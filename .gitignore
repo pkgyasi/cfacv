@@ -21,3 +21,7 @@ src/FEPFromForces
 gmon.out
 # backup of the pre-2026-11 makefile, kept locally
 src/makefile.orig
+
+# python bytecode
+__pycache__/
+*.pyc

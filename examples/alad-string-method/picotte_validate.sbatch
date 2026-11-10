@@ -39,6 +39,9 @@ if [ -z "${CFACV_BASEDIR:-}" ]; then CFACV_BASEDIR=$(cd "$SRC/../.." && pwd); fi
 export CFACV_BASEDIR
 
 EXAMPLE=$CFACV_BASEDIR/examples/alad-string-method
+
+# Terminate a launcher that outlives its NAMD ranks; see watchdog.sh.
+source "$EXAMPLE/watchdog.sh"
 WORK=/scratch/$USER/$SLURM_JOB_ID
 RESULTS=$SRC/validate.$SLURM_JOB_ID
 mkdir -p "$WORK" "$RESULTS"
@@ -72,13 +75,13 @@ echo "########## STAGE A - restart path"
 prep A_continuous 24 1 4000
 cp -a "$SRC"/initial_string/. .
 echo "--- A1: continuous, 4000 iterations"
-./runstring.sh --cfacv-base-dir="$CFACV_BASEDIR" --num-procs=24 > run.log 2>&1
+run_string_watched --cfacv-base-dir="$CFACV_BASEDIR" --num-procs=24 > run.log 2>&1
 grep -h "WallClock:" output/0/job0.0.log | tail -1
 
 prep A_restart 24 1 2000
 cp -a "$SRC"/initial_string/. .
 echo "--- A2a: first leg, 2000 iterations"
-./runstring.sh --cfacv-base-dir="$CFACV_BASEDIR" --num-procs=24 > run.a.log 2>&1
+run_string_watched --cfacv-base-dir="$CFACV_BASEDIR" --num-procs=24 > run.a.log 2>&1
 echo "--- restart files written:"
 ls output//*.tcl 2>/dev/null || echo "  NONE -- restart was not written"
 echo "--- A2b: resume to 4000 iterations"
@@ -87,7 +90,7 @@ echo "--- A2b: resume to 4000 iterations"
 # ranks, and a silently unforwarded value would stop the resume at 2000
 # and look like a successful restart.
 sed -i "s|^set num_runs .*|set num_runs 4000  ; # validate: resume target|" alad_stringmethod.conf
-./runstring.sh --cfacv-base-dir="$CFACV_BASEDIR" \
+run_string_watched --cfacv-base-dir="$CFACV_BASEDIR" \
     --num-procs=24 --conf=job1.conf > run.b.log 2>&1
 grep -hE "resuming from|CFACV/SM\) run (2000|2001) begins" output/0/job1.0.log | head -3
 
@@ -115,7 +118,7 @@ for N in 4 8 12 16 24; do
   ./mkinitimages.sh --cfacv-base-dir="$CFACV_BASEDIR" --num-procs=8 > mkinit.log 2>&1
   module purge; module load abramsGrp-namd/3.0.3/mpi-gcc
   echo "--- string, $N replicas"
-  ./runstring.sh --cfacv-base-dir="$CFACV_BASEDIR" --num-procs="$N" > run.log 2>&1
+  run_string_watched --cfacv-base-dir="$CFACV_BASEDIR" --num-procs="$N" > run.log 2>&1
   w=$(grep -h "WallClock:" output/0/job0.0.log | tail -1 | awk '{print $2}')
   if [ -z "$w" ]; then echo "$N,$((N/2)),2000,NA,NA" >> "$CSV"; echo "  FAILED, see $d/run.log"; continue; fi
   ms=$(awk -v t="$w" "BEGIN{printf \"%.3f\", 1000*t/2000}")

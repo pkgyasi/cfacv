@@ -31,6 +31,9 @@ module load abramsGrp-namd/3.0.3/mpi-gcc
 SRC=$SLURM_SUBMIT_DIR
 CFACV=/ifs/groups/abramsGrp/pg565/cfacv
 EXAMPLE=$CFACV/examples/alad-string-method
+
+# Terminate a launcher that outlives its NAMD ranks; see watchdog.sh.
+source "$EXAMPLE/watchdog.sh"
 WORK=/scratch/$USER/$SLURM_JOB_ID
 RESULTS=$SRC/sweep.$SLURM_JOB_ID
 
@@ -66,7 +69,7 @@ for spr in $SPRS; do
   sed -i "s|^set num_runs .*|set num_runs $nr  ; # sweep: total MD steps held at $TOTAL_STEPS|" alad_stringmethod.conf
 
   echo "=== steps_per_run=$spr  num_runs=$nr  total=$TOTAL_STEPS"
-  ./runstring.sh --cfacv-base-dir="$CFACV" --num-procs="$SLURM_NTASKS" > run.log 2>&1
+  run_string_watched --cfacv-base-dir="$CFACV" --num-procs="$SLURM_NTASKS" > run.log 2>&1
 
   wc_s=$(grep -h "WallClock:" output/0/job0.0.log | tail -1 | awk "{print \$2}")
   if [ -z "$wc_s" ]; then

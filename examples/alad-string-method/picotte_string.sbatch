@@ -43,6 +43,9 @@ if [ ! -d "$CFACV_BASEDIR/tcl" ]; then
   exit 1
 fi
 
+# Terminate a launcher that outlives its NAMD ranks; see watchdog.sh.
+source "$CFACV_BASEDIR/examples/alad-string-method/watchdog.sh"
+
 WORK=/scratch/$USER/$SLURM_JOB_ID
 
 # MPI launches must work on a persistent filesystem: $TMPDIR and
@@ -75,6 +78,6 @@ if [ ! -f restr.job0.0.inp ]; then
 fi
 
 # --- stage 2: evolve the string -----------------------------------------
-./runstring.sh --cfacv-base-dir="$CFACV_BASEDIR" --num-procs="$SLURM_NTASKS"
+run_string_watched --cfacv-base-dir="$CFACV_BASEDIR" --num-procs="$SLURM_NTASKS"
 
 echo "=== done"

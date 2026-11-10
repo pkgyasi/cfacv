@@ -35,6 +35,9 @@ if [ -z "${CFACV_BASEDIR:-}" ]; then CFACV_BASEDIR=$(cd "$SRC/../.." && pwd); fi
 export CFACV_BASEDIR
 
 EXAMPLE=$CFACV_BASEDIR/examples/alad-string-method
+
+# Terminate a launcher that outlives its NAMD ranks; see watchdog.sh.
+source "$EXAMPLE/watchdog.sh"
 WORK=/scratch/$USER/$SLURM_JOB_ID
 RESULTS=$SRC/crossnode.$SLURM_JOB_ID
 NRUNS=2000
@@ -63,7 +66,7 @@ prep() {   # prep <dir> <num_replicas>
 run_case() {   # run_case <label> <dir> <replicas> <ranks_per_node> <nodes>
   local label=$1 d=$2 nrep=$3 ppn=$4 nodes=$5
   cd "$WORK/$d"
-  ./runstring.sh --cfacv-base-dir="$CFACV_BASEDIR" --num-procs="$nrep" \
+  run_string_watched --cfacv-base-dir="$CFACV_BASEDIR" --num-procs="$nrep" \
                  --mpirun-opts="--map-by ppr:${ppn}:node --bind-to core" > run.log 2>&1 || true
   local w ms
   w=$(grep -h "WallClock:" output/0/job0.0.log 2>/dev/null | tail -1 | awk '{print $2}')

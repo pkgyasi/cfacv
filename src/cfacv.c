@@ -3,7 +3,7 @@
 //#define _PARANOIA_ 1
 
 void cfacvBanner ( void ) {
-  printf("CFACV/C) Version %.2f\n",CFACVC_VERSION);
+  printf("CFACV/C) Version %s\n",CFACV_VERSION);
 }
 
 FILE * my_fopen ( char * name, char * code ) {
@@ -351,9 +351,10 @@ double tmdUpdate ( double z, double increment, int OK ) {
 }
 
 double tmdUpdate_Periodic ( double z, double increment, int OK ) {
-  double newz=z+increment;
-  if (newz>M_PI) newz-=2*OK*M_PI;
-  else if (newz<-M_PI) newz+=2*OK*M_PI;
+  /* move only inside the TMD window, as tmdUpdate does; always wrap */
+  double newz=z+OK*increment;
+  if (newz>M_PI) newz-=2*M_PI;
+  else if (newz<-M_PI) newz+=2*M_PI;
   return newz;
 }
 
@@ -884,8 +885,10 @@ int DataSpace_RestrainingForces ( DataSpace * ds, int first, int timestep ) {
 	r->z=tamdUpdate(ds,r->z,-r->f,r->tamdOpt,&r->tamd_noise,&r->tamd_restraint);
       }
       if (r->tmdOpt) {
+	/* t1-t0 increments, one after each of steps t0..t1-1, so the target
+	   in effect from step t1 on is exactly the TMD target */
 	r->z=r->tmdOpt->update(r->z,r->tmdOpt->increment,
-			       (r->tmdOpt->t0<=timestep)&&(r->tmdOpt->t1>=timestep));
+			       (r->tmdOpt->t0<=timestep)&&(timestep<r->tmdOpt->t1));
       }
       ds->z[i]=r->z;
     }
@@ -1401,8 +1404,10 @@ int SMDataSpace_reparameterize ( SMDataSpace * sm ) {
       }
     }
 
-    for (i=0;i<ni;i++) sm->z[i]=sm->zn[i];
-    if (sm->dual) for (i=ni;i<sm->ni;i++) sm->z[i]=sm->zn[i]=sm->z[i-ni];
+    /* copy, never alias: if z[i] and zn[i] became the same buffer, every later
+       pass would interpolate in place, reading images it had already moved */
+    for (i=0;i<ni;i++) sm_cop(sm->z[i],sm->zn[i],nz);
+    if (sm->dual) for (i=ni;i<sm->ni;i++) sm_cop(sm->z[i],sm->z[i-ni],nz);
  
     /* check the convergence of the reparameterization */
     err=0.0;
@@ -1419,7 +1424,8 @@ int SMDataSpace_reparameterize ( SMDataSpace * sm ) {
       if (no_iter) no_iter=0;
       iter++;
     }
-    if (iter==sm->reparam_maxiter) {
+    /* converging on the last allowed iteration is still converging */
+    if (err > sm->reparam_tol) {
       fprintf(stderr,"ERROR: string reparameterization did not converge after %i iterations (%.5le > %.5le)\n",iter,err,sm->reparam_tol);
       exit(1);
     }

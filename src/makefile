@@ -1,6 +1,6 @@
 comma := ,
 
-# CFACV -- a simple collective-variables module for NAMD
+# cfacv -- a simple collective-variables module for NAMD
 #
 # Cameron F Abrams 2016-2018, Drexel University
 #
@@ -47,22 +47,29 @@ ifeq ($(strip $(TCL_INC)),)
   $(error tcl.h not found. Pass TCL_INC=/dir/containing/tcl.h)
 endif
 
-# ---- GSL (Reconstruct and FEPFromForces only) -----------------------------
+# ---- GSL (Reconstruct only) -----------------------------
 GSL_CONFIG := $(shell command -v gsl-config 2>/dev/null)
-ifneq ($(GSL_CONFIG),)
+# an explicit GSL_PREFIX wins over whatever gsl-config is on the PATH
+ifneq ($(strip $(GSL_PREFIX)),)
+  GSL_CFLAGS := -I$(GSL_PREFIX)/include
+  GSL        := -L$(GSL_PREFIX)/lib -Wl,-rpath,$(GSL_PREFIX)/lib -lgsl -lgslcblas
+else ifneq ($(GSL_CONFIG),)
   GSL_CFLAGS := $(shell $(GSL_CONFIG) --cflags)
   GSL_RAW    := $(shell $(GSL_CONFIG) --libs)
   # gsl-config gives -L but no -rpath; without it the binaries fail at run time
   GSL        := $(GSL_RAW) $(patsubst -L%,-Wl$(comma)-rpath$(comma)%,$(filter -L%,$(GSL_RAW)))
-else ifneq ($(strip $(GSL_PREFIX)),)
-  GSL_CFLAGS := -I$(GSL_PREFIX)/include
-  GSL        := -L$(GSL_PREFIX)/lib -Wl,-rpath,$(GSL_PREFIX)/lib -lgsl -lgslcblas
 else ifneq ($(wildcard $(CONDA_PREFIX)/include/gsl),)
   GSL_CFLAGS := -I$(CONDA_PREFIX)/include
   GSL        := -L$(CONDA_PREFIX)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib -lgsl -lgslcblas
 else
+  # no gsl-config, GSL_PREFIX or conda GSL: try the compiler's default paths
   GSL_CFLAGS :=
   GSL        := -lgsl -lgslcblas
+  ifeq ($(wildcard /usr/include/gsl/gsl_linalg.h),)
+    GSL_NOTE := (not found; only Reconstruct needs it -- pass GSL_PREFIX=)
+  else
+    GSL_NOTE := (default system paths)
+  endif
 endif
 
 # ---- swig -----------------------------------------------------------------
@@ -72,7 +79,11 @@ ifeq ($(strip $(SWIG)),)
 endif
 
 # ---- assembled flags ------------------------------------------------------
-CFLAGS  += $(OPT) $(WARN) -I$(TCL_INC) $(GSL_CFLAGS)
+# ---- version --------------------------------------------------------------
+# one source of truth, also read by tcl/cfacv.tcl and set by scripts/release.sh
+CFACV_VERSION := $(strip $(shell cat ../VERSION 2>/dev/null || echo unknown))
+
+CFLAGS  += $(OPT) $(WARN) -I$(TCL_INC) $(GSL_CFLAGS) -DCFACV_VERSION='"$(CFACV_VERSION)"'
 LIBS    += -lm
 LDFLAGS += $(LDEXTRA)
 USER_FLAGS ?=
@@ -84,11 +95,12 @@ SSOBJ += basisrep.o
 all: cfacv.so genericdataspace.so ForcesFromLog Reconstruct FEPFromForces
 
 config:
+	@echo "VERSION  = $(CFACV_VERSION)"
 	@echo "CC       = $(CC)"
 	@echo "OPT      = $(OPT)"
 	@echo "TCL_INC  = $(TCL_INC)"
 	@echo "SWIG     = $(SWIG)"
-	@echo "GSL      = $(GSL)"
+	@echo "GSL      = $(GSL) $(GSL_NOTE)"
 	@echo "CFLAGS   = $(CFLAGS)"
 
 ../lib ../bin:
@@ -117,13 +129,13 @@ Reconstruct: $(SSOBJ) Reconstruct.o | ../bin
 	cp $@ ../bin/
 
 FEPFromForces: FEPFromForces.c | ../bin
-	$(CC) $(CFLAGS) $(USER_FLAGS) $(LDFLAGS) -o $@ $^ $(LIBS) $(GSL)
+	$(CC) $(CFLAGS) $(USER_FLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 	cp $@ ../bin/
 
 # ---- header dependencies --------------------------------------------------
 measurements.o : measurements.h
 centers.o      : centers.h
-cfacv.o        : cfacv.h measurements.h centers.h wrapcoords.h
+cfacv.o        : cfacv.h measurements.h centers.h wrapcoords.h ../VERSION
 Reconstruct.o  : basisrep.h
 basisrep.o     : basisrep.h
 

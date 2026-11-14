@@ -24,12 +24,14 @@ INITX="initX.conf"
 # plain restrained-MD warmups, one system at a time and no replicas, so the
 # single-node build is the right one and charmrun is not involved.
 #
-# On picotte:
-#     module purge
-#     module load abramsGrp-namd/3.0.3/multicore-gcc
+# With namd3 on PATH:
+#
 #     ./mkinitimages.sh --num-procs=8
 #
-CFACV_BASEDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# An exported CFACV_BASEDIR wins; otherwise assume the example sits in a
+# checkout. (The fallback must not fail under set -e: the "not a cfacv tree"
+# check below reports a bad path with a message.)
+CFACV_BASEDIR=${CFACV_BASEDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd || true)}
 NAMD3=namd3
 NAMD_CMD=""      # full launcher; default is "$NAMD3 +p$NP"
 NP=16
@@ -99,7 +101,7 @@ if [ -z "$NAMD_CMD" ]; then
 fi
 if ! command -v ${NAMD_CMD%% *} >/dev/null; then
    echo "ERROR: '${NAMD_CMD%% *}' not on PATH."
-   echo "       module load abramsGrp-namd/3.0.3/multicore-gcc"
+   echo "       Load your NAMD module, or pass --namd3-command=/path/to/namd3."
    exit 1
 fi
 echo "mkinitimages.sh: cfacv $CFACV_BASEDIR"

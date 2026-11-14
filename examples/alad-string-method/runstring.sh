@@ -8,17 +8,21 @@
 # of hardcoded paths on the original author's workstation, and to launch the
 # NAMD 3 MPI build, which is what provides +replicas across nodes.
 #
-# On picotte:
-#     module purge
-#     module load abramsGrp-namd/3.0.3/mpi-gcc
-#     ./runstring.sh --num-procs=$SLURM_NTASKS
+# Needs an MPI (or other multi-partition) NAMD build: a multicore build
+# refuses +replicas with "+partitions other than 1 is not allowed for
+# multicore build".  With namd3 and mpirun on PATH:
+#
+#     ./runstring.sh --num-procs=<total ranks>
 #
 # NAMD's +replicas requires the total process count to be an exact multiple
 # of the replica count; this script checks that before launching.
 #
 set -euo pipefail
 
-CFACV_BASEDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# An exported CFACV_BASEDIR wins; otherwise assume the example sits in a
+# checkout. (The fallback must not fail under set -e: the "not a cfacv tree"
+# check below reports a bad path with a message.)
+CFACV_BASEDIR=${CFACV_BASEDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd || true)}
 NAMD3=namd3
 MPIRUN="mpirun"
 MPIRUN_OPTS="--map-by core --bind-to core"
@@ -49,7 +53,7 @@ for f in "$CONF" "$STRING_METHOD_CONFIG"; do
   [ -f "$f" ] || { echo "ERROR: file $f not found." >&2; exit 1; }
 done
 [ -d "$CFACV_BASEDIR/tcl" ] || { echo "ERROR: $CFACV_BASEDIR is not a cfacv tree." >&2; exit 1; }
-command -v "$NAMD3"  >/dev/null || { echo "ERROR: '$NAMD3' not on PATH. module load abramsGrp-namd/3.0.3/mpi-gcc" >&2; exit 1; }
+command -v "$NAMD3"  >/dev/null || { echo "ERROR: '$NAMD3' not on PATH. Load an MPI NAMD build, or pass --namd3-command=." >&2; exit 1; }
 command -v "$MPIRUN" >/dev/null || { echo "ERROR: '$MPIRUN' not on PATH." >&2; exit 1; }
 
 # replica count comes from the string-method config unless overridden

@@ -23,10 +23,12 @@
 #     TW(zscale)       one length scale per CV [1 for each, with a warning]
 #     TW(periodic)     0/1 per CV [1 for each DIHED in cvINP]
 #     TW(dual)         1 = two systems per image, metric tensor from the partner [0]
-#     TW(memory)       updates the running averages remember, at least [200];
-#                      lengthened at calibration until the noise left in the
-#                      average is TW(force_res) [0.15] of the starting force,
-#                      up to TW(memory_max) [10000]
+#     TW(polyak)       1 = the images move on each update's own force and the
+#                      AVERAGED string is the result (Polyak-Ruppert); 0 = they
+#                      move on the averaged force, which overshoots [1]
+#     TW(memory)       updates the running averages of the metric tensor and of
+#                      the force remember [200].  With polyak on the force
+#                      average only sets the step at calibration
 #     TW(calibrate)    updates with the string held still, to set the step [200]
 #     TW(max_move)     signal limit on the step: largest across-string move
 #                      per update right after calibration, scaled units [0.002]
@@ -36,11 +38,31 @@
 #     TW(stepsize)     set the step by hand instead (0 = measure it) [0]
 #     TW(spline)       1 = spline respacing, 0 = straight segments [1]
 #     TW(evolve_ends)  1 = end images move too [1]
+#     TW(pin_first), TW(pin_last)   a point in CV space for the first / last
+#                      image, usually the basin centre from endpoint_analysis.py.
+#                      That end then ignores the force: it walks to the pin at
+#                      TW(pin_speed) scaled units per update [0.002] and stays.
+#                      Without this an end image wanders inside its basin and
+#                      leaves a bend in the string.  [not set]
+#     TW(hook_cos)     an image next to an end is dropped, and the string
+#                      respaced, when the turn there has a cosine below this
+#                      [0 = sharper than 90 degrees]; -2 turns it off
 #     TW(conv_window)  frames per averaging window of the drift test [20]
 #     TW(conv_tol)     drift, in scaled units, below which a frame counts as still [0.1]
-#     TW(conv_force)   and the averaged force across the string must be no more
-#                      than this many times the noise left in the average [1.5]
-#     TW(conv_count)   consecutive frames passing both tests that end the run [3]
+#     TW(force_tol)    and the force left across the string over the last
+#                      window of frames, rms over the images and with its own
+#                      noise taken out, must be below this, in kcal/mol per
+#                      scaled unit [0.3, half of kT at 300 K]; 0 turns it off
+#     TW(profile_tol)  and the free-energy profile from one window's forces and
+#                      the next's must not differ by more than this (kcal/mol)
+#                      at any image, beyond its own noise [0.5]; 0 turns it off
+#     TW(conv_count)   consecutive frames passing all the tests that end the run [3]
+#     (TW(conv_force), TW(force_res), TW(memory_max) and TW(max_step_factor),
+#      from earlier force tests, are accepted and ignored.)
+#     TW(fine) [12] points per segment of the spline; TW(nblocks) [10] blocks for
+#     the noise at calibration; TW(frame_updates) updates per recorded frame
+#     [runs_per_frame]; TW(debug) 1 traces the first updates on stderr.
+# Optional: restart_file (a state file from an earlier leg), first_timestep.
 #     TW(min_runs)     never stop before this many updates [0]
 # num_runs is the cap: the run ends there if the drift test has not ended it.
 #
@@ -111,9 +133,18 @@ set stop 0
 if {$tw_me == 0} {
     set history_file [open [format "$job_output_root.$replica_id.history" $replica_id] "w"]
     fconfigure $history_file -buffering line
+    # one line per image per recorded frame: update, image, updates averaged,
+    # the image's position, and the mean gradient dF/dz there over the frame.
+    # fe_profile.py driver turns the frames after the string stopped into a
+    # free-energy profile, at no extra MD.
+    set force_file [open [format "$job_output_root.$replica_id.forces" $replica_id] "w"]
+    fconfigure $force_file -buffering line
+    puts $force_file "# update image n_updates z(1..D) dF/dz(1..D)"
     if {[info exists tw_state]} {
         eval $tw_state
         if {$tw::N != $nimg} { tw_fail "the restart holds $tw::N images, this run has $nimg" }
+        # the step was set in an earlier leg; do not announce a calibration again
+        if {$tw::h > 0} { set step_reported 1 }
     } else {
         set z0 {}
         for {set i 0} {$i < $nimg} {incr i} {
@@ -155,6 +186,11 @@ if {$tw_me == 0} {
     }
     # on a restart, a memory lengthened at calibration outranks the config's
     if {[info exists tw_state] && $kept_memory > $tw::P(memory)} { tw::set_param memory $kept_memory }
+    # a pin of the wrong length is refused now, not after the whole calibration
+    foreach k {pin_first pin_last} {
+        set n [llength $tw::P($k)]
+        if {$n && $n != $tw::D} { tw_fail "TW($k) has $n values, the string has $tw::D CVs" }
+    }
     puts "TW) $tw::N images in $tw::D CVs; length scales $tw::scale; periodic $tw::periodic"
     puts "TW) memory $tw::P(memory), calibrate $tw::P(calibrate), max_move $tw::P(max_move), spline $tw::P(spline), drift test $tw::P(conv_window) frames < $tw::P(conv_tol) x $tw::P(conv_count)"
     set tg [tw::targets]
@@ -199,32 +235,47 @@ while {$i_run < $num_runs && !$stop} {
         if {[dict get $info moved] && ![info exists step_reported]} {
             set step_reported 1
             set which [expr {$tw::P(stepsize) > 0 ? "set by hand" : ($tw::h_noise < $tw::h_signal ? "noise limit" : "signal limit")}]
+            set fac [dict get $info factor]
+            if {$fac > 1} {
+                puts "TW) the force is too noisy for the longest memory: MD steps per update $steps_per_run -> [expr {$steps_per_run * $fac}]"
+                puts $history_file "TW iter $next_run : steps per update $steps_per_run -> [expr {$steps_per_run * $fac}]"
+            }
             puts "TW) calibration over at update $next_run: step $tw::h ($which; signal limit $tw::h_signal, noise limit $tw::h_noise, noise per update $tw::noise1); averaging memory $tw::P(memory) updates"
             puts $history_file "TW iter $next_run : calibrated step $tw::h ($which) signal_limit $tw::h_signal noise_limit $tw::h_noise noise_per_update $tw::noise1 memory $tw::P(memory)"
         }
         if {$next_run % $runs_per_frame == 0} {
-            set drift [tw::record_frame]
-            for {set i 0} {$i < $nimg} {incr i} { puts $history_file "SM iter $next_run replica $i : reparam z [lindex $tw::z $i]" }
-            puts $history_file "TW iter $next_run : step [dict get $info h] across-string move [dict get $info perp] force/noise $tw::force_ratio drift $drift"
+            # this frame's mean gradients, and the mean positions they were measured at
+            lassign [tw::frame_force] fn fg
+            set fz [tw::frame_z]
+            if {$fn > 0} {
+                for {set i 0} {$i < $nimg} {incr i} { puts $force_file "$next_run $i $fn [lindex $fz $i] [lindex $fg $i]" }
+            }
+            set drift [tw::record_frame $fz $fg]
+            # the string that is reported is the frame's average, not the momentary one
+            for {set i 0} {$i < $nimg} {incr i} { puts $history_file "SM iter $next_run replica $i : reparam z [lindex $fz $i]" }
+            puts $history_file "TW iter $next_run : step [dict get $info h] across-string move [dict get $info perp] force/noise $tw::force_ratio drift $drift residual_force $tw::f_res force_noise $tw::f_noise residual_less_noise $tw::f_clean profile_change $tw::p_change"
             if {[tw::converged] && $next_run >= $TW(min_runs)} {
                 set stop 1
-                puts "TW) the string has stopped: drift $drift, force across it $tw::force_ratio x its noise; ending at update $next_run"
-                puts $history_file "TW iter $next_run : converged, drift $drift force/noise $tw::force_ratio"
+                puts "TW) the string has stopped: drift $drift, force across it $tw::f_res kcal/mol per scaled unit (noise $tw::f_noise; $tw::f_clean with the noise taken out), profile change $tw::p_change kcal/mol; ending at update $next_run"
+                puts $history_file "TW iter $next_run : converged, drift $drift residual_force $tw::f_res profile_change $tw::p_change"
             }
         }
         set tg [tw::targets]
-        for {set i 1} {$i < $nr} {incr i} { replicaSend [list $stop [lindex $tg [expr {$i % $nimg}]]] $i }
+        set fac [dict get $info factor]
+        for {set i 1} {$i < $nr} {incr i} { replicaSend [list $stop [lindex $tg [expr {$i % $nimg}]] $fac] $i }
         set z [lindex $tg 0]
     } else {
-        lassign [replicaRecv 0] stop z
+        lassign [replicaRecv 0] stop z fac
     }
+    # count this update's MD steps before the number per update changes
+    incr i_step $steps_per_run
+    if {$fac > 1} { set steps_per_run [expr {$steps_per_run * $fac}] }
     tw_dbg "new target $z"
     set new_z 1
     Tcl_DataSpace_resetAccumulators $ds
     replicaBarrier
     tw_dbg "barrier 2 passed"
 
-    incr i_step $steps_per_run
     set i_run $next_run
 
     # restart files: every few frames, at the cap, and when the drift test ends the run
@@ -237,6 +288,7 @@ while {$i_run < $num_runs && !$stop} {
             puts $fh [list set i_job [expr {$i_job + 1}]]
             puts $fh [list set i_run $i_run]
             puts $fh [list set i_step $i_step]
+            puts $fh [list set steps_per_run $steps_per_run]
             puts $fh [list set restart_root $restart_root]
             puts $fh [list set tw_state [tw::dump_state]]
             close $fh
@@ -253,9 +305,12 @@ while {$i_run < $num_runs && !$stop} {
 
 replicaBarrier
 if {$tw_me == 0} {
-    for {set i 0} {$i < $nimg} {incr i} { puts $history_file "SM FINALiter $i_run replica $i : reparam z [lindex $tw::z $i]" }
+    # the result is the string averaged over the last window of frames
+    set zfin [tw::final_string]
+    for {set i 0} {$i < $nimg} {incr i} { puts $history_file "SM FINALiter $i_run replica $i : reparam z [lindex $zfin $i]" }
     puts $history_file "TW iter $i_run : finished, [expr {$stop ? {stopped by its drift and force tests} : {reached the update cap}}]"
     close $history_file
+    close $force_file
     puts "TW) finished at update $i_run: [expr {$stop ? {stopped by its drift and force tests} : {reached the update cap without passing its stopping tests}}]"
 }
 replicaBarrier

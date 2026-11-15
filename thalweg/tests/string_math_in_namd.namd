@@ -7,7 +7,7 @@ set npass 0; set nfail 0
 proc try {what script} { global npass nfail; if {[catch {uplevel #0 $script} err]} { incr nfail; puts "FAIL $what: $err" } else { incr npass } }
 proc check {what ok} { global npass nfail; if {$ok} { incr npass } else { incr nfail; puts "FAIL $what" } }
 try init {tw::init {{-1.09 2.51 -0.07 -0.01} {-1.2 2.0 0.0 0.0} {-1.4 1.5 0.0 0.0} {-1.6 0.8 0.03 0.0} {-1.7 0.0 0.07 0.0}} {0.609 0.350 0.157 0.160} {1 1 1 1}}
-foreach {k v} {memory 50 calibrate 40 max_move 0.002 conv_window 3 conv_tol 0.1 conv_count 2 frame_updates 10} { try "set_param $k" [list tw::set_param $k $v] }
+foreach {k v} {memory 50 calibrate 40 max_move 0.002 conv_window 3 conv_tol 0.1 conv_count 2 frame_updates 10 memory_max 30 max_step_factor 8} { try "set_param $k" [list tw::set_param $k $v] }
 try targets {set tg [tw::targets]}
 expr {srand(7)}
 for {set n 0} {$n < 120} {incr n} {

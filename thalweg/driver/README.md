@@ -10,9 +10,11 @@ Written 2026-11-14.
 | | cfacv `stringmethod.tcl` | this driver |
 |---|---|---|
 | torsions | never wrapped; a string must not cross +/-pi | string kept unwrapped, replicas restrained to the wrapped point |
-| mean force used for an update | the last `steps_per_run` MD steps | a running average over `TW(memory)` updates |
-| step size | `SMPARAMS(stepsize)`, chosen by hand | measured: the string stands still for `TW(calibrate)` updates, then the step is set so the fastest image moves `TW(max_move)` scaled units per update |
-| when it stops | after `num_runs` updates | when the string has stopped drifting, or at `num_runs` |
+| mean force used for an update | the last `steps_per_run` MD steps | the same (this is the on-the-fly string update), with a metric tensor averaged over `TW(memory)` updates |
+| the result | the string at the last update | the AVERAGE of the string over the last window of frames (iterate averaging): the momentary string fluctuates about the path and never settles, because the step is constant |
+| step size | `SMPARAMS(stepsize)`, chosen by hand | measured: the string stands still for `TW(calibrate)` updates, then the step is the smaller of two limits: the fastest image moves `TW(max_move)` scaled units per update, or the noise alone moves an image less than half the drift tolerance over one test window |
+| when it stops | after `num_runs` updates | when the averaged string has stopped drifting, no force across it is demonstrably left, and the profile along it is not demonstrably changing; or at `num_runs` |
+| end images | move with the force | move with the force, or are pinned (`TW(pin_first)`, `TW(pin_last)`); an image next to an end that doubles back is dropped |
 | respacing | straight segments between images | a cubic spline through the images |
 | two systems per image | needed for independent force and metric estimates | optional (`TW(dual)`); the running averages make it unnecessary |
 
@@ -37,10 +39,23 @@ Do not set `langevinTemp`, `outputEnergies`, `dcdFreq`, input or output names
 in the base file: the driver sets them, and NAMD refuses a parameter given
 twice.
 
-The history file is `<output_root>.job<N>.0.history` on replica 0, with the
-same `SM iter ... reparam z ...` lines as cfacv's driver, so
-`string_monitor.py status` reads it. Lines starting `TW iter` carry the step,
-the largest across-string move and the drift.
+The history file is `<output_root>.job<N>.0.history` on replica 0, with
+`SM iter ... reparam z ...` lines in cfacv's format, so `string_monitor.py
+status` reads it (do not pass `--dual`; a run that stopped itself has few
+frames, and the monitor then shortens its window). Each frame's string is
+the MEAN over that frame's updates, unwrapped (a torsion may lie beyond
+pi). The `SM FINALiter` block at the end is the result: the string averaged
+over the last window and respaced. Lines starting `TW iter` carry the step,
+the largest across-string move, the drift, the residual force, its noise,
+the residual with the noise taken out, and the profile change.
+
+Next to it, `<output_root>.job<N>.0.forces` holds one line per image per
+recorded frame: the update, the image, the number of updates averaged, the
+image's position and the mean gradient dF/dz there over that frame (a plain
+average, not the weighted one the string moves with). `fe_profile.py driver`
+integrates the frames from after the string stopped into a free-energy
+profile with error bars, at no extra MD. It shares its sampling with the
+refinement, so it is a first look, not the profile of record.
 
 ## Choosing the settings
 
@@ -51,8 +66,45 @@ the largest across-string move and the drift.
   an average over `memory x steps_per_run` MD steps.
 - `TW(conv_window)`, `TW(conv_tol)`, `TW(conv_count)`: the run ends when the
   window-averaged string has moved less than `conv_tol` scaled units between
-  consecutive windows, `conv_count` frames in a row. This is the same test
-  `string_monitor.py` applies afterwards.
+  consecutive windows, `conv_count` frames in a row, AND the force left
+  across the string over the last window, with the noise in that number
+  taken out, is below `TW(force_tol)` (0.3 kcal/mol per scaled unit, half of
+  kT at 300 K), AND the free-energy profile computed from one window's
+  forces and from the next's is not demonstrably changing by more than
+  `TW(profile_tol)` (0.5 kcal/mol), AND both windows lie after the
+  calibration period.
+  The drift test is the one the string-method literature uses (a plateau in
+  the string's displacement); it is given a number here. The force and
+  profile tests are additions. The force test does NOT wait until the force
+  is resolved below its tolerance: for a solvated protein that needs
+  nanoseconds per image, as much as a free-energy profile costs. It holds
+  the run while a force is demonstrably there. Each history line gives the
+  force, its noise and the force with the noise taken out, so how well it
+  was resolved is on record. A longer `TW(conv_window)` resolves it better.
+  `string_monitor.py` applies only the drift test, with its own defaults
+  (window 100, tolerance 0.25), so the two can disagree: the driver's is the
+  stricter. An end that is pinned or held is left out of all of them.
+- `TW(polyak)`: 1 by default. Each update the images move on that update's
+  own force with the measured small step (the on-the-fly string update), and
+  the string that is recorded, tested and written at the end is the average
+  over a frame or a window (iterate averaging, after Polyak and Juditsky).
+  The step is constant, so this does not meet the Robbins-Monro conditions:
+  the momentary string does not converge, the averaged one does, up to a
+  bias of the order of the step. Stepping on an exponentially averaged force
+  instead, `TW(polyak) 0` and what this driver did at first, is exactly
+  Polyak's heavy-ball iteration with momentum 1 - 1/memory: on a straight
+  valley the string coasted past the floor by as much as it started above
+  it. It is kept for comparison and should not be used.
+
+- `TW(pin_first)`, `TW(pin_last)`: a point in CV space for an end image
+  (the basin centre from `endpoint_analysis.py`, which is the free-energy
+  minimum only as far as the basin is harmonic). That end ignores the force,
+  walks to the pin at `TW(pin_speed)` and stays; it is left out of the step
+  and of the stopping tests. Both free and fixed ends are in published use.
+- `TW(hook_cos)`: the image NEXT TO an end that makes the string double back
+  (cosine of the turn below this value, default 0) is dropped before the
+  images are respaced, so an end that has slid down into its basin does not
+  leave a hook behind. Set it to -2 to switch this off (-1 is not enough: an exact reversal can round to just below -1).
 
 ## Limits
 

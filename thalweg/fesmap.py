@@ -31,7 +31,7 @@ KT_300 = 0.0019872041 * 300.0
 class FESMap:
     """Gaussian radial-basis free-energy surface in scaled CV space."""
 
-    def __init__(self, centers, coef, sigma, scale, periodic, types=None, offset=0.0, metric=None):
+    def __init__(self, centers, coef, sigma, scale, periodic, types=None, offset=0.0, metric=None, M=None):
         self.centers = np.asarray(centers, float)
         self.coef = np.asarray(coef, float)
         self.sigma = float(sigma)
@@ -44,6 +44,31 @@ class FESMap:
         self.periodic = np.asarray(periodic, bool)
         self.types = types
         self.offset = float(offset)
+        # the metric tensor measured at each center (K, D, D), if it was; the
+        # string moves along -M grad F
+        self.M = None if M is None else np.asarray(M, float)
+
+    def set_metric_tensor(self, points, M):
+        """Attach tensors measured at `points` to the centers they belong to."""
+        points = np.asarray(points, float); M = np.asarray(M, float)
+        d = np.abs(diff(self.centers[:, None, :], points[None, :, :], self.periodic)).max(axis=2)
+        j = d.argmin(axis=1)
+        if d[np.arange(len(j)), j].max() > 1e-4:
+            raise ValueError("the metric tensors were not measured at this map's centers")
+        self.M = M[j]
+
+    def mobility(self, z):
+        """Dimensionless tensor that turns the scaled gradient dF/du into a
+        direction of motion in path units: S^-1 M S^-1 at the nearest center,
+        divided by its typical size over all centers so that a step keeps its
+        meaning.  The identity when no tensor was measured."""
+        z = np.atleast_2d(np.asarray(z, float)); D = z.shape[1]
+        if self.M is None:
+            return np.broadcast_to(np.eye(D), (len(z), D, D))
+        Mu = self.M / np.outer(self.metric, self.metric)
+        Mu = Mu / np.median(np.trace(Mu, axis1=1, axis2=2) / D)
+        dm = diff(z[:, None, :], self.centers[None, :, :], self.periodic) / self.metric
+        return Mu[np.sum(dm ** 2, axis=2).argmin(axis=1)]
 
     # -- evaluation ---------------------------------------------------------
     def _du(self, z):
@@ -101,7 +126,7 @@ class FESMap:
     # -- persistence --------------------------------------------------------
     def save(self, path, extra=None):
         d = {"centers": self.centers, "coef": self.coef, "sigma": self.sigma, "scale": self.scale, "metric": self.metric,
-             "periodic": self.periodic.tolist(), "types": self.types, "offset": self.offset}
+             "periodic": self.periodic.tolist(), "types": self.types, "offset": self.offset, "M": self.M}
         d.update(extra or {})
         save_json(path, d)
 
@@ -109,7 +134,7 @@ class FESMap:
     def load(cls, path):
         d = load_json(path)
         return cls(d["centers"], d["coef"], d["sigma"], d["scale"], d["periodic"], d.get("types"), d["offset"],
-                   d.get("metric"))
+                   d.get("metric"), d.get("M"))
 
 
 def cross_validate(z, f, sigma, scale, periodic, folds=5, seed=0, ridge=1e-8):
@@ -192,6 +217,8 @@ def main(argv=None):
                    help="one Gaussian width for every CV in units of its length scale (default: a width per CV)")
     p.add_argument("--max-error", type=float, default=0.5,
                    help="gate: largest tolerated left-out relative force error [0.5]")
+    p.add_argument("--metric-tensor", help="metric.json from 'meanforce.py metric': stored with the map, and the "
+                                           "path search then relaxes its strings along -M grad F")
     p.add_argument("--out", default="map.json")
     p = sub.add_parser("eval")
     p.add_argument("--map", required=True)
@@ -220,6 +247,13 @@ def main(argv=None):
         print(f"{len(z)} centers, F at centers spans {F.min():.2f} to {F.max():.2f} kcal/mol")
         ok = err <= a.max_error
         print(f"GATE map quality: {'PASS' if ok else 'FAIL'} (left-out force error {err:.3f}, limit {a.max_error})")
+        if a.metric_tensor:
+            mt = load_json(a.metric_tensor)
+            try:
+                m.set_metric_tensor(mt["points"], mt["M"])
+            except ValueError as e:
+                sys.exit(f"{a.metric_tensor}: {e}")
+            print(f"metric tensor attached at {len(m.M)} centers")
         m.save(a.out, {"sigma_scan": scan, "leftout_force_error": err})
         print(f"wrote {a.out}")
         return 0 if ok else 1

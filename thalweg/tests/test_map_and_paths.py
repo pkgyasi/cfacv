@@ -45,7 +45,10 @@ def test_search_ranks_the_two_channels_and_finds_no_third():
     m, _, _ = fit_with_sigma_scan(P, -g, np.ones(2), np.zeros(2, bool))
     res = search(m, np.array([-1.0, 0.0]), np.array([1.0, 0.0]), n_images=24, n_channels=3, n_random=20)
     ch = res["channels"]
-    assert len(ch) == 2, [c["barrier"] for c in ch]
+    # one route over the top; underneath, the route splits round its bump (inside and outside the ring),
+    # which the search used to merge into one because it compared strings too coarsely
+    assert 2 <= len(ch) <= 3, [c["barrier"] for c in ch]
+    assert all(c["converged"] and not c["through_minimum"] for c in ch)
     # channel 0 goes over the top (y > 0), channel 1 underneath
     assert ch[0]["anchors"][:, 1].max() > 0.8 and ch[0]["anchors"][:, 1].min() > -0.3
     assert ch[1]["anchors"][:, 1].min() < -0.6 and ch[1]["anchors"][:, 1].max() < 0.3
@@ -57,8 +60,10 @@ def test_search_ranks_the_two_channels_and_finds_no_third():
         Vt, _ = ring(c["anchors"])
         assert abs(c["barrier"] - (Vt.max() - Vt[0])) < 0.7
     assert ch[0]["barrier"] < ch[1]["barrier"]
-    assert not res["unassigned"]
+    assert res["unconverged_random"] == 0
     assert sum(c["random_hits"] for c in ch) == 20
+    # every string starts at the closed well's minimum on the map, and barriers are measured from there
+    assert all(np.allclose(c["anchors"][0], res["end_minima"][0]) and abs(c["F"][0]) < 1e-9 for c in ch)
     # images equally spaced, ends in the wells
     seg = np.linalg.norm(np.diff(ch[0]["anchors"], axis=0), axis=1)
     assert seg.std() / seg.mean() < 0.02
@@ -130,3 +135,125 @@ def test_per_cv_widths_rescue_a_surface_the_basin_widths_misshape():
     assert e_ani < 0.6 * e_iso, (e_iso, e_ani, record)
     assert np.allclose(ani.metric, basin)                       # distances still in basin units
     assert ani.scale[1] / ani.scale[0] > basin[1] / basin[0]    # relatively wider along the stiff CV
+
+
+def test_ranking_uncertainty_and_unmatched_groups():
+    from path_search import barrier_uncertainty, group_unassigned
+    P, V, g = ring_centers()
+    rng = np.random.default_rng(2)
+    f = -g + rng.normal(0, 0.3, g.shape)
+    m, _, _ = fit_with_sigma_scan(P, f, np.ones(2), np.zeros(2, bool))
+    res = search(m, np.array([-1.0, 0.0]), np.array([1.0, 0.0]), n_images=20, n_channels=3, n_random=10)
+    sd, holds = barrier_uncertainty(m, P, f, res["channels"], n_boot=15)
+    assert len(sd) == len(res["channels"]) >= 2 and np.all(sd < 0.8) and np.all(sd > 0)
+    # with the forces' own standard errors, the part of that error that is force noise comes back too
+    sd3, holds3, noise = barrier_uncertainty(m, P, f, res["channels"], n_boot=15, f_se=np.full(f.shape, 0.3))
+    assert len(noise) == len(sd3) and np.all(noise > 0)
+    assert holds[0] >= 0.9                      # 5 against 8: the order is firm
+    # two identical strays and one different one make two groups
+    a = res["channels"][0]["anchors"]
+    strays = [{"anchors": a + [0, 1.0], "barrier": 9.0}, {"anchors": a + [0, 1.01], "barrier": 9.1},
+              {"anchors": a - [0, 2.0], "barrier": 12.0}]
+    groups = group_unassigned(strays, np.ones(2), 0.3)
+    assert [g["count"] for g in groups] == [2, 1] and groups[0]["barrier"] == 9.0
+
+
+def test_close_barriers_are_reported_as_not_established():
+    """Two channels with nearly the same barrier: the ranking must not be called firm."""
+    from path_search import barrier_uncertainty
+    xs = np.arange(-1.5, 1.5 + 1e-9, 0.15)
+    P = np.array([(x, y) for x in xs for y in xs])
+    V, g = ring(P, hi_upper=3.0, hi_lower=3.15)
+    keep = V < 9.0
+    P, g = P[keep], g[keep]
+    rng = np.random.default_rng(7)
+    f = -g + rng.normal(0, 1.0, g.shape)
+    m, _, _ = fit_with_sigma_scan(P, f, np.ones(2), np.zeros(2, bool))
+    res = search(m, np.array([-1.0, 0.0]), np.array([1.0, 0.0]), n_images=20, n_channels=3, n_random=6)
+    assert len(res["channels"]) >= 2
+    sd, holds = barrier_uncertainty(m, P, f, res["channels"], n_boot=20)
+    assert holds[0] < 0.9
+
+
+def test_spur_is_cut_and_curve_distance_ignores_a_shift_along_the_path():
+    from path_search import cut_spurs, turn_cosines, path_distance
+    from common import redistribute
+    one = np.ones(2)
+    # a straight path with a stretch that goes out sideways and comes back
+    spur = np.array([[0, 0], [1, 0], [2, 0], [2, 0.9], [2, 0.05], [3, 0], [4, 0.0]], float)
+    assert turn_cosines(spur, one).min() < -0.9
+    cut = cut_spurs(spur, one)
+    assert turn_cosines(cut, one).min() >= 0 and np.allclose(cut[0], spur[0]) and np.allclose(cut[-1], spur[-1])
+    assert np.abs(cut[:, 1]).max() < 0.1                              # the excursion is gone
+    gentle = np.array([[0, 0], [1, 0.2], [2, 0.5], [3, 1.2], [4, 2.0]], float)
+    assert len(cut_spurs(gentle, one)) == 5
+    # the same line, one string longer at one end: image-by-image they look apart, as curves they are not
+    a = np.column_stack([np.linspace(0, 4, 16), np.zeros(16)])
+    b = np.column_stack([np.linspace(0, 5, 16), np.zeros(16)])
+    assert float(np.mean(np.linalg.norm(a - b, axis=1))) > 0.4
+    assert path_distance(a, b[:13], one) < 0.05
+    c = a + [0, 0.7]
+    assert abs(path_distance(a, c, one) - 0.7) < 1e-9
+
+
+def test_relaxation_keeps_its_ends_and_reports_convergence():
+    P, V, g = ring_centers()
+    m, _, _ = fit_with_sigma_scan(P, -g, np.ones(2), np.zeros(2, bool))
+    from path_search import relax_string
+    start = np.array([[-1.0, 0.0], [0.0, 1.3], [1.0, 0.0]])
+    p, n, conv = relax_string(m, start, 15)
+    assert conv and np.allclose(p[0], start[0]) and np.allclose(p[-1], start[-1])
+    p2, n2, conv2 = relax_string(m, start, 15, max_iter=3)
+    assert not conv2 and n2 == 3
+
+
+def test_uncertainty_has_the_subsample_factor():
+    """With half the centers left out each time the factor is 1; with a fifth left out it is 2."""
+    from path_search import barrier_uncertainty
+    P, V, g = ring_centers()
+    rng = np.random.default_rng(2)
+    f = -g + rng.normal(0, 0.3, g.shape)
+    m, _, _ = fit_with_sigma_scan(P, f, np.ones(2), np.zeros(2, bool))
+    res = search(m, np.array([-1.0, 0.0]), np.array([1.0, 0.0]), n_images=20, n_channels=2, n_random=0)
+    assert len(res["channels"]) == 2                                  # a duplicate route no longer uses up the quota
+    truth = []
+    for s in range(25):                                               # the real spread: new noise each time
+        fs = -g + np.random.default_rng(100 + s).normal(0, 0.3, g.shape)
+        mb = type(m).fit(P, fs, m.sigma, m.scale, m.periodic, metric=m.metric)
+        F = mb.value(np.asarray(res["channels"][0]["anchors"])); truth.append(F.max() - F[0])
+    sd, _ = barrier_uncertainty(m, P, f, res["channels"], n_boot=40)
+    assert 0.5 < sd[0] / np.std(truth, ddof=1) < 2.0                  # it was about 0.5 before the factor
+
+
+def test_a_string_through_a_side_minimum_converges_and_is_flagged():
+    """Three wells in a row with the middle one off to the side: A -> B -> C
+    turns a sharp corner at B.  Cutting the corner out every iteration made a
+    limit cycle (cut, fall back in, cut again) that never converged."""
+    from path_search import relax_string, turn_cosines
+    xs = np.arange(-2.0, 2.0 + 1e-9, 0.2); ys = np.arange(-0.6, 2.4 + 1e-9, 0.2)
+    P = np.array([(x, y) for x in xs for y in ys])
+    wells = [(-1.5, 0.0, 4.0), (0.0, 1.8, 5.0), (1.5, 0.0, 4.0)]
+    def grad(p):
+        g = np.zeros_like(p)
+        for cx, cy, a in wells:
+            d = p - [cx, cy]; e = a * np.exp(-np.sum(d * d, axis=1) / 0.5)
+            g += (2 * d / 0.5) * e[:, None]
+        return g
+    m, _, _ = fit_with_sigma_scan(P, -grad(P), np.ones(2), np.zeros(2, bool))
+    start = np.array([[-1.5, 0.0], [0.0, 0.3], [1.5, 0.0]])
+    p, n, conv = relax_string(m, start, 14)
+    assert conv and n < 4000
+    if turn_cosines(p, np.ones(2)).min() < -0.5:                     # it went through B: say so
+        assert relax_string.info["through_minimum"]
+    assert np.allclose(p[0], start[0]) and np.allclose(p[-1], start[-1])
+
+
+def test_descent_finds_the_basin_floor_and_distances_respect_periodicity():
+    from path_search import descend, path_distance
+    P, V, g = ring_centers()
+    m, _, _ = fit_with_sigma_scan(P, -g, np.ones(2), np.zeros(2, bool))
+    z = descend(m, np.array([-0.8, 0.25]))
+    assert np.hypot(z[0] + 1.0, z[1]) < 0.08
+    a = np.column_stack([np.linspace(0, 1, 9), np.linspace(2.5, 3.5, 9)])
+    b = a - [0, 2 * np.pi]
+    assert path_distance(a, b, np.ones(2)) > 5 and path_distance(a, b, np.ones(2), periodic=[False, True]) < 1e-9

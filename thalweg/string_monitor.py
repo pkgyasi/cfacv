@@ -33,7 +33,7 @@ import numpy as np
 
 from common import CVSet, load_json, path_length, save_json, wrap
 
-_LINE = re.compile(r"^SM (?:FINAL)?iter\s*(\d+) replica (\d+) : reparam z (.*)$")
+_LINE = re.compile(r"^SM (FINAL)?iter\s*(\d+) replica (\d+) : reparam z (.*)$")
 
 
 def read_history(paths):
@@ -41,18 +41,34 @@ def read_history(paths):
 
     Returns (iters, z) with z of shape (frames, replicas, nCV).  A later file
     overrides an earlier one where their iterations overlap."""
-    frames = {}
+    frames = {}; final = {}; thalweg = False
     for path in paths:
         with open(path, errors="replace") as fh:
             for line in fh:
+                if line.startswith("TW iter"):
+                    thalweg = True
                 m = _LINE.match(line)
-                if m:
-                    frames.setdefault(int(m.group(1)), {})[int(m.group(2))] = [float(v) for v in m.group(3).split()]
+                if not m:
+                    continue
+                try:
+                    vals = [float(v) for v in m.group(4).split()]
+                except ValueError:
+                    continue                                  # a line cut in the middle of a number
+                # the thalweg driver's FINAL block is its own result, the string averaged over
+                # its last window; it is not one more frame, and carries the last frame's number
+                (final if m.group(1) else frames.setdefault(int(m.group(2)), {}))[int(m.group(3))] = vals
     if not frames:
         raise ValueError("no 'reparam z' lines found")
     nrep = max(len(f) for f in frames.values())
-    iters = sorted(i for i, f in frames.items() if len(f) == nrep)   # drop a frame cut short
+    ncv = max(len(v) for f in frames.values() for v in f.values())
+    # drop a frame cut short, by lines or within a line
+    iters = sorted(i for i, f in frames.items() if len(f) == nrep and all(len(v) == ncv for v in f.values()))
+    if not iters:
+        raise ValueError("no complete frame in the history")
     z = np.array([[frames[i][r] for r in range(nrep)] for i in iters])
+    read_history.thalweg = thalweg
+    read_history.final = (np.array([final[r] for r in range(nrep)])
+                          if len(final) == nrep and all(len(v) == ncv for v in final.values()) else None)
     return np.array(iters), z
 
 
@@ -69,7 +85,13 @@ def status(iters, z, scale, window, tol):
     seg = np.diff(s)
     # running distance from the final averaged string, to see the approach
     approach = np.sqrt(np.mean(np.sum(((z - mean) / scale) ** 2, axis=2), axis=1))
+    # sharpest turn of the averaged string: a cosine below 0 is a hook, the
+    # path doubling back on itself, usually at a free end
+    d = np.diff(mean, axis=0) / scale
+    d /= np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-300)
+    turn = np.sum(d[:-1] * d[1:], axis=1)
     return {
+        "turn_cos": turn, "sharpest_turn": float(turn.min()), "sharpest_turn_image": int(turn.argmin()) + 1,
         "iterations": [int(iters[0]), int(iters[-1])], "frames": nf, "window": window,
         "string": mean, "arc": s, "drift": drift, "scatter": scatter,
         "max_drift": float(drift.max()), "mean_scatter": float(scatter.mean()),
@@ -127,8 +149,11 @@ def main(argv=None):
     p.add_argument("--history", nargs="+", required=True, help="history file(s) of replica 0, in job order")
     p.add_argument("--scales", required=True)
     p.add_argument("--cv", help="CV definition JSON, for names")
-    p.add_argument("--dual", action="store_true", help="the first half of the replicas are the string")
-    p.add_argument("--window", type=int, default=100, help="frames per averaging window")
+    p.add_argument("--dual", action="store_true",
+                   help="cfacv's own driver in dual mode: the first half of the replicas are the string. "
+                        "NOT for the thalweg driver, which writes only the string's images")
+    p.add_argument("--window", type=int, default=0,
+                   help="frames per averaging window [100, or a quarter of the frames recorded when there are fewer than 200]")
     p.add_argument("--tol", type=float, default=0.25, help="gate: largest tolerated drift in scaled units [0.25]")
     p.add_argument("--out", default="string")
     p = sub.add_parser("compare")
@@ -153,7 +178,14 @@ def main(argv=None):
 
     iters, z = read_history(a.history)
     if a.dual:
+        if read_history.thalweg:
+            sys.exit("--dual is for cfacv's own driver. This history was written by the thalweg driver, which records "
+                     "only the string's images: halving it would judge half a string.")
         z = z[:, : z.shape[1] // 2]
+    if not a.window:
+        a.window = 100 if len(z) >= 200 else max(2, len(z) // 4)
+        if len(z) < 200:
+            print(f"{len(z)} frames recorded: using windows of {a.window} frames (the default of 100 needs 200)")
     if z.shape[2] != len(scale):
         sys.exit(f"history has {z.shape[2]} CVs, scales has {len(scale)}")
     names = CVSet.load(a.cv).string if a.cv else [f"cv{j}" for j in range(z.shape[2])]
@@ -167,10 +199,18 @@ def main(argv=None):
     for i, row in enumerate(res["string"]):
         print(f"{i:5d} " + " ".join(f"{v:9.4f}" for v in row) + f" {res['drift'][i]:7.3f} {res['scatter'][i]:8.3f}")
     print(f"length {res['length']:.2f} scaled units; spacing varies by {res['spacing_cv']:.1%}")
+    if res["sharpest_turn"] < 0:
+        print(f"WARNING: the string doubles back at image {res['sharpest_turn_image']} "
+              f"(turn cosine {res['sharpest_turn']:.2f}); a profile along it would cross that region twice")
     print(f"GATE path convergence: {'PASS' if res['pass'] else 'FAIL'} "
           f"(largest drift {res['max_drift']:.3f}, limit {a.tol}; mean scatter {res['mean_scatter']:.3f})")
     np.savetxt(a.out + "_final.dat", res["string"], fmt="%.6f",
                header=f"string averaged over the last {a.window} frames")
+    if read_history.final is not None:
+        np.savetxt(a.out + "_driver_final.dat", read_history.final, fmt="%.6f",
+                   header="the thalweg driver's own result: the string averaged over its last window and respaced")
+        d = np.sqrt(np.mean(np.sum(((read_history.final - res["string"]) / scale) ** 2, axis=1)))
+        print(f"the driver's own final string is in {a.out}_driver_final.dat ({d:.3f} scaled units rms from the one above)")
     save_json(a.out + "_monitor.json", res)
     plot(res, names, iters, a.out)
     return 0 if res["pass"] else 1

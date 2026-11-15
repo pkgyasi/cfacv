@@ -16,18 +16,20 @@ Written 2026-11-14 as `stringtools`; renamed thalweg the same day. Fork-local: n
 
 | stage | file | what it does |
 |---|---|---|
-| 2 | `endpoint_analysis.py` | CV statistics of the two end states, the joint separation test, the periodic-image check; writes `scales.json` and `basins.json` |
+| 2 | `endpoint_analysis.py` | CV statistics of the two end states, the joint separation test, the periodic-image check; writes `<out>_scales.json`, `<out>_basins.json` and `<out>_cvstats.json` (default prefix `endpoints`) |
+| all | `thalweg_run.py` | runs the stages of one settings file in order, keeps a record in `.thalweg/` of the run directory, and stops at the first failed gate; run it again and it carries on. A changed step redoes everything after it; a NAMD run is redone when its config is newer than its log; one runner per directory; an interrupt stops what it started. `examples/alad_cvsel.json` is a complete settings file |
+| 3 | `cv_select.py`, `cvsel_shot.tcl` | chooses the CVs from the system's own data: candidate enumeration, targeted-MD and shot setup, a basin model over the whole candidate pool, and likelihood maximization with a BIC stop. Configurations, not shots, are the sample; the gate is a permutation test. A basin is a core of its state (the features that tell the states apart are capped at 2.5 spreads, and entering takes two consecutive tests); with the basin model built first each shot stops when it enters one, and a tenth of them run on as an audit of that |
 | 3 | `harvest_centers.py` | centers from TAMD trajectories at a minimum SCALED spacing; keeps each center's configuration |
-| 3, 6 | `meanforce.py` | sets up restrained MD at a list of points; collects block-averaged mean forces |
+| 3, 6 | `meanforce.py` | sets up restrained MD at a list of points; collects block-averaged mean forces; `metric` measures the metric tensor at each point from its configuration (no MD) |
 | 3 | `fesmap.py` | single-sweep free-energy map in scaled, periodic-aware CV space; sigma by cross-validation |
-| 4 | `path_search.py` | lowest-barrier routes on the map (graph search, alternatives, zero-temperature strings, random-start cross-check) |
+| 4 | `path_search.py` | lowest-barrier routes on the map: graph search, alternatives, zero-temperature strings between the two basins' minima on the map, and random-start strings, whose routes join the table when the graph search could not return them. With `--forces` it refits the map on subsets of the centers and says how firm the ranking is. A string through a side minimum is reported as such. Strings relax along -M grad F when the map carries a metric tensor (`fesmap.py fit --metric-tensor`): opt-in and NOT READY, the tensor is taken from the nearest center and one test string did not converge |
 | 4 | `init_string.py` | image anchors -> the files the cfacv string driver starts from; warm-ups; the initiation gate |
-| 5 | `string_monitor.py` | convergence of a string from its history file; merged-or-distinct for two strings |
-| 6 | `fe_profile.py` | profile along a string with propagated error, overlap and stability checks; path-independence check |
-| 7 | `committor.py`, `committor_shot.tcl` | unbiased shots that stop on basin entry; the transition-state gate |
-| 5 | `driver/` | a string driver of its own: wrapped torsions, averaged forces with a measured step and a stopping test, spline respacing. See `driver/README.md`. cfacv's driver is unchanged and still usable |
+| 5 | `string_monitor.py` | convergence of a string from its history file; merged-or-distinct for two strings; warns when the string doubles back on itself |
+| 6 | `fe_profile.py` | profile along a string. Errors from block profiles (each block of every run integrated into a whole profile), with Student-t limits; gates on overlap, stability (halves and trend, for the barrier and the end-to-end difference) and resolution (both numbers); warns when blocks are not longer than the correlation time. `--refine` adds images where the force curves. `driver` gives a first profile from the forces the thalweg driver recorded, once the string is shown to have stopped. `compare` is the path-independence check |
+| 7 | `committor.py`, `committor_shot.tcl` | unbiased shots that stop on basin entry; the transition-state gate (at least 100 committed shots, at least 5 configurations of 10, and the uncommitted bracketed both ways) |
+| 5 | `driver/` | a string driver of its own: wrapped torsions, a measured step, images that move on each update's force with the AVERAGED string as the result, optional pinned ends, a stopping test (drift, force left across the string, profile change), spline respacing, restart. See `driver/README.md`. cfacv's driver is unchanged and still usable |
 | 1 | `make_cfacv_inputs.py` | writes cfacv's label PDB and CV file from the CV definition JSON |
-| all | `sbatch/namd_array.sbatch` | one NAMD run per array task from a list file |
+| all | `sbatch/namd_array.sbatch` | one NAMD run per array task from a list file; kills a run that has written nothing for `HANG_MINUTES` |
 | | `common.py` | CV definitions, periodic arithmetic, readers for cfacv's files |
 | | `t4l_cvs.json` | the eleven T4 lysozyme CVs of Abou-Hatab and Abrams 2025 |
 
@@ -88,18 +90,24 @@ cfacv restraint; put it in the NAMD base file by other means (colvars,
 
 ```
 endpoint_analysis.py                      -> endpoints_scales.json, endpoints_basins.json
+make_cfacv_inputs.py                      -> label.pdb, cv.inp           (from the CV JSON)
+cv_select.py candidates ; classifier ; tmd ; shots ; outcomes ; select   (if the CVs are to be chosen)
 (run TAMD with cfacv)
 harvest_centers.py                        -> centers/
-meanforce.py setup ; array ; collect      -> forces.dat
+meanforce.py setup ; array ; collect      -> forces.dat   (; metric -> metric.json, optional)
 fesmap.py fit                             -> map.json
-path_search.py                            -> channels_anchors_N.dat
+path_search.py --forces forces.dat        -> channels_anchors_N.dat
 init_string.py setup ; array ; check      -> stringN/  (+ string_stage_snippet.namd)
-(run the string with cfacv)
-string_monitor.py status / compare        -> stringN_final.dat
+(run the string: thalweg/driver, or cfacv's own driver)
+string_monitor.py status / compare        -> stringN_final.dat  (+ stringN_driver_final.dat)
+fe_profile.py driver                      -> a first profile, free
 meanforce.py setup --points stringN_final.dat ; array
 fe_profile.py compute / compare           -> profile
 committor.py pick ; setup ; array ; tally
 ```
+
+`thalweg_run.py settings.json` runs any stretch of this from one settings
+file and stops at the first gate that fails.
 
 ## Python on picotte
 
@@ -116,35 +124,64 @@ call `sbatch` from a shell where you have purged.
 
 ## Tests
 
+From the repository root:
+
 ```
-python3 -m pytest thalweg/tests       # no MD needed, about a minute
-tclsh tests/reparam_zscale.tcl .          # the zscale change, through the Tcl interface
+python3 -m pytest thalweg/tests                     # no MD needed, under a minute
+tclsh thalweg/tests/string_math_test.tcl            # the driver's arithmetic, under plain tclsh
+namd3 thalweg/tests/string_math_in_namd.namd        # the same arithmetic inside NAMD's Tcl
+tclsh tests/reparam_zscale.tcl .                    # the zscale change, through cfacv's Tcl interface
 ```
 
-`tests/run_list_local.sh <list>` runs a list of configs on a workstation with
-the same rules as the SLURM wrapper.
+`thalweg/tests/run_list_local.sh <list>` runs a list of configs on a
+workstation with the rules of the SLURM wrapper (skip a run whose log ends
+cleanly and is newer than its config; `#PRE` chains; blank and `#` lines
+ignored), without its hang guard.
 
 ## What has and has not been run
 
-Run for real, on alanine dipeptide with NAMD 3 on a workstation: CV values
-from these scripts against cfacv's own, center harvesting, the mean-force
-runs, the map, the path search, the string warm-ups and the committor shots.
+Validated end to end on alanine dipeptide in four torsions (CHARMM22, TIP3P,
+NAMD 3), on a workstation and on picotte: end-state analysis, center
+harvesting, mean forces at 483 centers, the map (left-out force error 0.23
+with a Gaussian width per CV), the path search, string initiation, string
+refinement with cfacv's driver and with the thalweg driver, profiles from
+dedicated restrained runs, the committor shots, CV selection through
+`thalweg_run.py`, and the profile from the driver's own forces.
 
-Run for real on picotte: the string driver with `SMPARAMS(zscale)` and with
-per-replica restraint files, on alanine dipeptide (jobs 26768091-26768093).
+T4 lysozyme: a smoke test only. A closed system (2LZM) and an open one (150L
+chain D) were built; a 12-image string between the closed basin and a point
+part way to open was initiated and run with the thalweg driver for 21,000
+updates without reaching its stopping test. Nothing on T4 lysozyme is a
+result.
 
-NOT shown: the free-energy map did not pass its own gate on short alanine
-dipeptide data (left-out force error 0.65 with 118 centers of 8 ps; limit
-0.5). NOT run: anything on T4 lysozyme, and the SLURM wrapper on picotte.
+Not run: the SLURM array wrapper as a job array on picotte (the runner's
+sbatch mode); the metric-tensor path search beyond one comparison; pinned
+ends on a full closed-to-open string; a helper restraint that is not a
+string coordinate.
+
+Two rounds of independent code review (2026-11-15) found and removed defects
+that had let gates pass for the wrong reason; the tests now include a case
+for each. A gate that has never been seen to fail on bad data has not been
+tested: see `tests/` for which have.
 
 ## Limits worth remembering
 
 - The map is only as wide as the region the centers cover. `path_search.py`
-  keeps strings within `2 sigma` of the nearest center and reports how far
-  each path strays from the data.
-- Barriers read from the map rank channels. The reported barrier comes from
-  the refined string and `fe_profile.py`.
-- The zero-temperature strings on the map use the scaled Euclidean metric,
-  not the metric tensor. The MD string of Stage 5 uses the metric tensor.
+  keeps strings from moving farther than two center spacings from the data
+  and reports how far each path strays.
+- Barriers read from the map rank channels; their error bar is mostly how
+  much the barrier depends on which centers the map has. The reported
+  barrier comes from the refined string and `fe_profile.py`.
+- The profile is the free energy of the CVs integrated along the path. It
+  is not a free energy that includes the width of the transition tube.
+- The driver's step is constant, so the string itself does not converge:
+  it fluctuates about the path, and the AVERAGED string is the result, with
+  a bias of the order of the step.
+- The driver's stopping test holds a run while a force across the string is
+  demonstrably there; it does not wait for the force to be resolved below
+  its tolerance, which would cost as much sampling as a profile.
+- Shots for CV selection are seeded from targeted MD, which has its own
+  known bias; the committor test is what checks the outcome.
 - `t4l_cvs.json` uses the paper's residue numbers and takes chi1 as
-  N-CA-CB-CG. Check both against the built PSF.
+  N-CA-CB-CG. The CVs come from a steered-MD and TAMD study in another force
+  field and engine; that they are adequate string CVs here is a hypothesis.

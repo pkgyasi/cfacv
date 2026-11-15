@@ -22,7 +22,7 @@ Written 2026-11-14 as `stringtools`; renamed thalweg the same day. Fork-local: n
 | 3 | `harvest_centers.py` | centers from TAMD trajectories at a minimum SCALED spacing; keeps each center's configuration |
 | 3, 6 | `meanforce.py` | sets up restrained MD at a list of points; collects block-averaged mean forces; `metric` measures the metric tensor at each point from its configuration (no MD) |
 | 3 | `fesmap.py` | single-sweep free-energy map in scaled, periodic-aware CV space; sigma by cross-validation |
-| 4 | `path_search.py` | lowest-barrier routes on the map: graph search, alternatives, zero-temperature strings between the two basins' minima on the map, and random-start strings, whose routes join the table when the graph search could not return them. With `--forces` it refits the map on subsets of the centers and says how firm the ranking is. A string through a side minimum is reported as such. Strings relax along -M grad F when the map carries a metric tensor (`fesmap.py fit --metric-tensor`): opt-in and NOT READY, the tensor is taken from the nearest center and one test string did not converge |
+| 4 | `path_search.py` | lowest-barrier routes on the map: graph search, alternatives, zero-temperature strings between the two basins' minima on the map, and random-start strings, whose routes join the table when the graph search could not return them. With `--forces` it refits the map on subsets of the centers and says how firm the ranking is. A string through a side minimum is reported as such. When the map carries a metric tensor (`fesmap.py fit --metric-tensor`, opt-in) strings relax to where M grad F lies along them, the condition that defines a minimum free-energy path. They are moved against the part of grad F the path does not balance, with M^-1 as preconditioner and upwind tangents, after a first relaxation without the tensor; the tensor is a smooth average over nearby centers. On alanine dipeptide these strings lie 0.17 to 0.28 scaled units from the MD strings of three routes, the tensor-free ones 0.37 to 0.63; barriers and their order are the same, since both kinds of path cross the same saddles |
 | 4 | `init_string.py` | image anchors -> the files the cfacv string driver starts from; warm-ups; the initiation gate |
 | 5 | `string_monitor.py` | convergence of a string from its history file; merged-or-distinct for two strings; warns when the string doubles back on itself |
 | 6 | `fe_profile.py` | profile along a string. Errors from block profiles (each block of every run integrated into a whole profile), with Student-t limits; gates on overlap, stability (halves and trend, for the barrier and the end-to-end difference) and resolution (both numbers); warns when blocks are not longer than the correlation time. `--refine` adds images where the force curves. `driver` gives a first profile from the forces the thalweg driver recorded, once the string is shown to have stopped. `compare` is the path-independence check |
@@ -155,7 +155,7 @@ updates without reaching its stopping test. Nothing on T4 lysozyme is a
 result.
 
 Not run: the SLURM array wrapper as a job array on picotte (the runner's
-sbatch mode); the metric-tensor path search beyond one comparison; pinned
+sbatch mode); an MD string run to rest from a metric-tensor starting string; pinned
 ends on a full closed-to-open string; a helper restraint that is not a
 string coordinate.
 
@@ -180,8 +180,14 @@ tested: see `tests/` for which have.
 - The driver's stopping test holds a run while a force across the string is
   demonstrably there; it does not wait for the force to be resolved below
   its tolerance, which would cost as much sampling as a profile.
-- Shots for CV selection are seeded from targeted MD, which has its own
-  known bias; the committor test is what checks the outcome.
+- Shots for CV selection need configurations BETWEEN the basins. Evenly
+  spaced targeted-MD frames mostly start inside one (alanine dipeptide: 38
+  usable configurations of 180, 6 with shots going both ways). Frames from
+  the images around the barrier tops of MD strings do far better (`shots
+  --dcd` takes any trajectories: 183 usable of 210, 82 going both ways), but
+  they come from runs restrained in the string's CVs, so they vary little in
+  those CVs across the path and cannot show that one of them matters. Either
+  way the committor test is what checks the outcome.
 - `t4l_cvs.json` uses the paper's residue numbers and takes chi1 as
   N-CA-CB-CG. The CVs come from a steered-MD and TAMD study in another force
   field and engine; that they are adequate string CVs here is a hypothesis.

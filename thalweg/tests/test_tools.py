@@ -383,6 +383,47 @@ def test_mobility_bends_the_relaxed_string():
     assert np.allclose(m2.M, m.M) and np.allclose(m2.mobility(P[:3]), m.mobility(P[:3]))
 
 
+def test_metric_relaxation_reaches_the_path_M_grad_F_defines():
+    """Two wells joined by a curved valley, and a tensor whose eigenvalues
+    differ 200-fold with the slow direction nearly across the valley.  The
+    relaxation must converge, must end on the path the textbook flow along
+    -M grad F reaches when run until it truly stops, and that path must
+    differ from the one found without the tensor."""
+    from fesmap import fit_with_sigma_scan
+    import path_search as ps
+    P = np.array([(x, y) for x in np.arange(-1.6, 1.6 + 1e-9, 0.2) for y in np.arange(-1.2, 1.2 + 1e-9, 0.2)])
+    w = P[:, 1] - 0.5 * np.sin(1.5 * P[:, 0])
+    f = -np.column_stack([4 * P[:, 0] * (P[:, 0] ** 2 - 1) - 6 * w * 0.75 * np.cos(1.5 * P[:, 0]), 6 * w])
+    m, _, _ = fit_with_sigma_scan(P, f, np.ones(2), np.zeros(2, bool))
+    e0, e1 = ps.descend(m, [-1, -0.5]), ps.descend(m, [1, 0.5])
+    start = np.linspace(e0, e1, 16); start[1:-1, 1] += 0.4
+    plain, _, conv0 = ps.relax_string(m, start, 16)
+    c, s_ = np.cos(1.3), np.sin(1.3); R = np.array([[c, -s_], [s_, c]])
+    m.set_metric_tensor(P, np.tile(R @ np.diag([1.0, 200.0]) @ R.T, (len(P), 1, 1)))
+    new, n_it, conv = ps.relax_string(m, start, 16)
+    assert conv0 and conv and n_it < 2000
+    path = ps.redistribute(start.copy(), 16, m.metric)        # the textbook flow: images along -M grad F, ends held, respaced
+    gm = np.einsum("pij,pj->pi", m.mobility(m.centers), m.gradient(m.centers))
+    dt = 0.05 / np.percentile(np.linalg.norm(gm, axis=1), 90)
+    for _ in range(20000):
+        q = path - dt * np.einsum("pij,pj->pi", m.mobility(path), m.gradient(path)); q[0], q[-1] = path[0], path[-1]
+        path = ps.redistribute(q, 16, m.metric)
+    assert ps.path_distance(new, path, m.metric) < 0.02       # the same path as the textbook flow
+    assert ps.path_distance(plain, new, m.metric) > 0.1       # and not the one the tensor-free relaxation finds
+    assert np.abs(ps.across_metric(m, new, m.gradient(new))[1:-1]).max() < 0.1
+
+
+def test_upwind_tangents():
+    import path_search as ps
+    u = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [2.0, 1.0]])
+    t = ps.upwind_tangents(u, np.array([0.0, 1.0, 2.0, 3.0]))             # rising: look ahead
+    assert np.allclose(t[1], [0, 1]) and np.allclose(t[2], [1, 0])
+    t = ps.upwind_tangents(u, np.array([3.0, 2.0, 1.0, 0.0]))             # falling: look back
+    assert np.allclose(t[1], [1, 0]) and np.allclose(t[2], [0, 1])
+    t = ps.upwind_tangents(u, np.array([0.0, 1.0, 1.0, 0.0]))             # a flat top: a mix, still unit length
+    assert np.allclose(np.linalg.norm(t, axis=1), 1.0)
+
+
 def test_metric_from_cfacv_log(tmp_path):
     import meanforce as mf
     rng = np.random.default_rng(5)

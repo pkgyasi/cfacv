@@ -180,13 +180,59 @@ def cut_spurs(path, scale, cos_min=0.0):
     return path
 
 
+def upwind_tangents(u, F):
+    """Unit tangents of a string from the neighbour on the UPHILL side of
+    each image (both neighbours, weighted, at a maximum or minimum of F along
+    the string): the tangent of Henkelman and Jonsson, J Chem Phys 113, 9978
+    (2000).  A flow that pushes images along the string as well as across it
+    carries a perturbation along the string, and central differences then
+    amplify it: with them two of three alanine dipeptide routes cycled for
+    ever at 6e-3 scaled units per step; with these all three converge."""
+    u = np.asarray(u, float); F = np.asarray(F, float)
+    t = np.gradient(u, axis=0)
+    if len(u) > 2:
+        a = u[2:] - u[1:-1]; b = u[1:-1] - u[:-2]
+        up = F[2:] - F[1:-1]; dn = F[:-2] - F[1:-1]
+        hi = np.maximum(np.abs(up), np.abs(dn))[:, None]; lo = np.minimum(np.abs(up), np.abs(dn))[:, None]
+        rising = (F[2:] > F[1:-1]) & (F[1:-1] > F[:-2]); falling = (F[2:] < F[1:-1]) & (F[1:-1] < F[:-2])
+        mixed = np.where((F[2:] > F[:-2])[:, None], a * hi + b * lo, a * lo + b * hi)
+        t[1:-1] = np.where(rising[:, None], a, np.where(falling[:, None], b, mixed))
+    return t / np.maximum(np.linalg.norm(t, axis=1, keepdims=True), 1e-300)
+
+
+def across_metric(m, path, g_u):
+    """The part of the scaled gradient that a minimum free-energy path does
+    not balance: g minus its component along n = M^-1 t / |M^-1 t|, with t the
+    path's tangent and M the (scaled) metric tensor there.  It vanishes where
+    M grad F is parallel to the tangent, which is what defines the path.
+
+    The string is moved along MINUS THIS, not along -M grad F.  Both flows
+    stop at the same paths.  Moving along -M grad F is the textbook form, but
+    here M's eigenvalues differ 250-fold (torsions that barely move the atoms
+    against ones that swing a whole group), so a step small enough for the
+    fast directions leaves the slow ones, the ones the path runs along,
+    almost still.  On the alanine dipeptide map such relaxations met their
+    stopping test 0.03 to 0.09 scaled units short of where they ended after
+    200,000 iterations (six minutes a string), with 0.04 to 0.31 of this
+    residual left; this flow reaches the same paths, to 0.01, in under 2,000
+    iterations.  It is the same descent with
+    M^-1 as a preconditioner (it lowers F at a rate >= 0 by Cauchy-Schwarz in
+    the M^-1 inner product), has the conditioning of plain descent, and needs
+    no special step or iteration cap.  It does need upwind tangents (see
+    `upwind_tangents`), because unlike -M grad F it uses the tangent."""
+    t = upwind_tangents(path / m.metric, m.value(path))
+    n = np.linalg.solve(m.mobility(path), t[:, :, None])[:, :, 0]
+    n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-300)
+    return g_u - np.sum(g_u * n, axis=1, keepdims=True) * n
+
+
 def _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends):
     converged = False
     for it in range(max_iter):
         g_u = m.gradient(path) * m.metric                    # dF/du
         if m.M is not None:
-            g_u = np.einsum("pij,pj->pi", m.mobility(path), g_u)
-        new = path - dt * g_u * m.metric                     # du = -dt M dF/du
+            g_u = across_metric(m, path, g_u)
+        new = path - dt * g_u * m.metric
         if fix_ends:
             new[0], new[-1] = path[0], path[-1]
         if support is not None:
@@ -204,8 +250,9 @@ def _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends):
 
 def relax_string(m, path, n_images, dt=None, max_iter=None, tol=1e-4, support=None, fix_ends=True, cut=-0.5):
     """Descent in scaled coordinates plus equal-arc redistribution.  With a
-    metric tensor on the map the images move along -M grad F, which is what
-    defines the minimum free-energy path; without one, along -grad F.
+    metric tensor on the map the images move against the part of grad F that
+    a minimum free-energy path does not balance (see `across_metric`), which
+    stops where M grad F is parallel to the path; without one, along -grad F.
 
     The two end images stay where they start (fix_ends): free ends slide to
     whichever sub-minimum of the basin is nearest, so two relaxations of the
@@ -229,22 +276,29 @@ def relax_string(m, path, n_images, dt=None, max_iter=None, tol=1e-4, support=No
     Returns (path, iterations, converged); relax_string.info holds
     {"through_minimum": bool, "cut": bool} for the last call."""
     path = redistribute(unwrap_path(path, m.periodic), n_images, m.metric)
-    # a step that moves the steepest center about 0.05 metric units; with a
-    # tensor the step is set from M grad F, not grad F, or the directions the
-    # tensor slows down (often the ones the path runs along) barely move
+    # a step that moves the steepest center about 0.05 metric units
     gc = m.gradient(m.centers) * m.metric
     dt_plain = 0.05 / max(np.percentile(np.linalg.norm(gc, axis=1), 90), 1e-12)
     if dt is None:
         dt = dt_plain
-        if m.M is not None:
-            gm = np.einsum("pij,pj->pi", m.mobility(m.centers), gc)
-            dt = 0.05 / max(np.percentile(np.linalg.norm(gm, axis=1), 90), 1e-12)
     if max_iter is None:
-        max_iter = 4000 if m.M is None else 20000
+        max_iter = 4000
     # the stopping test is on move / dt, a residual force, so it means the
     # same thing whatever the step
     stop = tol * dt / dt_plain
+    n_pre = 0
+    if m.M is not None:
+        # first to the tensor-free path, then on from there with the tensor: a
+        # string still far from any path (a graph route, a random start) can
+        # double back on itself under the tensor flow and never settle, and
+        # started from the tensor-free path it does not
+        M, m.M = m.M, None
+        try:
+            path, n_pre, _ = _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends)
+        finally:
+            m.M = M
     path, n_it, conv = _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends)
+    n_it += n_pre
     info = {"through_minimum": False, "cut": False}
     if cut is not None and conv and turn_cosines(path, m.metric).min() < cut:
         trial = redistribute(cut_spurs(path, m.metric, cut), n_images, m.metric)
@@ -527,7 +581,7 @@ def main(argv=None):
     m = FESMap.load(a.map)
     if a.no_metric_tensor:
         m.M = None
-    print("strings relaxed along -M grad F, with the metric tensor measured at the centers" if m.M is not None else
+    print("strings relaxed to where M grad F lies along them, with the metric tensor measured at the centers" if m.M is not None else
           "strings relaxed along -grad F (no metric tensor on the map: see 'meanforce.py metric')")
     b = load_json(a.basins)
     res = search(m, np.array(b["closed"]["centre"]), np.array(b["open"]["centre"]), a.images, a.channels,

@@ -47,6 +47,8 @@ class FESMap:
         # the metric tensor measured at each center (K, D, D), if it was; the
         # string moves along -M grad F
         self.M = None if M is None else np.asarray(M, float)
+        # width, in metric units, of the average that `mobility` takes over the centers
+        self.mobility_width = 0.5
 
     def set_metric_tensor(self, points, M):
         """Attach tensors measured at `points` to the centers they belong to."""
@@ -68,7 +70,13 @@ class FESMap:
         Mu = self.M / np.outer(self.metric, self.metric)
         Mu = Mu / np.median(np.trace(Mu, axis1=1, axis2=2) / D)
         dm = diff(z[:, None, :], self.centers[None, :, :], self.periodic) / self.metric
-        return Mu[np.sum(dm ** 2, axis=2).argmin(axis=1)]
+        d2 = np.sum(dm ** 2, axis=2)
+        # a smooth average over the centers within about one metric unit, not
+        # the nearest center's tensor alone: a field that jumps where the
+        # nearest center changes gives a relaxation nothing to converge to
+        w = np.exp(-0.5 * (d2 - d2.min(axis=1, keepdims=True)) / self.mobility_width ** 2)
+        w /= w.sum(axis=1, keepdims=True)
+        return np.einsum("pk,kij->pij", w, Mu)
 
     # -- evaluation ---------------------------------------------------------
     def _du(self, z):

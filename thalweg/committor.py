@@ -123,7 +123,7 @@ def setup(a):
           f"submit {a.out}/runs.list as an array of 1-{len(confs)}")
 
 
-def tally_counts(counts, max_uncommitted=0.2, alpha=0.05):
+def tally_counts(counts, max_uncommitted=0.2, alpha=0.05, min_committed=100, min_per_config=10, min_configs=5):
     """counts: list of (n_closed, n_open, n_uncommitted, n_missing) per configuration."""
     from scipy.stats import chi2
     c = np.array(counts, dtype=float)
@@ -135,7 +135,9 @@ def tally_counts(counts, max_uncommitted=0.2, alpha=0.05):
     P = nB.sum() / N if N else float("nan")
     se = float(np.sqrt(P * (1 - P) / N)) if N else float("nan")
     # homogeneity: are the per-configuration values draws from one binomial?
-    use = n > 0
+    # a configuration with a handful of shots says nothing about homogeneity
+    use = n >= min_per_config
+    testable = bool(use.sum() >= min_configs)
     if 0 < P < 1 and use.sum() > 1:
         stat = float(np.sum((nB[use] - n[use] * P) ** 2 / (n[use] * P * (1 - P))))
         dof = int(use.sum() - 1)
@@ -143,13 +145,25 @@ def tally_counts(counts, max_uncommitted=0.2, alpha=0.05):
     else:
         stat, dof, pval = float("nan"), 0, float("nan")
     unc = float(nU.sum() / (N + nU.sum())) if (N + nU.sum()) else float("nan")
-    centred = bool(N > 0 and abs(P - 0.5) <= 2 * np.sqrt(0.25 / N))
+    # "not shown to differ from 1/2" passes on lack of evidence when N is
+    # small (7 closed, 13 open of 20 passed), so a minimum count is part of it
+    enough = bool(N >= min_committed)
+    half = 2 * np.sqrt(0.25 / N) if N else float("nan")
+    # the uncommitted are not in P; where they would have gone is unknown, so
+    # P is bracketed by sending all of them one way and then the other, and
+    # BOTH ends must be inside the window
+    tot = N + nU.sum()
+    lo, hi = (float(nB.sum() / tot), float((nB.sum() + nU.sum()) / tot)) if tot else (float("nan"),) * 2
+    centred = bool(enough and abs(P - 0.5) <= half and lo >= 0.5 - half and hi <= 0.5 + half)
     homogeneous = bool(np.isfinite(pval) and pval >= alpha)
     res = {"per_config_p_open": p, "per_config_committed": n, "pooled_p_open": float(P), "pooled_se": se,
            "committed": int(N), "uncommitted": int(nU.sum()), "missing": int(c[:, 3].sum()),
            "uncommitted_fraction": unc, "chi2": stat, "dof": dof, "p_value": pval,
-           "centred": centred, "homogeneous": homogeneous, "few_uncommitted": bool(unc <= max_uncommitted)}
-    res["pass"] = bool(centred and homogeneous and res["few_uncommitted"] and res["missing"] == 0)
+           "centred": centred, "enough": enough, "min_committed": int(min_committed),
+           "window": [0.5 - half, 0.5 + half] if N else None, "p_bounds": [lo, hi],
+           "testable": testable, "configs_used": int(use.sum()),
+           "homogeneous": homogeneous, "few_uncommitted": bool(unc <= max_uncommitted)}
+    res["pass"] = bool(centred and testable and homogeneous and res["few_uncommitted"] and res["missing"] == 0)
     return res
 
 
@@ -173,7 +187,7 @@ def tally(a):
             else:
                 nU += 1
         counts.append((nA, nB, nU, nM))
-    r = tally_counts(counts, a.max_uncommitted)
+    r = tally_counts(counts, a.max_uncommitted, min_committed=a.min_committed, min_per_config=a.min_per_config, min_configs=a.min_configs)
     print(f"{'config':>6s} {A:>7s} {B:>7s} {'uncomm.':>8s} {'missing':>8s} {'p(' + B + ')':>9s}")
     for c, (nA, nB, nU, nM) in enumerate(counts):
         print(f"{c:6d} {nA:7d} {nB:7d} {nU:8d} {nM:8d} {r['per_config_p_open'][c]:9.2f}")
@@ -181,7 +195,12 @@ def tally(a):
           f"trajectories; {r['uncommitted']} uncommitted ({r['uncommitted_fraction']:.1%}), {r['missing']} missing")
     if steps:
         print(f"trajectory length: median {int(np.median(steps))} steps, longest {max(steps)}")
-    print(f"  centred on 0.5 within 2 standard errors : {'yes' if r['centred'] else 'NO'}")
+    print(f"  at least {a.min_committed} committed trajectories      : {'yes' if r['enough'] else 'NO'} ({r['committed']})")
+    if r["window"]:
+        print(f"  centred on 0.5 within 2 standard errors : {'yes' if r['centred'] else 'NO'} (window {r['window'][0]:.2f} to {r['window'][1]:.2f}; "
+              f"with the uncommitted sent all one way or the other, p is {r['p_bounds'][0]:.2f} to {r['p_bounds'][1]:.2f})")
+    print(f"  enough configurations to test sameness  : {'yes' if r['testable'] else 'NO'} "
+          f"({r['configs_used']} with at least {a.min_per_config} committed; {a.min_configs} needed)")
     print(f"  configurations consistent with one value: {'yes' if r['homogeneous'] else 'NO'} "
           f"(chi-square {r['chi2']:.1f} on {r['dof']} dof, p = {r['p_value']:.3f})")
     print(f"  uncommitted fraction within {a.max_uncommitted:.0%}       : {'yes' if r['few_uncommitted'] else 'NO'}")
@@ -217,6 +236,11 @@ def main(argv=None):
     p = sub.add_parser("tally")
     p.add_argument("--dir", default="shots")
     p.add_argument("--max-uncommitted", type=float, default=0.2)
+    p.add_argument("--min-per-config", type=int, default=10, help="committed trajectories a configuration needs to count [10]")
+    p.add_argument("--min-configs", type=int, default=5, help="such configurations needed for the sameness test [5]")
+    p.add_argument("--min-committed", type=int, default=100,
+                   help="fewest committed trajectories for the gate to be able to pass [100]: with few, "
+                        "'not shown to differ from 1/2' is true of almost anything")
     a = ap.parse_args(argv)
     if a.cmd == "pick":
         pick(a); return 0

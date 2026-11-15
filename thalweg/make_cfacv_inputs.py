@@ -25,9 +25,21 @@ import sys
 from common import CVSet
 
 
-def serial_field(n):
-    """PDB serial, columns 7-11: decimal up to 99999, then hexadecimal as VMD writes it."""
-    return f"{n:5d}" if n <= 99999 else f"{n:5x}"
+def serial_field(n, in_group=False):
+    """PDB serial, columns 7-11: decimal up to 99999, then hexadecimal as VMD writes it.
+
+    cfacv's reader takes the field as DECIMAL whenever it looks like a whole
+    number, so a hexadecimal serial with no letter in it (148000 -> "24220")
+    is read as a different atom, silently.  For an atom that is in a group
+    that would put a CV on the wrong atom, so it is refused here."""
+    if n <= 99999:
+        return f"{n:5d}"
+    s = f"{n:5x}"
+    if in_group and s.strip().isdigit():
+        raise ValueError(f"atom serial {n} is written '{s.strip()}' in hexadecimal, which cfacv would read as decimal "
+                         f"atom {int(s)}: this atom cannot be used in a CV group through a label PDB. "
+                         "Reorder the system so the CV atoms come first (serial <= 99999).")
+    return s
 
 
 def build_groups(cvset, universe):
@@ -64,7 +76,7 @@ def write_label_pdb(path, universe, groups):
             occ = float(a.mass) if g else 0.0
             name = a.name if len(a.name) == 4 else f" {a.name:<3s}"
             x, y, z = a.position
-            fh.write(f"ATOM  {serial_field(a.index + 1)} {name:4s} {a.resname:<4s}{(a.segid or 'X')[:1]}"
+            fh.write(f"ATOM  {serial_field(a.index + 1, bool(g))} {name:4s} {a.resname:<4s}{(a.segid or 'X')[:1]}"
                      f"{a.resid % 10000:4d}    {x:8.3f}{y:8.3f}{z:8.3f}{occ:6.2f}{g:6.2f}"
                      f"      {a.segid[:4]:<4s}\n")
         fh.write("END\n")

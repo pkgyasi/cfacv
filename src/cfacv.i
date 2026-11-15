@@ -35,6 +35,7 @@ extern double * SMDataSpace_image_oldz ( SMDataSpace * sm, int i );
 extern double * SMDataSpace_image_g ( SMDataSpace * sm, int i );
 extern double * SMDataSpace_image_M ( SMDataSpace * sm, int i );
 extern int SMDataSpace_reparameterize ( SMDataSpace * sm );
+extern double * SMDataSpace_zscale ( SMDataSpace * sm );
 extern int SMDataSpace_MoveString ( SMDataSpace * sm, double stepsize );
 extern int SMDataSpace_climb ( SMDataSpace * sm );
 extern int SMDataSpace_set_reparam_tol ( SMDataSpace * sm, double reparam_tol, int maxiter );

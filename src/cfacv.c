@@ -1211,6 +1211,11 @@ SMDataSpace * New_stringMethod_Dataspace ( int ni, int nz, int outputlevel, doub
 
   sm->ztyp=(int*)malloc(nz*sizeof(int));
 
+  /* per-CV length scale used ONLY to measure arc length in the
+     reparameterization; 1.0 reproduces the historical raw-unit behavior */
+  sm->zscale=(double*)malloc(nz*sizeof(double));
+  for (i=0;i<nz;i++) sm->zscale[i]=1.0;
+
   sm->nu = nu;
 
   fprintf(stderr,"CFACV/C) Finished string-method dataspace allocation.\n");
@@ -1254,6 +1259,25 @@ double sm_euc ( double * a, double * b, int D ) {
   double d=0.0;
   for (i=0;i<D;i++) d+=(b[i]-a[i])*(b[i]-a[i]);
   return sqrt(d);
+}
+
+/* Distance with each component divided by its own length scale w[i].
+   CVs of different kinds (distances in A, torsions in rad) are not
+   commensurate in raw units; this is the distance the reparameterization
+   uses to space the images.  w==NULL means unscaled. */
+double sm_euc_scaled ( double * a, double * b, double * w, int D ) {
+  int i;
+  double d=0.0, x;
+  for (i=0;i<D;i++) {
+    x=(b[i]-a[i])/(w?w[i]:1.0);
+    d+=x*x;
+  }
+  return sqrt(d);
+}
+
+double * SMDataSpace_zscale ( SMDataSpace * sm ) {
+  if (sm) return sm->zscale;
+  return NULL;
 }
 
 void sm_sub ( double * d, double * a, double * b, int D ) {
@@ -1337,6 +1361,7 @@ int SMDataSpace_reparameterize ( SMDataSpace * sm ) {
     int nz=sm->nz;
     double * L=sm->L;
     double * s=sm->s;
+    double * w=sm->zscale;
     int i,k,tk;
     double del=0.0;
     int iter=0;
@@ -1362,7 +1387,7 @@ int SMDataSpace_reparameterize ( SMDataSpace * sm ) {
     while (no_iter || (iter < sm->reparam_maxiter && err > sm->reparam_tol)) {
     /* 1. compute actual running arc length of the un-reparameterized string */
     L[0]=0.0;
-    for (i=1;i<ni;i++) L[i]=L[i-1]+sm_euc(sm->z[i],sm->z[i-1],nz);
+    for (i=1;i<ni;i++) L[i]=L[i-1]+sm_euc_scaled(sm->z[i],sm->z[i-1],w,nz);
     /* 2. compute desired (equidistant) running arc length */
     s[0]=0.0;
     dL=L[ni-1]/(ni-1);
@@ -1371,7 +1396,7 @@ int SMDataSpace_reparameterize ( SMDataSpace * sm ) {
     if (sm->outputlevel>0) {
       fprintf(stdout,"CFACV/C) string pre-reparam interimage stepsizes: |");
       for (i=1;i<ni;i++) {
-        fprintf(stdout,"%.5lf|",sm_euc(sm->z[i-1],sm->z[i],nz));
+        fprintf(stdout,"%.5lf|",sm_euc_scaled(sm->z[i-1],sm->z[i],w,nz));
       }
       fprintf(stdout,"\n");
     }
@@ -1401,15 +1426,22 @@ int SMDataSpace_reparameterize ( SMDataSpace * sm ) {
       }
     }
 
-    for (i=0;i<ni;i++) sm->z[i]=sm->zn[i];
-    if (sm->dual) for (i=ni;i<sm->ni;i++) sm->z[i]=sm->zn[i]=sm->z[i-ni];
+    /* Copy VALUES back.  This used to assign the pointers (z[i]=zn[i]),
+       which made z and zn the same memory from the first call onward, so
+       that every later interpolation read neighbors that had already been
+       overwritten in the same pass (and leaked the original z arrays). */
+    for (i=0;i<ni;i++) sm_cop(sm->z[i],sm->zn[i],nz);
+    if (sm->dual) for (i=ni;i<sm->ni;i++) {
+      sm_cop(sm->z[i],sm->z[i-ni],nz);
+      sm_cop(sm->zn[i],sm->z[i-ni],nz);
+    }
  
     /* check the convergence of the reparameterization */
     err=0.0;
     sum=0.0;
     sum2=0.0;
     for (i=1;i<ni;i++) {
-      d=sm_euc(sm->z[i-1],sm->z[i],nz);
+      d=sm_euc_scaled(sm->z[i-1],sm->z[i],w,nz);
       sum+=d;
       sum2+=d*d;
     }
@@ -1427,13 +1459,13 @@ int SMDataSpace_reparameterize ( SMDataSpace * sm ) {
     if (sm->outputlevel>0) {
       fprintf(stdout,"CFACV/C) string post-reparam interimage stepsizes after %i iterations (%.5le): |",iter,err);
       for (i=1;i<ni;i++) {
-	fprintf(stdout,"%.5lf|",sm_euc(sm->z[i-1],sm->z[i],nz));
+	fprintf(stdout,"%.5lf|",sm_euc_scaled(sm->z[i-1],sm->z[i],w,nz));
       }
       fprintf(stdout,"\n");
       if (sm->dual) {
         fprintf(stdout,"CFACV/C)    plus partner images in dual-image configuration |");
         for (i=ni+1;i<sm->ni;i++) {
-          fprintf(stdout,"%.5lf|",sm_euc(sm->z[i-1],sm->z[i],nz));
+          fprintf(stdout,"%.5lf|",sm_euc_scaled(sm->z[i-1],sm->z[i],w,nz));
         }
         fprintf(stdout,"\n");
       }

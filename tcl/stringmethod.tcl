@@ -179,6 +179,25 @@ if {[expr $replica_id == 0]} {
     ListToArray_Data [SMDataSpace_image_z $smds $i] $image_z($i)
   }
   SMDataSpace_set_reparam_tol $smds $SMPARAMS(reparam_tol) $SMPARAMS(maxiter)
+  # Optional per-CV length scales for the reparameterization, one per CV in
+  # cv.inp order, in the CV's own units (A for BOND, rad for ANGLE/DIHED).
+  # Arc length is then measured with each CV divided by its scale, so CVs of
+  # different kinds share the images fairly.  Unset = 1.0 for every CV, the
+  # historical behavior.  The string update and the mean force are unaffected.
+  if {[info exists SMPARAMS(zscale)]} {
+    if {[llength $SMPARAMS(zscale)] != $SMPARAMS(nz)} {
+      puts stderr "CFACV/SM) ERROR: SMPARAMS(zscale) has [llength $SMPARAMS(zscale)] entries; CV space is $SMPARAMS(nz)-dimensional"
+      exit 1
+    }
+    foreach zs $SMPARAMS(zscale) {
+      if {![string is double -strict $zs] || $zs <= 0.0} {
+        puts stderr "CFACV/SM) ERROR: SMPARAMS(zscale) entries must be positive numbers; got '$zs'"
+        exit 1
+      }
+    }
+    ListToArray_Data [SMDataSpace_zscale $smds] $SMPARAMS(zscale)
+    puts stdout "CFACV/SM) reparameterization length scales: $SMPARAMS(zscale)"
+  }
 }
 
 set new_z 1

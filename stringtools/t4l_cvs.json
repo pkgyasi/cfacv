@@ -1,0 +1,18 @@
+{
+ "_source": "Abou-Hatab and Abrams, J Phys Chem B 2025;129:5176, Table 1 and Figure 2. Residue numbers are the paper's; check them against the built PSF before use. chi1 is taken as N-CA-CB-CG.",
+ "cvs": [
+  {"name": "d1",   "type": "BOND",  "atoms": ["protein and resid 22 and name CA",  "protein and resid 141 and name CA"]},
+  {"name": "d2",   "type": "BOND",  "atoms": ["protein and resid 5 and name CA",   "protein and resid 59 and name CA"]},
+  {"name": "d6",   "type": "BOND",  "atoms": ["protein and resid 8 and name CZ",   "protein and resid 64 and name CD"]},
+  {"name": "chi1", "type": "DIHED", "atoms": ["protein and resid 4 and name N",    "protein and resid 4 and name CA",
+                                               "protein and resid 4 and name CB",   "protein and resid 4 and name CG"]},
+  {"name": "d3",   "type": "BOND",  "atoms": ["protein and resid 35 and name CA",  "protein and resid 109 and name CA"]},
+  {"name": "d4",   "type": "BOND",  "atoms": ["protein and resid 35 and name CA",  "protein and resid 137 and name CA"]},
+  {"name": "d5",   "type": "BOND",  "atoms": ["protein and resid 45 and name CA",  "protein and resid 109 and name CA"]},
+  {"name": "d7",   "type": "BOND",  "atoms": ["protein and resid 4 and name CA",   "protein and resid 60 and name CA"]},
+  {"name": "d8",   "type": "BOND",  "atoms": ["protein and resid 4 and name CZ",   "protein and resid 63 and name CA"]},
+  {"name": "d9",   "type": "BOND",  "atoms": ["protein and resid 8 and name CZ",   "protein and resid 9 and name CB"]},
+  {"name": "d10",  "type": "BOND",  "atoms": ["protein and resid 64 and name CD",  "protein and resid 65 and name NZ"]}
+ ],
+ "string": ["d1", "d2", "d6", "chi1"]
+}

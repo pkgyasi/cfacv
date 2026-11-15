@@ -55,9 +55,25 @@ deviation of the inter-image distances is at most `SMPARAMS(reparam_tol)`;
 if that takes more than `SMPARAMS(maxiter)` passes, the run stops with an
 error.
 
+By default arc length is the ordinary Euclidean distance in CV space, which
+is meaningful only when every CV has the same units. `SMPARAMS(zscale)` gives
+one positive length scale per CV, in `cv.inp` order and in the CV's own units
+(Å for `BOND`, radians for `ANGLE` and `DIHED`); arc length is then measured
+with each CV divided by its scale, so that a torsion and a distance share the
+images in proportion to how far each moves in units of its own scale. Only the
+spacing of the images uses the scales: the image update and the mean force do
+not.
+
 ```{warning}
-Arc length is measured with the ordinary Euclidean distance in CV space, and
-periodic CVs are not wrapped, either in the arc length or in the image update.
+The scales decide where the images go, and with too few images on one CV the
+path itself changes. In a test on alanine dipeptide with 12 images, weighting
+ψ four times as heavily as φ left about three images on the φ crossing, and
+the string cut the corner there. Choose the scales and the number of images
+together, and look at each CV against the image index.
+```
+
+```{warning}
+Periodic CVs are not wrapped, either in the arc length or in the image update.
 A string of dihedral angles must not cross $\pm\pi$.
 ```
 
@@ -94,6 +110,7 @@ Set in the string-method configuration file (in the example,
 | `SMPARAMS(evolve_ends)` | 1 to move the end images, 0 to hold them fixed |
 | `SMPARAMS(reparam_tol)` | reparameterization tolerance on the spread of inter-image distances |
 | `SMPARAMS(maxiter)` | maximum reparameterization passes per update |
+| `SMPARAMS(zscale)` | list of one length scale per CV for measuring arc length; unset, every scale is 1 |
 | `SMPARAMS(dual)` | 1 for dual-image mode |
 | `SMPARAMS(nu)` | climbing factor for the last image; 0 (the default) disables climbing |
 | `SMPARAMS(outputlevel)` | above 0, log the inter-image distances before and after each reparameterization |

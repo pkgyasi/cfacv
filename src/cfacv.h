@@ -156,6 +156,7 @@ typedef struct SMDATASPACESTRUCT {
   double ** g; // dF/dz for over all images
   double ** zn; // after reparameterization
   int * ztyp; // type of CV
+  double * zscale; // per-CV length scale for arc length in reparameterization (default 1.0)
   double * L; // running arclength
   double * s; // equally-spaced running arclength
   double reparam_tol;
@@ -178,6 +179,7 @@ double * SMDataSpace_image_M ( SMDataSpace * sm, int i );
 int SMDataSpace_climb ( SMDataSpace * sm );
 int SMDataSpace_MoveString ( SMDataSpace * sm, double stepsize );
 int SMDataSpace_reparameterize ( SMDataSpace * sm );
+double * SMDataSpace_zscale ( SMDataSpace * sm );
 int SMDataSpace_set_reparam_tol ( SMDataSpace * sm, double reparam_tol, int maxiter );
 double * DataSpace_centerPos ( DataSpace * ds, int i );
 double * DataSpace_z ( DataSpace * ds );

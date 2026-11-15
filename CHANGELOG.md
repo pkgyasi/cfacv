@@ -10,6 +10,11 @@ Releases are made as needed (see `RELEASING.md`). Add an entry under
 ## [Unreleased]
 
 ### Added
+- `SMPARAMS(zscale)`: per-CV length scales for the string method's
+  reparameterization. Arc length is measured with each CV divided by its
+  scale, so that CVs of different units (distances and torsions) share the
+  images. Unset, the behavior is unchanged. `tests/reparam_zscale.tcl` checks
+  it.
 - The formats of the three input files (label PDB, CV file, restraint file)
   are specified in the reference docs, "Input files", as a public interface
   that changes only compatibly within a major version, so other programs can

@@ -246,7 +246,7 @@ for {set i 0} {$i <= 10} {incr i} { set y [expr {0.2 * $i}]; lappend zz [list 0.
 check "trapezoid profile of a linear force is exact" [expr {abs([lindex [tw::profile $zz $gg] end] - 2.0) < 1e-12}]
 # a profile still changing between windows blocks the stop, whatever the drift and the force say
 tw::init {{0.0 0.0} {1.0 0.0} {2.0 0.0} {3.0 0.0}} {1.0 1.0} {0 0}
-foreach {k v} {calibrate 2 memory 2 stepsize 1e-9 conv_window 2 conv_count 1 profile_tol 0.5 force_tol 0.3 polyak 1 frame_updates 5} { tw::set_param $k $v }
+foreach {k v} {calibrate 2 memory 2 stepsize 1e-9 conv_window 2 conv_count 1 profile_tol 0.5 force_tol 0.3 polyak 1 frame_updates 5 plateau 0} { tw::set_param $k $v }
 set I {1 0 0 1}
 for {set it 0} {$it < 40} {incr it} {
     set gx [expr {$it < 20 ? 1.0 : 0.0}]                    ;# the force along the string changes half way: F(end) 3 -> 0
@@ -257,7 +257,7 @@ for {set it 0} {$it < 40} {incr it} {
 check "a changing profile blocks the stop (change $mid_change)" [expr {!$mid_ok && $mid_change > 0.5}]
 check "and a settled one allows it (change $tw::p_change)" [expr {[tw::converged] && $tw::p_change < 0.5}]
 foreach {k v} {calibrate 200 memory 200 stepsize 0 conv_window 20 conv_count 3} { tw::set_param $k $v }
-tw::set_param force_tol 0.3; tw::set_param frame_updates 100
+tw::set_param force_tol 0.3; tw::set_param frame_updates 100; tw::set_param plateau 1
 
 # ---- 5c. the residual force is a FORCE, whatever the metric tensor looks like
 check "solve: 3x3 system" [expr {abs([lindex [tw::solve {2 1 0  1 3 1  0 1 4} {3 5 5}] 0] - 1.0) < 1e-12 && abs([lindex [tw::solve {2 1 0  1 3 1  0 1 4} {3 5 5}] 2] - 1.0) < 1e-12}]
@@ -301,6 +301,78 @@ foreach off {0.0 0.9 0.99} {
     check "a unit force never reads as more than 1 (coupling $off: $r)" [expr {$r <= 1.0 + 1e-9 && $r > 0.1}]
 }
 foreach {k v} {calibrate 200 memory 200 stepsize 0 conv_window 20 frame_updates 100 profile_tol 0.5} { tw::set_param $k $v }
+
+# ---- 5e. drift as a curve: sliding along the path is not movement, moving across it is
+tw::init {{0.0 0.0} {1.0 0.0} {2.0 0.0} {3.0 0.0}} {1.0 1.0} {0 0}
+# a quarter circle, and the same quarter circle with its inner images slid along it
+proc arcpts {angles {dr 0.0}} { set o {}; foreach a $angles { lappend o [list [expr {(2.0 + $dr) * cos($a)}] [expr {(2.0 + $dr) * sin($a)}]] }; return $o }
+set A [arcpts {0.0 0.2 0.4 0.6 0.8 1.0 1.2 1.4}]
+set Bslide [arcpts {0.0 0.3 0.5 0.7 0.9 1.1 1.3 1.4}]
+set dslide [tw::curve_distance $A $Bslide]
+check "images slid 0.2 along the path: the curves agree to the spline's own error ($dslide)" [expr {$dslide < 0.01}]
+set Bout [arcpts {0.0 0.2 0.4 0.6 0.8 1.0 1.2 1.4} 0.15]
+set dout [tw::curve_distance $A $Bout]
+check "a string moved 0.15 across its path is 0.15 away ($dout)" [expr {abs($dout - 0.15) < 0.005}]
+set Bboth [arcpts {0.0 0.3 0.5 0.7 0.9 1.1 1.3 1.4} 0.15]
+set dboth [tw::curve_distance $A $Bboth]
+check "slid and moved across: only the move across counts ($dboth)" [expr {abs($dboth - 0.15) < 0.005}]
+set Bgrow [arcpts {0.0 0.2 0.4 0.6 0.8 1.0 1.2 1.5}]
+set dgrow [tw::curve_distance $A $Bgrow]
+check "an end that has grown 0.2 along the path is counted ($dgrow)" [expr {abs($dgrow - 0.2) < 0.01}]
+check "one bulged image is seen ([tw::curve_distance $A [lreplace $A 3 3 [list [expr {2.3 * cos(0.6)}] [expr {2.3 * sin(0.6)}]]]])" \
+    [expr {[tw::curve_distance $A [lreplace $A 3 3 [list [expr {2.3 * cos(0.6)}] [expr {2.3 * sin(0.6)}]]]] > 0.25}]
+# the stopping test itself: frames that slide pass on the curve and fail per image; frames that move across fail both
+proc feed {first second} {
+    tw::init $first {1.0 1.0} {0 0}
+    foreach {k v} {calibrate 0 conv_window 2 conv_count 1 force_tol 0 profile_tol 0 frame_updates 1 plateau 0} { tw::set_param $k $v }
+    set tw::nacc 100
+    foreach f [list $first $first $second $second] { set d [tw::record_frame $f {}] }
+    return $d
+}
+feed $A $Bslide
+check "sliding: curve drift passes ($tw::d_curve), image drift would not ($tw::d_image)" [expr {[tw::converged] && $tw::d_curve < 0.01 && $tw::d_image > 0.15}]
+tw::set_param drift_curve 0; feed $A $Bslide; set old_blocks [expr {![tw::converged]}]; tw::set_param drift_curve 1
+check "drift_curve 0 restores the per-image test, which blocks on sliding" $old_blocks
+feed $A $Bout
+check "moving across: the curve drift blocks the stop ($tw::d_curve)" [expr {![tw::converged] && $tw::d_curve > 0.1}]
+feed $A $Bgrow
+check "a growing end blocks the stop ($tw::d_curve)" [expr {![tw::converged]}]
+foreach {k v} {calibrate 200 memory 200 stepsize 0 conv_window 20 conv_count 3 frame_updates 100 profile_tol 0.5 force_tol 0.3 plateau 1} { tw::set_param $k $v }
+
+# ---- 5f. the plateau test: a resting string that wanders passes; one that creeps under the same wander does not
+# 12 images on a line in x; every frame each image is displaced across the line by slow noise
+# (an AR(1) wander) and, in the second case, also by a steady creep of the far half of the string
+proc wander_run {creep nfr} {
+    tw::init {{0 0} {1 0} {2 0} {3 0} {4 0} {5 0} {6 0} {7 0} {8 0} {9 0} {10 0} {11 0}} {1.0 1.0} {0 0}
+    foreach {k v} {calibrate 0 conv_window 20 conv_count 1 force_tol 0 profile_tol 0 frame_updates 1 plateau 1 plateau_tol 0.2} { tw::set_param $k $v }
+    set tw::nacc 1000
+    set w [lrepeat 12 0.0]; set short {}; set sys {}; set stopped 0
+    for {set f 0} {$f < $nfr} {incr f} {
+        set nw {}; set fr {}; set i 0
+        foreach y $w {
+            set y [expr {0.8 * $y + 0.04 * [gauss]}]; lappend nw $y
+            lappend fr [list $i.0 [expr {$y + ($i >= 6 ? $creep * $f : 0.0)}]]; incr i
+        }
+        set w $nw
+        set d [tw::record_frame $fr {}]
+        if {$tw::d_sys >= 0} { lappend short $d; lappend sys $tw::d_sys; if {[tw::converged]} { incr stopped } }
+    }
+    set ms 0.0; foreach v $short { set ms [expr {$ms + $v}] }
+    set tail [lrange $sys end-49 end]; set my 0.0; foreach v $tail { set my [expr {$my + $v}] }
+    return [list [expr {$ms / [llength $short]}] [expr {$my / [llength $tail]}] [expr {double($stopped) / [llength $sys]}]]
+}
+expr {srand(11)}
+lassign [wander_run 0.0 600] rest_short rest_sys rest_frac
+lassign [wander_run 0.004 600] creep_short creep_sys creep_frac
+check "resting but wandering: the plateau test passes most of the time (systematic $rest_sys, passes [format %.2f $rest_frac])" [expr {$rest_sys < 0.2 && $rest_frac > 0.8}]
+check "creeping 0.4 per 100 frames: the plateau test never passes (systematic $creep_sys, passes $creep_frac)" [expr {$creep_sys > 0.2 && $creep_frac == 0.0}]
+check "the neighbouring-window drift cannot tell them apart (resting $rest_short, creeping $creep_short)" [expr {abs($creep_short - $rest_short) < 0.5 * $rest_short}]
+tw::init {{0 0} {1 0} {2 0} {3 0}} {1.0 1.0} {0 0}
+foreach {k v} {conv_window 5 frame_updates 1 calibrate 0} { tw::set_param $k $v }
+set tw::nacc 1000
+for {set f 0} {$f < 39} {incr f} { tw::record_frame {{0 0} {1 0} {2 0} {3 0}} {} }
+check "too little history: no verdict and no stop (39 of 40 frames)" [expr {$tw::d_sys < 0 && ![tw::converged]}]
+foreach {k v} {calibrate 200 memory 200 stepsize 0 conv_window 20 conv_count 3 frame_updates 100 profile_tol 0.5 force_tol 0.3 plateau 1 plateau_tol 0.2} { tw::set_param $k $v }
 
 # ---- 6. bad input is refused
 check "too few images refused" [catch {tw::init {{0 0} {1 1}} {1 1} {0 0}}]

@@ -64,6 +64,10 @@ namespace eval tw {
         pin_last    {}
         pin_speed   0.002
         noise_frac  0.5
+        drift_curve 1
+        plateau     1
+        plateau_tol 0.2
+        plateau_every 5
         frame_updates 100
         nblocks     10
     }
@@ -89,6 +93,28 @@ namespace eval tw {
     # noise per update of the across-string force, kcal/mol per scaled unit (worst image)
     variable noise_f1 0.0
     variable p_change -1.0
+    # the two measures of drift between the last two windows: each image's
+    # own displacement, and the distance between the two strings as curves
+    variable d_image -1.0
+    variable d_curve -1.0
+    # the plateau test: every frame-mean string recorded after calibration,
+    # the largest movement of any image over the last half of them that the
+    # string's own wander does not account for, and that wander (rms over
+    # the images, between neighbouring blocks)
+    variable zhist {}
+    variable ghist {}
+    # consecutive evaluations of the long-span tests that passed
+    variable nplat 0
+    # the force across the string over the last half of the run: rms over
+    # the images, its noise (from the four blocks), and with the noise out
+    variable fl_res -1.0
+    variable fl_noise -1.0
+    variable fl_clean -1.0
+    variable d_sys -1.0
+    variable d_floor -1.0
+    # residual force at each image that follows the force, over the last
+    # window and with its noise taken out: a list of {image value}
+    variable f_image {}
     # plain (not exponentially weighted) sum of the gradients since the last
     # recorded frame: independent samples of dF/dz for the free-energy profile
     variable F_sum {}
@@ -131,6 +157,9 @@ proc tw::init {z0 scale periodic} {
     variable G_now {}; variable Z_sum {}; variable Z_n 0; variable prof {}
     variable f_res -1.0; variable f_noise -1.0; variable p_change -1.0; variable force_ratio -1.0
     variable noise_f1 0.0; variable gframes {}; variable f_clean -1.0
+    variable zhist {}; variable d_sys -1.0; variable d_floor -1.0; variable f_image {}
+    variable ghist {}; variable nplat 0; variable fl_res -1.0; variable fl_noise -1.0; variable fl_clean -1.0
+    variable d_image -1.0; variable d_curve -1.0
     set N [llength $z0]
     set D [llength [lindex $z0 0]]
     if {$N < 3} { error "thalweg: a string needs at least 3 images, got $N" }
@@ -538,14 +567,181 @@ proc tw::advance {} {
     return [dict create moved 1 h $h perp $perp factor $factor]
 }
 
+# Scaled distance from point p to the polyline through the points of c.
+proc tw::point_to_curve {p c} {
+    variable scale
+    set best -1.0
+    set a [lindex $c 0]
+    foreach b [lrange $c 1 end] {
+        set ab2 0.0; set apab 0.0
+        foreach u $a v $b x $p sc $scale {
+            set e [expr {($v - $u) / $sc}]; set q [expr {($x - $u) / $sc}]
+            set ab2 [expr {$ab2 + $e * $e}]; set apab [expr {$apab + $q * $e}]
+        }
+        set t [expr {$ab2 > 0 ? $apab / $ab2 : 0.0}]
+        if {$t < 0.0} { set t 0.0 } elseif {$t > 1.0} { set t 1.0 }
+        set d2 0.0
+        foreach u $a v $b x $p sc $scale { set d2 [expr {$d2 + pow(($x - $u - $t * ($v - $u)) / $sc, 2)}] }
+        if {$best < 0 || $d2 < $best} { set best $d2 }
+        set a $b
+    }
+    return [expr {sqrt($best)}]
+}
+
+# How far apart two strings are as curves: the largest scaled distance from
+# an image of one to the spline through the other, taken both ways.  Two
+# strings that trace the same path with their images in different places are
+# at distance zero; one that extends past the other's end is at the distance
+# it extends.
+proc tw::curve_distance {A B} {
+    variable P
+    set nf [expr {([llength $A] - 1) * ($P(spline) ? $P(fine) : 1) + 1}]
+    set fa [tw::reparam $A $nf]; set fb [tw::reparam $B $nf]
+    set worst 0.0
+    foreach p $B { set v [tw::point_to_curve $p $fa]; if {$v > $worst} { set worst $v } }
+    foreach p $A { set v [tw::point_to_curve $p $fb]; if {$v > $worst} { set worst $v } }
+    return $worst
+}
+
+# For each image, the mean of two squared scaled distances: from that image
+# of B to the curve through A, and from that image of A to the curve through B.
+proc tw::image_curve_sq {A B} {
+    variable P
+    set nf [expr {([llength $A] - 1) * ($P(spline) ? $P(fine) : 1) + 1}]
+    set fa [tw::reparam $A $nf]; set fb [tw::reparam $B $nf]
+    set out {}
+    foreach pa $A pb $B {
+        set u [tw::point_to_curve $pb $fa]; set v [tw::point_to_curve $pa $fb]
+        lappend out [expr {($u * $u + $v * $v) / 2.0}]
+    }
+    return $out
+}
+
+# Mean string over frames first..last (inclusive) of a list of strings.
+proc tw::mean_string {fr first last} {
+    set n [llength [lindex $fr $first]]; set D [llength [lindex $fr $first 0]]
+    set cnt [expr {$last - $first + 1}]; set out {}
+    for {set i 0} {$i < $n} {incr i} {
+        set p {}
+        for {set d 0} {$d < $D} {incr d} {
+            set a 0.0
+            for {set f $first} {$f <= $last} {incr f} { set a [expr {$a + [lindex $fr $f $i $d]}] }
+            lappend p [expr {$a / $cnt}]
+        }
+        lappend out $p
+    }
+    return $out
+}
+
+# THE PLATEAU TEST.  A string that moves on a noisy force with a constant
+# step never stands still: it wanders about its resting place, and on the
+# alanine dipeptide strings that wander is 0.06 to 0.07 scaled units (rms
+# over the images) between the means of any two neighbouring stretches of
+# the run, however long the stretches.  A string that is still relaxing, or
+# whose free end is creeping, shows the same number between neighbours, so a
+# test on neighbouring windows cannot tell the two apart.  What does differ
+# is how far apart stretches are that lie FAR from each other in the run.
+#
+# The last half of the frames recorded since calibration is cut into four
+# equal blocks.  For every image, g2 is its squared distance (as a curve,
+# tw::image_curve_sq) between the first block's mean string and the last's,
+# and f2 the same between neighbouring blocks, averaged over the three
+# pairs.  Wander alone gives g2 about equal to f2; steady movement of v per
+# block gives g2 - f2 = 8 v^2.  The test statistic is the largest
+# sqrt(g2 - f2) over the images: the movement over the last half of the run
+# that the string's own wander does not explain.  Slow wander (slower than a
+# block) counts as movement, which errs on the side of running on.
+# Returns {systematic floor}, or {-1 -1} with fewer than 8 x conv_window frames.
+proc tw::plateau {} {
+    variable zhist; variable P
+    set k [llength $zhist]
+    set L [expr {$k / 8}]
+    if {$L < $P(conv_window) || $L < 1} { return {-1.0 -1.0} }
+    set Q {}
+    for {set j 0} {$j < 4} {incr j} {
+        set first [expr {$k - (4 - $j) * $L}]
+        lappend Q [tw::mean_string $zhist $first [expr {$first + $L - 1}]]
+    }
+    set g2 [tw::image_curve_sq [lindex $Q 0] [lindex $Q 3]]
+    set f2 [lrepeat [llength $g2] 0.0]
+    for {set j 0} {$j < 3} {incr j} {
+        set t {}
+        foreach a $f2 b [tw::image_curve_sq [lindex $Q $j] [lindex $Q [expr {$j + 1}]]] { lappend t [expr {$a + $b / 3.0}] }
+        set f2 $t
+    }
+    set worst 0.0; set fl 0.0
+    foreach a $g2 b $f2 {
+        set m [expr {$a > $b ? sqrt($a - $b) : 0.0}]
+        if {$m > $worst} { set worst $m }
+        set fl [expr {$fl + $b}]
+    }
+    return [list $worst [expr {sqrt($fl / [llength $f2])}]]
+}
+
+# THE FORCE LEFT ACROSS THE STRING, over the same span as the plateau test:
+# the last half of the frames since calibration, in four blocks.  At each
+# image that follows the force, the part of the mean gradient that the
+# string does not balance (tw::residual_vec, with the normal taken on the
+# span's mean string) is averaged over each block; the mean of the four is
+# the residual and their scatter its noise.  Returns {rms noise clean} over
+# the images and sets tw::f_image to {image clean} pairs; -1s when there is
+# too little history or no forces were recorded.
+#
+# A window of ten or twenty frames is too short for this: on the alanine
+# dipeptide strings the noise-corrected number then swings between 0.2 and
+# 0.8 from one window to the next, and a run could stop on a low swing.
+# Over the long span it is steady, and on those strings it is NOT zero: it
+# sits at a few images, at the path's sharp bends, at 0.5 to 1.4 kcal/mol
+# per scaled unit, the same in both halves of a run and nearly the same
+# with 24 and with 36 images.  That is a string that has come to rest with
+# a force left, not one that is still relaxing; why it is left is not
+# established.
+proc tw::long_force {} {
+    variable zhist; variable ghist; variable P; variable D; variable f_image
+    set k [llength $zhist]; set L [expr {$k / 8}]
+    if {$L < $P(conv_window) || $L < 1 || [llength $ghist] != $k} { return {-1.0 -1.0 -1.0} }
+    set k0 [expr {$k - 4 * $L}]
+    for {set f $k0} {$f < $k} {incr f} { if {[llength [lindex $ghist $f]] != [llength [lindex $zhist $f]]} { return {-1.0 -1.0 -1.0} } }
+    set zbar [tw::mean_string $zhist $k0 [expr {$k - 1}]]
+    set gb {}
+    for {set j 0} {$j < 4} {incr j} { lappend gb [tw::mean_string $ghist [expr {$k0 + $j * $L}] [expr {$k0 + ($j + 1) * $L - 1}]] }
+    set tot 0.0; set vtot 0.0; set m 0; set f_image {}
+    foreach e [tw::normals $zbar] {
+        lassign $e img n
+        set sum [lrepeat $D 0.0]; set sq [lrepeat $D 0.0]
+        foreach g $gb {
+            set r [tw::residual_vec [lindex $g $img] $n]
+            set ns {}; set nq {}
+            foreach a $sum b $sq c $r { lappend ns [expr {$a + $c}]; lappend nq [expr {$b + $c * $c}] }
+            set sum $ns; set sq $nq
+        }
+        set ti 0.0; set vi 0.0
+        foreach a $sum b $sq {
+            set mean [expr {$a / 4.0}]
+            set ti [expr {$ti + $mean * $mean}]
+            set vi [expr {$vi + ($b / 4.0 - $mean * $mean) / 3.0}]
+        }
+        set tot [expr {$tot + $ti}]; set vtot [expr {$vtot + $vi}]
+        lappend f_image [list $img [expr {$ti > $vi ? sqrt($ti - $vi) : 0.0}]]
+        incr m
+    }
+    if {$m == 0} { return {0.0 0.0 0.0} }
+    set clean [expr {($tot - $vtot) / $m}]
+    return [list [expr {sqrt($tot / $m)}] [expr {$vtot > 0 ? sqrt($vtot / $m) : 0.0}] [expr {$clean > 0 ? sqrt($clean) : 0.0}]]
+}
+
 # Convergence needs FOUR things, all for conv_count frames in a row.
 #
-#   drift    the window-averaged string has moved less than conv_tol between
-#            consecutive windows;
-#   force    the force left across the string over the last window of
-#            frames, rms over the images that follow the force and with the
-#            noise in that number taken out, is below force_tol (kcal/mol
-#            per scaled unit; 0.3 is half of kT at 300 K);
+#   drift    over the last half of the run no image has moved, beyond the
+#            string's own wander, by plateau_tol or more (tw::plateau; with
+#            plateau 0, the older test: the window-averaged string has moved
+#            less than conv_tol between consecutive windows, which on real
+#            runs sits at the wander and passes or fails by chance);
+#   force    the force left across the string over the last half of the run
+#            (tw::long_force; with plateau 0, over the last window of
+#            frames), rms over the images that follow the force and with
+#            the noise in that number taken out, is below force_tol
+#            (kcal/mol per scaled unit; 0.3 is half of kT at 300 K);
 #   profile  the free-energy profile from the forces of one window and of
 #            the next agree to within profile_tol (kcal/mol) at every image;
 #   age      both windows lie after the calibration period.
@@ -557,7 +753,8 @@ proc tw::advance {} {
 # changing.
 #
 # zf, gf: this frame's mean positions and mean gradients (tw::frame_z,
-# tw::frame_force).  Returns the largest scaled drift of any image, or -1
+# tw::frame_force).  Returns the drift the test used (tw::d_curve, or
+# tw::d_image when drift_curve is 0; both are kept), or -1
 # while there is too little history.  tw::f_res, tw::f_noise and
 # tw::p_change hold the other tests' values.
 proc tw::record_frame {{zf {}} {gf {}}} {
@@ -567,6 +764,10 @@ proc tw::record_frame {{zf {}} {gf {}}} {
     if {[llength $prof] != [llength $frames] || [llength $gframes] != [llength $frames]} { set prof {}; set frames {}; set gframes {} }
     lappend frames $zf
     lappend gframes $gf
+    # the plateau test's history: frames wholly after calibration
+    variable zhist; variable nacc
+    variable ghist
+    if {$nacc >= $P(calibrate) + $P(frame_updates)} { lappend zhist $zf; lappend ghist $gf }
     lappend prof [expr {[llength $gf] ? [tw::profile $zf $gf] : {}}]
     set w $P(conv_window)
     if {[llength $frames] > 2 * $w} {
@@ -574,20 +775,51 @@ proc tw::record_frame {{zf {}} {gf {}}} {
         set prof [lrange $prof end-[expr {2 * $w - 1}] end]
         set gframes [lrange $gframes end-[expr {2 * $w - 1}] end]
     }
-    if {[llength $frames] < 2 * $w} { return -1.0 }
-    set n [llength $z]; set D [llength [lindex $z 0]]; set worst 0.0
+    if {[llength $frames] < 2 * $w} { set tw::d_sys -1.0; set tw::d_floor -1.0; return -1.0 }
+    # The two windows' mean strings, and how far apart they are.
+    #   d_image  the largest displacement of any one image.  It counts an
+    #            image that has only slid ALONG the path, which happens to
+    #            every image whenever an end moves and the string is respaced.
+    #   d_curve  the largest distance from an image of either window to the
+    #            other window's string taken as a curve (the spline through
+    #            its images).  Sliding along the path costs nothing; a string
+    #            that has grown or shrunk at an end is still counted, by the
+    #            length gained or lost.
+    # The stopping test uses d_curve unless TW(drift_curve) is 0.
+    variable d_image; variable d_curve
+    set n [llength $z]; set D [llength [lindex $z 0]]
+    set A {}; set B {}
     for {set i 0} {$i < $n} {incr i} {
-        set d2 0.0
+        set pa {}; set pb {}
         for {set d 0} {$d < $D} {incr d} {
             set a 0.0; set b 0.0
             for {set f 0} {$f < $w} {incr f} {
                 set a [expr {$a + [lindex $frames $f $i $d]}]
                 set b [expr {$b + [lindex $frames [expr {$f + $w}] $i $d]}]
             }
-            set d2 [expr {$d2 + pow(($b - $a) / $w / [lindex $scale $d], 2)}]
+            lappend pa [expr {$a / $w}]; lappend pb [expr {$b / $w}]
         }
-        if {sqrt($d2) > $worst} { set worst [expr {sqrt($d2)}] }
+        lappend A $pa; lappend B $pb
     }
+    set d_image 0.0
+    foreach pa $A pb $B {
+        set d2 0.0
+        foreach a $pa b $pb sc $scale { set d2 [expr {$d2 + pow(($b - $a) / $sc, 2)}] }
+        if {sqrt($d2) > $d_image} { set d_image [expr {sqrt($d2)}] }
+    }
+    set d_curve [tw::curve_distance $A $B]
+    set worst [expr {$P(drift_curve) ? $d_curve : $d_image}]
+    variable d_sys; variable d_floor
+    # (worked out every plateau_every frames: it changes slowly and is the
+    # costliest thing here)
+    variable fl_res; variable fl_noise; variable fl_clean; variable nplat
+    set evaluated 0
+    if {$d_sys < 0 || [llength $zhist] % $P(plateau_every) == 0} {
+        lassign [tw::plateau] d_sys d_floor
+        if {$P(plateau)} { lassign [tw::long_force] fl_res fl_noise fl_clean }
+        set evaluated [expr {$d_sys >= 0}]
+    }
+    set drift_ok [expr {$P(plateau) ? ($d_sys >= 0 && $d_sys < $P(plateau_tol)) : ($worst < $P(conv_tol))}]
     # the profile of one window against the next
     variable p_change
     set p_change -1.0; set have 1; set p_sig 0
@@ -622,13 +854,28 @@ proc tw::record_frame {{zf {}} {gf {}}} {
     # free-energy profile, and no published string calculation stops on an
     # absolute force.  It is held while the force is demonstrably there.
     variable noise1; variable force_ratio; variable f_res; variable f_noise; variable f_clean
-    lassign [tw::window_force $w] f_res f_noise f_clean
+    if {$P(plateau)} {
+        # short window: reported only (window_force would overwrite the
+        # per-image list of the long span, so keep that)
+        variable f_image; set keep $f_image
+        lassign [tw::window_force $w] f_res f_noise f_clean
+        set f_image $keep
+        set force_ok [expr {$P(force_tol) <= 0 || $fl_res < 0 || $fl_clean <= $P(force_tol)}]
+    } else {
+        lassign [tw::window_force $w] f_res f_noise f_clean
+        set force_ok [expr {$P(force_tol) <= 0 || $f_res < 0 || $f_clean <= $P(force_tol)}]
+    }
     set force_ratio [expr {$f_noise > 0 ? $f_res / $f_noise : -1.0}]
-    set force_ok [expr {$P(force_tol) <= 0 || $f_res < 0 || $f_clean <= $P(force_tol)}]
     # both windows must lie after the calibration period, when the string stood still
     variable nacc
     set aged [expr {$nacc >= $P(calibrate) + 2 * $w * $P(frame_updates)}]
-    if {$worst < $P(conv_tol) && $force_ok && $prof_ok && $aged} { incr nconv } else { set nconv 0 }
+    if {$P(plateau)} {
+        # the long-span tests change slowly and are worked out every
+        # plateau_every frames, so conv_count counts EVALUATIONS that pass in
+        # a row, not frames; the profile test still has to pass on the frame
+        if {$evaluated} { if {$drift_ok && $force_ok && $aged} { incr nplat } else { set nplat 0 } }
+        set nconv [expr {$prof_ok ? $nplat : 0}]
+    } elseif {$drift_ok && $force_ok && $prof_ok && $aged} { incr nconv } else { set nconv 0 }
     return $worst
 }
 
@@ -846,7 +1093,9 @@ proc tw::window_force {w} {
         lappend zbar $p
     }
     set tot 0.0; set vtot 0.0; set m 0
+    variable f_image; set f_image {}
     foreach e [tw::normals $zbar] {
+        set tot_i 0.0; set v_i 0.0
         lassign $e img n
         set sum [lrepeat $D 0.0]; set sq [lrepeat $D 0.0]
         foreach g $gs {
@@ -857,9 +1106,13 @@ proc tw::window_force {w} {
         }
         foreach a $sum b $sq {
             set mean [expr {$a / $w}]
-            set tot [expr {$tot + $mean * $mean}]
-            if {$w > 1} { set vtot [expr {$vtot + ($b / $w - $mean * $mean) / ($w - 1)}] }
+            set tot [expr {$tot + $mean * $mean}]; set tot_i [expr {$tot_i + $mean * $mean}]
+            if {$w > 1} {
+                set vtot [expr {$vtot + ($b / $w - $mean * $mean) / ($w - 1)}]
+                set v_i [expr {$v_i + ($b / $w - $mean * $mean) / ($w - 1)}]
+            }
         }
+        lappend f_image [list $img [expr {$tot_i > $v_i ? sqrt($tot_i - $v_i) : 0.0}]]
         incr m
     }
     if {$m == 0} { return {0.0 0.0 0.0} }
@@ -896,7 +1149,8 @@ proc tw::frame_force {} {
 proc tw::dump_state {} {
     set out ""
     foreach v {N D scale periodic z S_g S_M W h nacc frames nconv blk h_signal h_noise noise1 force_ratio F_sum F_n
-               G_now Z_sum Z_n prof f_res f_noise p_change noise_f1 gframes f_clean} {
+               G_now Z_sum Z_n prof f_res f_noise p_change noise_f1 gframes f_clean d_image d_curve
+               zhist d_sys d_floor f_image ghist nplat fl_res fl_noise fl_clean} {
         append out [list set tw::$v [set tw::$v]] "\n"
     }
     # the memory may have been lengthened at calibration; keep that choice

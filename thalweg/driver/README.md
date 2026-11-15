@@ -13,7 +13,7 @@ Written 2026-11-14.
 | mean force used for an update | the last `steps_per_run` MD steps | the same (this is the on-the-fly string update), with a metric tensor averaged over `TW(memory)` updates |
 | the result | the string at the last update | the AVERAGE of the string over the last window of frames (iterate averaging): the momentary string fluctuates about the path and never settles, because the step is constant |
 | step size | `SMPARAMS(stepsize)`, chosen by hand | measured: the string stands still for `TW(calibrate)` updates, then the step is the smaller of two limits: the fastest image moves `TW(max_move)` scaled units per update, or the noise alone moves an image less than half the drift tolerance over one test window |
-| when it stops | after `num_runs` updates | when the averaged string has stopped drifting, no force across it is demonstrably left, and the profile along it is not demonstrably changing; or at `num_runs` |
+| when it stops | after `num_runs` updates | when, over the last half of the run, the averaged string has not moved beyond its own wander and no force is left across it, and the profile along it is not demonstrably changing; or at `num_runs` |
 | end images | move with the force | move with the force, or are pinned (`TW(pin_first)`, `TW(pin_last)`); an image next to an end that doubles back is dropped |
 | respacing | straight segments between images | a cubic spline through the images |
 | two systems per image | needed for independent force and metric estimates | optional (`TW(dual)`); the running averages make it unnecessary |
@@ -46,7 +46,7 @@ frames, and the monitor then shortens its window). Each frame's string is
 the MEAN over that frame's updates, unwrapped (a torsion may lie beyond
 pi). The `SM FINALiter` block at the end is the result: the string averaged
 over the last window and respaced. Lines starting `TW iter` carry the step,
-the largest across-string move, the drift, the residual force, its noise,
+the largest across-string move, the short-window drift (as a curve, and per image), the plateau statistic and the wander, the residual force, its noise,
 the residual with the noise taken out, and the profile change.
 
 Next to it, `<output_root>.job<N>.0.forces` holds one line per image per
@@ -64,26 +64,65 @@ refinement, so it is a first look, not the profile of record.
   on the order of a thousand updates.
 - `TW(memory)`: longer is smoother and slower to respond. The force used is
   an average over `memory x steps_per_run` MD steps.
-- `TW(conv_window)`, `TW(conv_tol)`, `TW(conv_count)`: the run ends when the
-  window-averaged string has moved less than `conv_tol` scaled units between
-  consecutive windows, `conv_count` frames in a row, AND the force left
-  across the string over the last window, with the noise in that number
-  taken out, is below `TW(force_tol)` (0.3 kcal/mol per scaled unit, half of
-  kT at 300 K), AND the free-energy profile computed from one window's
-  forces and from the next's is not demonstrably changing by more than
-  `TW(profile_tol)` (0.5 kcal/mol), AND both windows lie after the
-  calibration period.
-  The drift test is the one the string-method literature uses (a plateau in
-  the string's displacement); it is given a number here. The force and
-  profile tests are additions. The force test does NOT wait until the force
-  is resolved below its tolerance: for a solvated protein that needs
-  nanoseconds per image, as much as a free-energy profile costs. It holds
-  the run while a force is demonstrably there. Each history line gives the
-  force, its noise and the force with the noise taken out, so how well it
-  was resolved is on record. A longer `TW(conv_window)` resolves it better.
-  `string_monitor.py` applies only the drift test, with its own defaults
-  (window 100, tolerance 0.25), so the two can disagree: the driver's is the
-  stricter. An end that is pinned or held is left out of all of them.
+- **When the run ends.** Three tests, all passing on `TW(conv_count)`
+  evaluations in a row, after at least 8 x `TW(conv_window)` frames since
+  calibration:
+  1. *Plateau.* The last half of the frames since calibration is cut into
+     four blocks. For each image, the distance (as a curve) between the
+     first block's mean string and the last's is compared with the distance
+     between neighbouring blocks. What the neighbours do not account for is
+     the movement over that half of the run beyond the string's own wander;
+     the largest over the images must be below `TW(plateau_tol)` (0.2 scaled
+     units).
+  2. *Force.* Over the same span, the force left across the string, rms over
+     the images that follow the force and with its noise (from the four
+     blocks) taken out, is below `TW(force_tol)` (0.3 kcal/mol per scaled
+     unit, half of kT at 300 K).
+  3. *Profile.* The free-energy profile from one window's forces and from
+     the next's is not demonstrably changing by more than `TW(profile_tol)`
+     (0.5 kcal/mol).
+
+  Why the first two look at half the run and not at two short windows. A
+  string that moves on a noisy force with a constant step never stands
+  still. On the alanine dipeptide strings the mean strings of any two
+  neighbouring stretches differ by 0.06 to 0.07 scaled units (rms over the
+  images; 0.12 to 0.14 for the worst image), whether the stretches are 1,000
+  or 4,000 updates long, and whether the string is at rest or creeping. The
+  earlier test (two windows against `TW(conv_tol)` 0.1; `TW(plateau) 0`
+  restores it) therefore sat at its own noise and passed or failed by
+  chance. Measuring that drift as a curve (`TW(drift_curve)`, still the
+  default for the number reported as `drift`) removes images sliding along
+  the path from it but changes it by under a tenth. What separates a string
+  at rest from one that creeps is how far apart DISTANT stretches are: a
+  24-image string with pinned ends stayed 0.07 from where it started over
+  80,000 updates, the same string with free ends went from 0.06 to 0.24
+  (one end image by 0.9), and the plateau statistic read 0.07 to 0.10 for
+  the first and 0.23 to 0.29 for the second. The force over a short window
+  has the same fault: with its noise taken out it swings between 0.2 and
+  0.8 from window to window, and a run could end on a low swing. Over half
+  the run it is steady to a few hundredths.
+
+  A string can come to rest with a force still across it. On the second
+  alanine channel that force is 0.4 to 0.5 kcal/mol per scaled unit however
+  long the run, and it sits at a few images, at the path's sharp bends
+  (up to 1.4 at one image), the same in both halves of the run. Such a run
+  goes to its cap; the log then says the string is at rest with a force
+  left, and the history lists the force by image (`residual_by_image`,
+  `above_force_tol`). Running longer does not help, and more images help
+  only so far: 16 images left 0.53 on that channel, 24 left 0.41 and 36
+  left 0.39 (+/- 0.05), still at the same places on the path. What holds
+  it there is not established. The profiles from the 24- and 36-image
+  strings pass all their gates and agree with unbiased dynamics, so a
+  residual of this size has not been seen to spoil a profile; whether to
+  accept it is a judgement, and `TW(force_tol)` is the setting.
+  Each history line carries both sets of numbers: `drift`, `image_drift`,
+  `residual_force`, `force_noise`, `residual_less_noise` over the short
+  window, and `systematic_drift`, `wander`, `long_residual`, `long_noise`,
+  `long_residual_less_noise` over the long span.
+  `string_monitor.py` applies a two-window drift test with its own defaults
+  (window 100, tolerance 0.25). An end that is pinned or held is left out of
+  the force test; in the drift tests it counts only while it is still
+  walking to its pin. `TW(conv_tol)` still sets the step (see above).
 - `TW(polyak)`: 1 by default. Each update the images move on that update's
   own force with the measured small step (the on-the-fly string update), and
   the string that is recorded, tested and written at the end is the average

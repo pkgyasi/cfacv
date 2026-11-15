@@ -31,11 +31,16 @@ KT_300 = 0.0019872041 * 300.0
 class FESMap:
     """Gaussian radial-basis free-energy surface in scaled CV space."""
 
-    def __init__(self, centers, coef, sigma, scale, periodic, types=None, offset=0.0):
+    def __init__(self, centers, coef, sigma, scale, periodic, types=None, offset=0.0, metric=None):
         self.centers = np.asarray(centers, float)
         self.coef = np.asarray(coef, float)
         self.sigma = float(sigma)
+        # `scale` shapes the Gaussians.  `metric` is the per-CV length scale
+        # used to measure distances along paths (the basin widths).  They are
+        # different things: a smooth, stiff CV wants a wide Gaussian even
+        # though its basin is narrow.
         self.scale = np.asarray(scale, float)
+        self.metric = self.scale.copy() if metric is None else np.asarray(metric, float)
         self.periodic = np.asarray(periodic, bool)
         self.types = types
         self.offset = float(offset)
@@ -59,7 +64,10 @@ class FESMap:
         return gu / self.scale
 
     def nearest_center_distance(self, z):
-        return np.sqrt(np.sum(self._du(z) ** 2, axis=2)).min(axis=1)
+        """Distance to the nearest center, in metric (path) units."""
+        z = np.atleast_2d(np.asarray(z, float))
+        dm = diff(z[:, None, :], self.centers[None, :, :], self.periodic) / self.metric
+        return np.sqrt(np.sum(dm ** 2, axis=2)).min(axis=1)
 
     # -- fitting ------------------------------------------------------------
     @staticmethod
@@ -71,7 +79,7 @@ class FESMap:
         return np.transpose(G, (0, 2, 1)).reshape(-1, centers.shape[0])
 
     @classmethod
-    def fit(cls, z, f, sigma, scale, periodic, ridge=1e-8, types=None):
+    def fit(cls, z, f, sigma, scale, periodic, ridge=1e-8, types=None, metric=None):
         z, f = np.asarray(z, float), np.asarray(f, float)
         scale = np.asarray(scale, float)
         G = cls._design(z, z, sigma, scale, periodic)
@@ -79,7 +87,7 @@ class FESMap:
         A = G.T @ G
         A[np.diag_indices_from(A)] += ridge * np.trace(A) / len(A)
         coef = np.linalg.solve(A, G.T @ target)
-        m = cls(z, coef, sigma, scale, periodic, types)
+        m = cls(z, coef, sigma, scale, periodic, types, metric=metric)
         m.offset = float(m.value(z).min())                  # lowest center = 0
         return m
 
@@ -92,7 +100,7 @@ class FESMap:
 
     # -- persistence --------------------------------------------------------
     def save(self, path, extra=None):
-        d = {"centers": self.centers, "coef": self.coef, "sigma": self.sigma, "scale": self.scale,
+        d = {"centers": self.centers, "coef": self.coef, "sigma": self.sigma, "scale": self.scale, "metric": self.metric,
              "periodic": self.periodic.tolist(), "types": self.types, "offset": self.offset}
         d.update(extra or {})
         save_json(path, d)
@@ -100,7 +108,8 @@ class FESMap:
     @classmethod
     def load(cls, path):
         d = load_json(path)
-        return cls(d["centers"], d["coef"], d["sigma"], d["scale"], d["periodic"], d.get("types"), d["offset"])
+        return cls(d["centers"], d["coef"], d["sigma"], d["scale"], d["periodic"], d.get("types"), d["offset"],
+                   d.get("metric"))
 
 
 def cross_validate(z, f, sigma, scale, periodic, folds=5, seed=0, ridge=1e-8):
@@ -133,6 +142,44 @@ def fit_with_sigma_scan(z, f, scale, periodic, sigmas=None, folds=5, ridge=1e-8,
     return FESMap.fit(z, f, best[0], scale, periodic, ridge, types), scan, best[1]
 
 
+def fit_anisotropic(z, f, scale, periodic, factors=(0.5, 0.7, 1.0, 1.4, 2.0, 3.0), passes=2, folds=5,
+                    ridge=1e-8, types=None, sigmas=None):
+    """Choose a Gaussian width PER CV by cross-validation.
+
+    The basin widths in `scale` are the right ruler for distances along a
+    path, and the wrong shape for the Gaussians: the free energy is smooth
+    along a stiff, nearly harmonic CV (wide Gaussian wanted, narrow basin) and
+    can be sharp along a soft one.  On alanine dipeptide in four torsions,
+    Gaussians shaped by the basin widths left 0.72 of the left-out force
+    unexplained; shaping them per CV brought that to 0.2.
+
+    Starts from the best single width, then tries each factor on each CV in
+    turn, keeping a change when it lowers the left-out force error.
+    Returns (map, record, left-out error); the map keeps `scale` as its
+    distance metric."""
+    scale = np.asarray(scale, float)
+    m0, scan, err = fit_with_sigma_scan(z, f, scale, periodic, sigmas, folds, ridge, types)
+    width = scale * m0.sigma
+    record = [("isotropic", width.tolist(), err)]
+    for _ in range(passes):
+        changed = False
+        for j in range(len(scale)):
+            best = (1.0, err)
+            for fac in factors:
+                if fac == 1.0:
+                    continue
+                w = width.copy(); w[j] *= fac
+                e = cross_validate(z, f, 1.0, w, periodic, folds, ridge=ridge)
+                if e < best[1]:
+                    best = (fac, e)
+            if best[0] != 1.0:
+                width[j] *= best[0]; err = best[1]; changed = True
+                record.append((f"cv {j} x {best[0]}", width.tolist(), err))
+        if not changed:
+            break
+    return FESMap.fit(z, f, 1.0, width, periodic, ridge, types, metric=scale), record, err
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -141,6 +188,8 @@ def main(argv=None):
     p.add_argument("--scales", required=True)
     p.add_argument("--sigmas", type=float, nargs="+", help="scaled widths to scan (default: from center spacing)")
     p.add_argument("--folds", type=int, default=5)
+    p.add_argument("--isotropic", action="store_true",
+                   help="one Gaussian width for every CV in units of its length scale (default: a width per CV)")
     p.add_argument("--max-error", type=float, default=0.5,
                    help="gate: largest tolerated left-out relative force error [0.5]")
     p.add_argument("--out", default="map.json")
@@ -155,11 +204,18 @@ def main(argv=None):
         if len(scale) != z.shape[1]:
             sys.exit(f"{len(scale)} scales for a {z.shape[1]}-dimensional CV space")
         periodic = np.array([t in PERIODIC_TYPES for t in types])
-        m, scan, err = fit_with_sigma_scan(z, f, scale, periodic,
-                                           np.array(a.sigmas) if a.sigmas else None, a.folds, types=types)
-        print("sigma (scaled)   left-out force error")
-        for s, e in scan:
-            print(f"  {s:10.4f}   {e:8.4f}{'   <- chosen' if s == m.sigma else ''}")
+        sig = np.array(a.sigmas) if a.sigmas else None
+        if a.isotropic:
+            m, scan, err = fit_with_sigma_scan(z, f, scale, periodic, sig, a.folds, types=types)
+            m.metric = scale.copy()
+            print("sigma (scaled)   left-out force error")
+            for s, e in scan:
+                print(f"  {s:10.4f}   {e:8.4f}{'   <- chosen' if s == m.sigma else ''}")
+        else:
+            m, scan, err = fit_anisotropic(z, f, scale, periodic, folds=a.folds, types=types, sigmas=sig)
+            print("Gaussian width per CV (raw units)             left-out force error")
+            for what, w, e in scan:
+                print("  " + " ".join(f"{v:8.3f}" for v in w) + f"   {e:8.4f}   {what}")
         F = m.value(z)
         print(f"{len(z)} centers, F at centers spans {F.min():.2f} to {F.max():.2f} kcal/mol")
         ok = err <= a.max_error

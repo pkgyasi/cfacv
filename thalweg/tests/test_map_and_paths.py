@@ -110,3 +110,23 @@ def test_map_round_trips_through_json(tmp_path):
     m2 = FESMap.load(tmp_path / "m.json")
     q = np.array([[0.2, 0.9], [-0.9, 0.1]])
     assert np.allclose(m.value(q), m2.value(q)) and np.allclose(m.gradient(q), m2.gradient(q))
+
+
+def test_per_cv_widths_rescue_a_surface_the_basin_widths_misshape():
+    """One CV is stiff and harmonic (narrow basin, smooth surface), the other
+    soft with a sharp feature.  Gaussians shaped by the basin widths fit this
+    badly; a width chosen per CV fits it well, and the path metric is kept."""
+    from fesmap import fit_anisotropic
+    rng = np.random.default_rng(11)
+    n = 260
+    z = np.column_stack([rng.uniform(-2.5, 2.5, n), rng.normal(0, 0.16, n)])
+    # F = double well in x with a sharp barrier + stiff harmonic in y
+    dF = np.column_stack([4 * (-2 * z[:, 0] / 0.09) * np.exp(-z[:, 0] ** 2 / 0.09) + 0.6 * z[:, 0], 23.0 * z[:, 1]])
+    f = -dF + rng.normal(0, 0.2, dF.shape)
+    basin = np.array([1.2, 0.16])                  # what endpoint analysis would report
+    per = np.zeros(2, bool)
+    iso, _, e_iso = fit_with_sigma_scan(z, f, basin, per)
+    ani, record, e_ani = fit_anisotropic(z, f, basin, per)
+    assert e_ani < 0.6 * e_iso, (e_iso, e_ani, record)
+    assert np.allclose(ani.metric, basin)                       # distances still in basin units
+    assert ani.scale[1] / ani.scale[0] > basin[1] / basin[0]    # relatively wider along the stiff CV

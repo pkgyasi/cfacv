@@ -47,7 +47,7 @@ def build_graph(m, k=8, samples=7):
     is the largest F at `samples` points along the straight segment."""
     z = m.centers
     n = len(z)
-    du = diff(z[:, None, :], z[None, :, :], m.periodic) / m.scale
+    du = diff(z[:, None, :], z[None, :, :], m.periodic) / m.metric
     d = np.sqrt(np.sum(du ** 2, axis=2))
     edges = {}
     t = np.linspace(0.0, 1.0, samples)
@@ -138,7 +138,7 @@ def find_channels(m, src, dst, n_channels=3, k=8, exclude_radius=None, tol=0.25,
         hs = [edges[(min(a, b), max(a, b))] for a, b in zip(nodes[:-1], nodes[1:])]
         top = max(hs, key=lambda e: e[0])
         out.append({"nodes": nodes, "barrier_point": top[2], "top": top[0]})
-        near = np.sqrt(np.sum((diff(m.centers, top[2], m.periodic) / m.scale) ** 2, axis=1)) < exclude_radius
+        near = np.sqrt(np.sum((diff(m.centers, top[2], m.periodic) / m.metric) ** 2, axis=1)) < exclude_radius
         new = {int(i) for i in np.where(near)[0]} - {src, dst}
         if not new:
             break
@@ -155,17 +155,19 @@ def relax_string(m, path, n_images, dt=None, max_iter=4000, tol=1e-4, support=No
     `support`: images are not allowed farther than this scaled distance from
     the nearest center, because the fitted surface means nothing out there
     (a sum of Gaussians goes flat away from its data)."""
-    path = redistribute(unwrap_path(path, m.periodic), n_images, m.scale)
+    path = redistribute(unwrap_path(path, m.periodic), n_images, m.metric)
     if dt is None:
-        dt = 0.05 * m.sigma ** 2 / max(np.abs(m.coef).max(), 1e-12)
+        # a step that moves the steepest center about 0.05 metric units
+        g0 = np.linalg.norm(m.gradient(m.centers) * m.metric, axis=1)
+        dt = 0.05 / max(np.percentile(g0, 90), 1e-12)
     for it in range(max_iter):
-        g_u = m.gradient(path) * m.scale                    # dF/du
-        new = path - dt * g_u * m.scale                     # du = -dt dF/du
+        g_u = m.gradient(path) * m.metric                    # dF/du
+        new = path - dt * g_u * m.metric                     # du = -dt dF/du
         if support is not None:
             far = m.nearest_center_distance(new) > support
             new[far] = path[far]
-        new = redistribute(new, n_images, m.scale)
-        move = np.max(np.linalg.norm((new - path) / m.scale, axis=1))
+        new = redistribute(new, n_images, m.metric)
+        move = np.max(np.linalg.norm((new - path) / m.metric, axis=1))
         path = new
         if move < tol:
             break
@@ -173,7 +175,7 @@ def relax_string(m, path, n_images, dt=None, max_iter=4000, tol=1e-4, support=No
 
 
 def profile_on_map(m, path):
-    s = path_length(path, m.scale)
+    s = path_length(path, m.metric)
     F = m.value(path)
     return s, F
 
@@ -191,7 +193,7 @@ def random_start(m, src, dst, rng, n_way=2):
 
 # --------------------------------------------------------------------------
 def nearest_center(m, point):
-    return int(np.argmin(np.sqrt(np.sum((diff(m.centers, point, m.periodic) / m.scale) ** 2, axis=1))))
+    return int(np.argmin(np.sqrt(np.sum((diff(m.centers, point, m.periodic) / m.metric) ** 2, axis=1))))
 
 
 def search(m, z_closed, z_open, n_images=20, n_channels=3, k=8, n_random=50, seed=0,
@@ -200,7 +202,10 @@ def search(m, z_closed, z_open, n_images=20, n_channels=3, k=8, n_random=50, see
     if src == dst:
         raise ValueError("both basins map onto the same center: the map does not separate them")
     if support is None:
-        support = 2.0 * m.sigma
+        # twice the typical spacing of the centers, in metric units
+        dm = diff(m.centers[:, None, :], m.centers[None, :, :], m.periodic) / m.metric
+        dd = np.sqrt(np.sum(dm ** 2, axis=2)); np.fill_diagonal(dd, np.inf)
+        support = 2.0 * float(np.median(dd.min(axis=1)))
     routes, excl = find_channels(m, src, dst, n_channels, k, exclude_radius)
     if not routes:
         raise ValueError("no route between the basins: the centers do not connect them")
@@ -210,7 +215,7 @@ def search(m, z_closed, z_open, n_images=20, n_channels=3, k=8, n_random=50, see
     for r in routes:
         relaxed, n_it = relax_string(m, m.centers[r["nodes"]], n_images, support=support)
         # a relaxed route may fall into a channel already found
-        if any(path_distance(relaxed, c["anchors"], m.scale) < same_channel for c in channels):
+        if any(path_distance(relaxed, c["anchors"], m.metric) < same_channel for c in channels):
             continue
         s, F = profile_on_map(m, relaxed)
         channels.append({
@@ -225,7 +230,7 @@ def search(m, z_closed, z_open, n_images=20, n_channels=3, k=8, n_random=50, see
     unassigned = []
     for _ in range(n_random):
         relaxed, _ = relax_string(m, random_start(m, src, dst, rng), n_images, support=support)
-        d = [path_distance(relaxed, c["anchors"], m.scale) for c in channels]
+        d = [path_distance(relaxed, c["anchors"], m.metric) for c in channels]
         j = int(np.argmin(d))
         if d[j] < same_channel:
             channels[j]["random_hits"] += 1

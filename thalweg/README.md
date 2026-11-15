@@ -1,4 +1,8 @@
-# stringtools
+# thalweg
+
+A thalweg is the line along the bottom of a valley, the course water follows
+downhill. This toolkit finds the equivalent in a free-energy landscape: the
+lowest route between two states.
 
 Scripts around cfacv's string method for a CV space of any dimension, with
 CVs of mixed units (distances and torsions). They implement the staged
@@ -6,7 +10,7 @@ protocol of the T4 lysozyme proposal: explore, map, search the map for the
 lowest-barrier routes, start strings from them, refine, profile, and test the
 transition state.
 
-Written 2026-11-14. Fork-local: not part of upstream cfacv.
+Written 2026-11-14 as `stringtools`; renamed thalweg the same day. Fork-local: not part of upstream cfacv.
 
 ## What is here
 
@@ -21,6 +25,8 @@ Written 2026-11-14. Fork-local: not part of upstream cfacv.
 | 5 | `string_monitor.py` | convergence of a string from its history file; merged-or-distinct for two strings |
 | 6 | `fe_profile.py` | profile along a string with propagated error, overlap and stability checks; path-independence check |
 | 7 | `committor.py`, `committor_shot.tcl` | unbiased shots that stop on basin entry; the transition-state gate |
+| 5 | `driver/` | a string driver of its own: wrapped torsions, averaged forces with a measured step and a stopping test, spline respacing. See `driver/README.md`. cfacv's driver is unchanged and still usable |
+| 1 | `make_cfacv_inputs.py` | writes cfacv's label PDB and CV file from the CV definition JSON |
 | all | `sbatch/namd_array.sbatch` | one NAMD run per array task from a list file |
 | | `common.py` | CV definitions, periodic arithmetic, readers for cfacv's files |
 | | `t4l_cvs.json` | the eleven T4 lysozyme CVs of Abou-Hatab and Abrams 2025 |
@@ -98,7 +104,7 @@ committor.py pick ; setup ; array ; tally
 ## Tests
 
 ```
-python3 -m pytest stringtools/tests       # no MD needed, about a minute
+python3 -m pytest thalweg/tests       # no MD needed, about a minute
 tclsh tests/reparam_zscale.tcl .          # the zscale change, through the Tcl interface
 ```
 

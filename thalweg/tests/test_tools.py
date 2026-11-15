@@ -282,6 +282,236 @@ def test_committor_tally_accepts_a_transition_state_only():
     assert not r["centred"] and not r["pass"]
     # too many trajectories never committed
     r = tally_counts([(6, 6, 8, 0)] * 10)
-    assert r["centred"] and not r["few_uncommitted"] and not r["pass"]
+    assert not r["few_uncommitted"] and not r["pass"]
+    # ... and where they would have gone brackets p: 8/8/4 reads 0.50, but is 0.40 to 0.60 or worse
+    r = tally_counts([(8, 8, 4, 0)] * 10)
+    assert abs(r["pooled_p_open"] - 0.5) < 1e-9 and r["p_bounds"][0] < r["window"][0] and not r["centred"]
+    # one configuration with all the shots and nine with one each: nothing to test sameness with
+    r = tally_counts([(45, 46, 0, 0)] + [(1, 0, 0, 0)] * 9)
+    assert not r["testable"] and not r["pass"]
     # unfinished runs can never pass
     assert not tally_counts([(10, 10, 0, 0)] * 9 + [(5, 5, 0, 10)])["pass"]
+
+
+def test_refine_puts_images_where_the_force_changes():
+    import fe_profile as fp
+    z = np.column_stack([np.linspace(0, 8, 9), np.zeros(9)])
+    f = np.zeros((9, 2)); f[4, 0] = 30.0                     # the force spikes at image 4
+    new, split = fp.refine_images(z, f, np.ones(2), 4)
+    assert len(new) == 13 and set(split) <= {2, 3, 4, 5}     # only the segments around the spike
+    # a steep but LINEAR ramp needs no images (the trapezoid rule is exact there); the kink does
+    f2 = np.zeros((9, 2)); f2[:5, 0] = 20.0 * np.arange(5); f2[5:, 0] = 80.0
+    new2, split2 = fp.refine_images(z, f2, np.ones(2), 3)
+    assert set(split2) <= {3, 4}
+    assert np.all(np.diff(new[:, 0]) > 0)                    # still an ordered path
+    assert np.allclose(new[0], z[0]) and np.allclose(new[-1], z[-1])
+
+
+def test_profile_from_driver_forces(tmp_path):
+    """A string that moves, then stops: only the frames after it stopped are
+    used, and the profile of F = 3 sin^2(pi x / 2) along x in [0, 1] comes back."""
+    import fe_profile as fp
+    rng = np.random.default_rng(4)
+    n, nfr = 11, 60
+    zfin = np.column_stack([np.linspace(0, 1, n), np.zeros(n)])
+    lines = ["# update image n_updates z dF/dz"]
+    for fr in range(nfr):
+        shift = 0.5 * np.exp(-fr / 3.0)                      # early frames are far from the final string
+        for i in range(n):
+            z = zfin[i] + [0, shift]
+            g = np.array([3 * np.pi / 2 * np.sin(np.pi * z[0]), 0.0]) + rng.normal(0, 0.3, 2)
+            lines.append(f"{(fr + 1) * 100} {i} 100 {z[0]} {z[1]} {g[0]} {g[1]}")
+    f1, f2 = tmp_path / "a.forces", tmp_path / "b.forces"       # two legs
+    cut = 1 + 20 * n
+    f1.write_text("\n".join(lines[:cut]) + "\n"); f2.write_text(lines[0] + "\n" + "\n".join(lines[cut:]) + "\n")
+    res = fp.from_driver([str(f1), str(f2)], np.ones(2))
+    assert 30 < res["frames_used"] < nfr                     # the moving frames were dropped
+    assert abs(res["barrier"] - 3.0) < 0.15 and res["top_image"] == 10
+    assert res["stable"] and res["resolved"]
+    with pytest.raises(ValueError):
+        fp.from_driver([str(f1)], np.ones(2), max_drift=1e-6)
+
+
+def test_metric_tensor_against_closed_forms():
+    mda = pytest.importorskip("MDAnalysis")
+    rng = np.random.default_rng(3)
+    u = mda.Universe.empty(6, trajectory=True)
+    masses = np.array([12.0, 14.0, 1.0, 16.0, 12.0, 32.0])
+    u.add_TopologyAttr("masses", masses)
+    u.atoms.positions = rng.normal(0, 2.0, (6, 3))
+    cvs = CVSet([{"name": "d", "type": "BOND", "atoms": ["index 0", "index 1"]},
+                 {"name": "dg", "type": "BOND", "atoms": ["index 0 2", "index 3"]},
+                 {"name": "far", "type": "BOND", "atoms": ["index 4", "index 5"]},
+                 {"name": "t", "type": "DIHED", "atoms": ["index 0", "index 1", "index 3", "index 4"]}])
+    M = common.CVCalculator(cvs, u).metric_tensor()
+    assert np.allclose(M, M.T) and np.all(np.linalg.eigvalsh(M) > 0)
+    assert abs(M[0, 0] - (1 / 12 + 1 / 14)) < 1e-6           # a distance: the sum of the inverse masses
+    assert abs(M[1, 1] - (1 / 13 + 1 / 16)) < 1e-6           # a group counts as one body of its total mass
+    assert abs(M[0, 2]) < 1e-12 and abs(M[1, 2]) < 1e-12     # no shared atoms, no coupling
+    assert abs(M[0, 1]) > 1e-4                               # atom 0 is in both
+    # the dihedral, by brute force on the atoms themselves
+    def tors(x):
+        return common._dihedral(x[0], x[1], x[3], x[4])
+    x0 = u.atoms.positions.astype(float); g = np.zeros((6, 3))
+    for a in range(6):
+        for k in range(3):
+            hi, lo = x0.copy(), x0.copy(); hi[a, k] += 1e-5; lo[a, k] -= 1e-5
+            g[a, k] = (tors(hi) - tors(lo)) / 2e-5
+    assert abs(M[3, 3] - np.sum(g ** 2 / masses[:, None])) < 1e-5
+
+
+def test_mobility_bends_the_relaxed_string():
+    """On a tilted quadratic valley a path relaxed with an anisotropic tensor
+    ends somewhere else than one relaxed without it; and the tensor survives
+    a save and a load."""
+    from fesmap import FESMap, fit_with_sigma_scan
+    from path_search import relax_string
+    xs = np.arange(-1.5, 1.5 + 1e-9, 0.25)
+    P = np.array([(x, y) for x in xs for y in xs])
+    f = -np.column_stack([0.4 * P[:, 0], 4.0 * (P[:, 1] - 0.5 * np.sin(2 * P[:, 0]))])   # minus the gradient
+    m, _, _ = fit_with_sigma_scan(P, f, np.ones(2), np.zeros(2, bool))
+    start = np.column_stack([np.linspace(-1.2, 1.2, 12), np.full(12, 0.6)])
+    plain, _, _ = relax_string(m, start, 12, max_iter=300)
+    m.set_metric_tensor(P, np.tile(np.array([[1.0, 0.9], [0.9, 1.0]]), (len(P), 1, 1)))
+    bent, _, _ = relax_string(m, start, 12, max_iter=300)
+    assert np.abs(bent - plain).max() > 0.02
+    with pytest.raises(ValueError):
+        m.set_metric_tensor(P + 0.1, np.tile(np.eye(2), (len(P), 1, 1)))
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        m.save(os.path.join(d, "m.json")); m2 = FESMap.load(os.path.join(d, "m.json"))
+    assert np.allclose(m2.M, m.M) and np.allclose(m2.mobility(P[:3]), m.mobility(P[:3]))
+
+
+def test_metric_from_cfacv_log(tmp_path):
+    import meanforce as mf
+    rng = np.random.default_rng(5)
+    true = np.array([[0.3, -0.1], [-0.1, 0.8]])
+    lines = ["Info: something", "CFACV) Average gradF 1.0 2.0"]
+    for i in range(50):
+        M = true + (5.0 if i < 10 else 0.0) + rng.normal(0, 0.01, (2, 2))       # the first fifth is off
+        lines.append("CFACV) Average MT " + " ".join(str(v) for v in M.ravel()))
+    p = tmp_path / "pt.log"; p.write_text("\n".join(lines) + "\n")
+    M = mf.metric_from_log(str(p), 2, discard=0.2)
+    assert np.allclose(M, true, atol=0.01) and np.allclose(M, M.T)
+    with pytest.raises(ValueError):
+        mf.metric_from_log(str(p), 3)
+
+
+def _force_frames(zs, rng, n=11):
+    lines = ["# update image n_updates z dF/dz"]
+    for fr, shift in enumerate(zs):
+        for i in range(n):
+            x = i / (n - 1.0)
+            g = np.array([3 * np.pi / 2 * np.sin(np.pi * x), 0.0]) + rng.normal(0, 0.3, 2)
+            lines.append(f"{(fr + 1) * 100} {i} 100 {x} {shift if i == 5 else 0.0} {g[0]} {g[1]}")
+    return lines
+
+
+def test_driver_profile_refuses_a_drifting_string_and_one_moving_image(tmp_path):
+    import fe_profile as fp
+    rng = np.random.default_rng(8)
+    # one image out of eleven drifts steadily the whole time: an average over images would hide it
+    f = tmp_path / "drift.forces"; f.write_text("\n".join(_force_frames(0.01 * np.arange(200), rng)) + "\n")
+    with pytest.raises(ValueError, match="still moving"):
+        fp.from_driver([str(f)], np.ones(2))
+    # the same string, stopped for its last 80 frames: those are used, and only those
+    f.write_text("\n".join(_force_frames(np.concatenate([0.01 * np.arange(120), np.full(80, 1.2)]), rng)) + "\n")
+    res = fp.from_driver([str(f)], np.ones(2))
+    assert 78 <= res["frames_used"] <= 100 and res["drift_in_window"] <= 0.03   # a few frames of the last creep fit within the limit
+
+
+def test_driver_force_legs_overlap_and_cut_frames(tmp_path):
+    import fe_profile as fp
+    rng = np.random.default_rng(9)
+    lines = _force_frames(np.zeros(40), rng)
+    a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+    a.write_text("\n".join(lines[:1 + 25 * 11 + 4]) + "\n")              # killed mid-frame after 25 frames
+    b.write_text(lines[0] + "\n")                                         # a leg that wrote nothing
+    c.write_text(lines[0] + "\n" + "\n".join(lines[1 + 20 * 11:]) + "\n")  # resumed from frame 20: five frames repeated
+    upd, Z, G, nup = fp.read_driver_forces([str(a), str(b), str(c)])
+    assert len(upd) == 40 and list(upd) == sorted(set(upd))
+
+
+def _toy_profile(rng, n=13, m=4000, corr=0.0, drift_image=None, drift=0.0, relax=0.0):
+    """Restrained-run samples for a string along (1, 1) in two CVs, F = 3 sin^2(pi s) + s."""
+    import fe_profile as fp
+    s = np.linspace(0, 1, n); z = np.column_stack([s, s]); k = np.array([200.0, 200.0])
+    dFds = 3 * np.pi * np.sin(2 * np.pi * s) + 1.0
+    grad = np.outer(dFds, [0.5, 0.5])
+    theta = []
+    for i in range(n):
+        a, b = rng.normal(0, 1, (2, m))
+        e = np.column_stack([a, corr * a + np.sqrt(1 - corr ** 2) * b]) * 0.055
+        th = z[i] - grad[i] / k + e
+        if drift_image == i:
+            th[:, 0] -= drift / k[0] * np.linspace(-0.5, 0.5, m)       # the force at this image drifts by `drift`
+        if relax:
+            th[:, 0] -= relax / k[0] * np.exp(-np.arange(m) / (0.05 * m))  # every run starts off its mean
+        theta.append(th)
+    return z, theta, k
+
+
+def test_error_keeps_the_correlation_between_components():
+    """Force noise correlated between the two CVs: along (1, 1) it adds up
+    when the correlation is positive and cancels when negative.  A separate
+    error bar per component gets both cases wrong."""
+    import fe_profile as fp
+    for corr, lo, hi in ((0.95, 0.6, 1.7), (-0.95, 0.6, 1.7)):
+        vals, ses = [], []
+        for rep in range(40):
+            z, theta, k = _toy_profile(np.random.default_rng(300 + rep), corr=corr, m=1500)
+            r = fp.compute(z, theta, k, np.zeros(2, bool), np.ones(2), discard=0.0)
+            vals.append(r["delta_F"]); ses.append(r["delta_F_se"])
+        ratio = np.mean(ses) / np.std(vals, ddof=1)
+        assert lo < ratio < hi, (corr, ratio)
+
+
+def test_stability_gate_can_fail_and_looks_at_the_end_to_end_difference():
+    import fe_profile as fp
+    z, theta, k = _toy_profile(np.random.default_rng(1))
+    r = fp.compute(z, theta, k, np.zeros(2, bool), np.ones(2), discard=0.0)
+    assert r["stable"] and r["stable_barrier"] and r["stable_delta_F"] and r["resolved"]
+    assert abs(r["barrier"] - 3.53) < 0.3 and abs(r["delta_F"] - 1.0) < 4 * r["delta_F_se"] + 0.05
+    # one image's force drifts through its run: with the old test (first half
+    # against the whole, error inflated by the drift itself) this could not fail
+    z, theta, k = _toy_profile(np.random.default_rng(1), drift_image=3, drift=40.0)
+    r = fp.compute(z, theta, k, np.zeros(2, bool), np.ones(2), discard=0.0)
+    assert not r["stable"]
+    # a drift AFTER the top leaves the barrier alone and moves only the end-to-end difference
+    z, theta, k = _toy_profile(np.random.default_rng(1), drift_image=10, drift=40.0)
+    r = fp.compute(z, theta, k, np.zeros(2, bool), np.ones(2), discard=0.0)
+    assert r["stable_barrier"] and not r["stable_delta_F"] and not r["stable"]
+
+
+def test_resolution_gate_looks_at_the_end_to_end_difference():
+    """A narrow drop after the top, seen by one image: the barrier is fine,
+    the end-to-end difference is not."""
+    import fe_profile as fp
+    rng = np.random.default_rng(12)
+    n, k = 21, np.array([50.0])
+    z = np.linspace(0, 10, n)[:, None]
+    dFdz = 0.8 * np.sin(np.pi * z[:, 0] / 5.0); dFdz[15] = 60.0
+    theta = [z[i] - dFdz[i] / k + rng.normal(0, 0.1, (2000, 1)) for i in range(n)]
+    r = fp.compute(z, theta, k, np.zeros(1, bool), np.ones(1), discard=0.0)
+    assert not r["resolved_delta_F"] and not r["resolved"]
+
+
+def test_equilibration_is_detected_not_assumed():
+    import fe_profile as fp
+    rng = np.random.default_rng(5)
+    x = rng.normal(0, 1, 4000); x[:600] += 6 * np.exp(-np.arange(600) / 150.0)
+    t0, g, neff = fp.detect_equilibration(x)
+    assert 200 <= t0 <= 1300
+    assert fp.detect_equilibration(rng.normal(0, 1, 4000))[0] <= 250          # nothing to drop from a stationary series
+    assert abs(fp.statistical_inefficiency(rng.normal(0, 1, 5000)) - 1) < 0.3
+    ar = np.zeros(20000); e = rng.normal(0, 1, 20000)
+    for i in range(1, 20000):
+        ar[i] = 0.9 * ar[i - 1] + e[i]
+    assert 12 < fp.statistical_inefficiency(ar) < 28                           # (1 + 0.9) / (1 - 0.9) = 19
+    # runs that start off their mean: auto drops it, a profile with no discard is biased
+    z, theta, k = _toy_profile(np.random.default_rng(2), relax=60.0)
+    auto = fp.compute(z, [t.copy() for t in theta], k, np.zeros(2, bool), np.ones(2))
+    none = fp.compute(z, [t.copy() for t in theta], k, np.zeros(2, bool), np.ones(2), discard=0.0)
+    assert np.median(auto["discarded_fraction"]) > 0.05
+    assert abs(auto["delta_F"] - 1.0) < abs(none["delta_F"] - 1.0)

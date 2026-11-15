@@ -113,6 +113,70 @@ def collect(a):
           f"worst {rel.max():.3f}")
 
 
+def metric_from_log(log, n, discard=0.2):
+    """Run average of the metric tensor cfacv prints at every report
+    ("CFACV) Average MT ...", each the average since the report before)."""
+    rows = []
+    with open(log, errors="replace") as fh:
+        for line in fh:
+            if line.startswith("CFACV) Average MT"):
+                v = line.split()[3:]
+                if len(v) == n * n:
+                    rows.append([float(x) for x in v])
+    if len(rows) < 5:
+        raise ValueError(f"{log}: {len(rows)} metric-tensor reports")
+    rows = np.array(rows[int(discard * len(rows)):])
+    M = rows.mean(axis=0).reshape(n, n)
+    return 0.5 * (M + M.T)
+
+
+def metric(a):
+    """The metric tensor at each point: averaged over the point's restrained
+    run when its log is there (the default), or from the point's starting
+    configuration alone (--start, with --cv and --psf)."""
+    from common import load_json, save_json
+    s = load_json(os.path.join(a.dir, "setup.json"))
+    if not a.start:
+        n = len(s["cvs"]); Ms = []; pts = []; missing = 0
+        for i in range(len(s["points"])):
+            try:
+                Ms.append(metric_from_log(os.path.join(a.dir, f"pt{i:05d}.log"), n, a.discard)); pts.append(s["points"][i])
+            except (OSError, ValueError):
+                missing += 1
+        if not Ms:
+            sys.exit(f"no metric-tensor reports in the logs under {a.dir}")
+        if missing:
+            print(f"WARNING: {missing} of {len(s['points'])} points have no usable log")
+        s = dict(s, points=pts); Ms = np.array(Ms)
+        return _write_metric(a, s, Ms, "averaged over each restrained run")
+    if not (a.cv and a.psf):
+        sys.exit("--start needs --cv and --psf")
+    import MDAnalysis as mda
+    from common import CVCalculator
+    cvset = CVSet.load(a.cv).subset(s["cvs"])
+    Ms = []
+    for i in range(len(s["points"])):
+        u = mda.Universe(a.psf, a.start.format(i=i) + ".coor", format="NAMDBIN")
+        try:
+            xsc = [l for l in open(a.start.format(i=i) + ".xsc") if not l.startswith("#")][-1].split()
+            u.dimensions = [float(xsc[1]), float(xsc[5]), float(xsc[9]), 90, 90, 90]
+        except (OSError, IndexError, ValueError):
+            pass                                              # no cell: the groups are taken as they are
+        Ms.append(CVCalculator(cvset, u).metric_tensor())
+    return _write_metric(a, s, np.array(Ms), "from one configuration per point")
+
+
+def _write_metric(a, s, Ms, how):
+    from common import save_json
+    save_json(a.out, {"cvs": s["cvs"], "points": s["points"], "M": Ms, "how": how})
+    d = np.array([np.diag(M) for M in Ms])
+    off = np.array([np.abs(M - np.diag(np.diag(M))).max() / np.sqrt(np.outer(np.diag(M), np.diag(M))).max() for M in Ms])
+    print(f"metric tensor at {len(Ms)} points, {how} -> {a.out}")
+    for n, lo, md, hi in zip(s["cvs"], d.min(0), np.median(d, 0), d.max(0)):
+        print(f"   M[{n},{n}]: {lo:.4g} to {hi:.4g}, median {md:.4g}")
+    print(f"   largest off-diagonal element relative to the diagonal: median {np.median(off):.2f}, worst {off.max():.2f}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -135,8 +199,14 @@ def main(argv=None):
     p.add_argument("--discard", type=float, default=0.2, help="leading fraction of each run to drop")
     p.add_argument("--blocks", type=int, default=5)
     p.add_argument("--out", default="forces.dat")
+    p = sub.add_parser("metric", help="metric tensor at each point, for the path search (no MD)")
+    p.add_argument("--dir", default="mf"); p.add_argument("--out", default="metric.json")
+    p.add_argument("--discard", type=float, default=0.2, help="leading fraction of each run to drop")
+    p.add_argument("--start", help="instead of the run averages, use one configuration per point: its path stem, "
+                                   "as given to setup (needs --cv and --psf)")
+    p.add_argument("--cv"); p.add_argument("--psf")
     a = ap.parse_args(argv)
-    (setup if a.cmd == "setup" else collect)(a)
+    {"setup": setup, "collect": collect, "metric": metric}[a.cmd](a)
     return 0
 
 

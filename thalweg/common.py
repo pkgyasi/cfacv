@@ -131,6 +131,40 @@ class CVCalculator:
         out = [self.frame() for _ in self.u.trajectory[start:stop:step]]
         return np.array(out)
 
+    def metric_tensor(self, h=1e-4):
+        """M_ij = sum over atoms of (1/m) grad(theta_i) . grad(theta_j) for the
+        current frame, in (CV unit)^2 per amu.
+
+        This is the tensor the string method in collective variables moves
+        with: an image goes along -M grad F, not along -grad F.  A CV here is
+        a function of the centers of mass of its atom groups, so its gradient
+        on atom a of group g is (m_a / M_g) dtheta/dR_g; dtheta/dR_g is taken
+        by central differences."""
+        grads = []                                            # per CV: {atom index: 3-vector}
+        for c, gs in zip(self.cvset.cvs, self.groups):
+            pts = self._centers(gs); per = c["type"] in PERIODIC_TYPES
+            ga = {}
+            for k, g in enumerate(gs):
+                d = np.zeros(3)
+                for x in range(3):
+                    hi = [p.copy() for p in pts]; lo = [p.copy() for p in pts]
+                    hi[k][x] += h; lo[k][x] -= h
+                    dv = cv_values_from_points(c["type"], hi) - cv_values_from_points(c["type"], lo)
+                    if per:
+                        dv = (dv + np.pi) % (2 * np.pi) - np.pi
+                    d[x] = dv / (2 * h)
+                w = g.masses / g.masses.sum()
+                for idx, wa in zip(g.indices, w):
+                    ga[idx] = ga.get(idx, 0.0) + wa * d
+            grads.append(ga)
+        mass = self.u.atoms.masses
+        n = len(grads); M = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i, n):
+                common = grads[i].keys() & grads[j].keys()
+                M[i, j] = M[j, i] = sum(float(grads[i][a] @ grads[j][a]) / mass[a] for a in common)
+        return M
+
 
 # --------------------------------------------------------------------------
 # periodic arithmetic in CV space
@@ -215,8 +249,12 @@ def read_cvout(path):
             acc.setdefault(m.group(1), []).append((int(m.group(2)), vals))
     out = {}
     for k, rows in acc.items():
-        n = min(len(r[1]) for r in rows)
-        out[k] = (np.array([r[0] for r in rows]), np.array([r[1][:n] for r in rows]))
+        # a line cut short (a walltime kill in mid-write) is dropped; cutting
+        # every row to its width instead would silently lose CVs
+        widths = [len(r[1]) for r in rows]
+        n = max(set(widths), key=widths.count)
+        rows = [r for r in rows if len(r[1]) == n]
+        out[k] = (np.array([r[0] for r in rows]), np.array([r[1] for r in rows]))
     return out
 
 
@@ -292,7 +330,9 @@ def block_mean_se(x, nblocks=5):
     x = np.asarray(x, float)
     if x.ndim == 1:
         x = x[:, None]
-    nb = max(2, min(nblocks, len(x)))
+    if len(x) < 4:
+        raise ValueError(f"{len(x)} samples: too few for an error estimate")
+    nb = max(2, min(nblocks, len(x) // 2))
     blocks = np.array([b.mean(axis=0) for b in np.array_split(x, nb)])
     return x.mean(axis=0), blocks.std(axis=0, ddof=1) / np.sqrt(nb), blocks
 

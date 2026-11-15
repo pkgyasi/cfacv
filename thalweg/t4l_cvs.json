@@ -1,5 +1,5 @@
 {
- "_source": "Abou-Hatab and Abrams, J Phys Chem B 2025;129:5176, Table 1 and Figure 2. Residue numbers are the paper's; check them against the built PSF before use. chi1 is taken as N-CA-CB-CG.",
+ "_source": "Abou-Hatab and Abrams, J Phys Chem B 2025;129:5176, Table 1 and Figure 2. Residue numbers are the paper's. Checked 2026-11-14 against a pestifer build of 2LZM: all eleven selections resolve and the sequence equals the deposit. chi1 is N-CA-CB-CG in the IUPAC sign convention cfacv uses: -65.7 deg in the 2LZM crystal and +175.8 deg in 150L chain D. The paper prints the closed value as +65.67, that is, with the opposite sign or as a magnitude, so in cfacv units the closed basin is near -1.15 rad, NOT +1.15, and the short way from closed to open crosses +/-pi.",
  "cvs": [
   {"name": "d1",   "type": "BOND",  "atoms": ["protein and resid 22 and name CA",  "protein and resid 141 and name CA"]},
   {"name": "d2",   "type": "BOND",  "atoms": ["protein and resid 5 and name CA",   "protein and resid 59 and name CA"]},

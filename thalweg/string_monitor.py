@@ -31,7 +31,7 @@ import sys
 
 import numpy as np
 
-from common import CVSet, load_json, path_length, save_json
+from common import CVSet, load_json, path_length, save_json, wrap
 
 _LINE = re.compile(r"^SM (?:FINAL)?iter\s*(\d+) replica (\d+) : reparam z (.*)$")
 
@@ -78,11 +78,16 @@ def status(iters, z, scale, window, tol):
     }
 
 
-def compare(a, b, scale, scatter_a, scatter_b, factor=2.0):
-    """Are two strings (same image count) one path?"""
+def compare(a, b, scale, scatter_a, scatter_b, factor=2.0, periodic=None):
+    """Are two strings (same image count) one path?
+
+    `periodic` flags the CVs that wrap.  Strings are stored unwrapped, so two
+    strings that are the same curve can differ by whole turns; the difference
+    is wrapped before it is measured."""
     if a.shape != b.shape:
         raise ValueError(f"strings have different shapes {a.shape} and {b.shape}")
-    d = np.linalg.norm((a - b) / scale, axis=1)
+    diff_ab = a - b if periodic is None else wrap(a - b, periodic)
+    d = np.linalg.norm(diff_ab / scale, axis=1)
     noise = float(np.hypot(scatter_a, scatter_b))
     return {"separation": d, "mean_separation": float(d.mean()), "max_separation": float(d.max()),
             "combined_scatter": noise, "merged": bool(d.max() < factor * noise), "factor": factor}
@@ -132,11 +137,15 @@ def main(argv=None):
     p.add_argument("--scatter-a", type=float, required=True, help="mean scatter reported by 'status' for string a")
     p.add_argument("--scatter-b", type=float, required=True)
     p.add_argument("--factor", type=float, default=2.0, help="merged if the largest separation < factor x scatter")
+    p.add_argument("--cv", help="CV definition JSON; needed when any CV is a torsion, so differences are wrapped")
     a = ap.parse_args(argv)
     scale = np.array(load_json(a.scales)["scale"])
 
     if a.cmd == "compare":
-        r = compare(np.loadtxt(a.a), np.loadtxt(a.b), scale, a.scatter_a, a.scatter_b, a.factor)
+        per = None
+        if a.cv:
+            full = CVSet.load(a.cv); per = full.subset(full.string).periodic
+        r = compare(np.loadtxt(a.a), np.loadtxt(a.b), scale, a.scatter_a, a.scatter_b, a.factor, per)
         print(f"separation: mean {r['mean_separation']:.2f}, largest {r['max_separation']:.2f} scaled units; "
               f"combined scatter {r['combined_scatter']:.2f}")
         print("MERGED: one path" if r["merged"] else "DISTINCT: two channels, both go to the free-energy stage")

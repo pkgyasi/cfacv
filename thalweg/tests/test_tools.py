@@ -195,6 +195,11 @@ def test_monitor_tells_converged_from_drifting(tmp_path):
     # merged or distinct
     c = sm.compare(ra["string"], ra["string"] + [0.02, 0.0], scale, ra["mean_scatter"], ra["mean_scatter"])
     assert c["merged"]
+    # the same curve stored one whole turn away in the torsion is still the same curve
+    turned = ra["string"] + [0.0, 2 * np.pi]
+    assert not sm.compare(ra["string"], turned, scale, ra["mean_scatter"], ra["mean_scatter"])["merged"]
+    assert sm.compare(ra["string"], turned, scale, ra["mean_scatter"], ra["mean_scatter"],
+                      periodic=np.array([False, True]))["merged"]
     other = base + np.column_stack([np.zeros(12), 0.6 * np.sin(np.linspace(0, np.pi, 12))])
     assert not sm.compare(ra["string"], other, scale, ra["mean_scatter"], ra["mean_scatter"])["merged"]
 

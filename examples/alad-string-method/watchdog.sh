@@ -57,7 +57,9 @@ run_string_watched() {
   local marked_at="" n rc
 
   while kill -0 "$pid" 2>/dev/null; do
-    n=$(grep -l "End of program" "$outdir"/*/"$base".*.log 2>/dev/null | wc -l)
+    # grep exits 2 while no log exists yet; under the caller's `set -e -o
+    # pipefail` that killed the job on the first poll, before NAMD had started.
+    n=$({ grep -l "End of program" "$outdir"/*/"$base".*.log 2>/dev/null || true; } | wc -l)
     if [ "$n" -ge "$nrep" ]; then
       if [ -z "$marked_at" ]; then
         marked_at=$SECONDS

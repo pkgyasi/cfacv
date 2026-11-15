@@ -1,0 +1,34 @@
+{
+ "_note": "CV selection end to end on alanine dipeptide in water: end-state runs, a basin model over a nine-candidate pool, targeted MD both ways, shots that stop on entering a basin, and likelihood maximization. Run from a directory holding system/, base.namd, pool.json, published.json and ends/e0..e7.conf (see thalweg/README.md). About five minutes on 24 cores.",
+ "vars": {
+  "psf": "system/alad_wb.psf",
+  "pdb": "system/alad_wb.pdb",
+  "pool": "pool.json",
+  "heavy": "bynum 1:22 and not name H*"
+ },
+ "launcher": {"mode": "local", "command": "namd3 +p4 {conf}", "parallel": 6, "hang_minutes": 10},
+ "stages": [
+  {"name": "end states", "steps": [
+    {"shell": "ls ends/e*.conf > ends/runs.list"},
+    {"runlist": "ends/runs.list"}
+  ]},
+  {"name": "basin model", "steps": [
+    {"tool": "cv_select.py classifier --cv {pool} --psf {psf} --closed ends/e0.dcd ends/e1.dcd ends/e2.dcd ends/e3.dcd --open ends/e4.dcd ends/e5.dcd ends/e6.dcd ends/e7.dcd --skip 50 --max-wrong 0.05 --out classifier.json", "gate": "basin classifier"},
+    {"tool": "make_cfacv_inputs.py --cv {pool} --psf {psf} --pdb {pdb} --all --label pool_label.pdb --cvinp pool_cv.inp"}
+  ]},
+  {"name": "targeted MD", "steps": [
+    {"tool": "cv_select.py tmd --psf {psf} --coor system/beta.coor --target-psf {psf} --target-coor system/alphaR.coor --sel \"{heavy}\" --runs 3 --steps 10000 --dcdfreq 100 --final-rmsd 0.1 --seed 31000 --namd-base base.namd --out tmd_b2a"},
+    {"tool": "cv_select.py tmd --psf {psf} --coor system/alphaR.coor --target-psf {psf} --target-coor system/beta.coor --sel \"{heavy}\" --runs 3 --steps 10000 --dcdfreq 100 --final-rmsd 0.1 --seed 32000 --namd-base base.namd --out tmd_a2b"},
+    {"runlist": "tmd_b2a/runs.list"},
+    {"runlist": "tmd_a2b/runs.list"}
+  ]},
+  {"name": "shots", "steps": [
+    {"tool": "cv_select.py shots --psf {psf} --dcd tmd_b2a/tmd0?.dcd tmd_a2b/tmd0?.dcd --n 180 --per-config 2 --steps 2500 --chunk 50 --dcdfreq 2500 --classifier classifier.json --label pool_label.pdb --cvinp pool_cv.inp --namd-base base.namd --out shots"},
+    {"runlist": "shots/runs.list"},
+    {"tool": "cv_select.py outcomes --cv {pool} --classifier classifier.json --psf {psf} --dir shots"}
+  ]},
+  {"name": "selection", "steps": [
+    {"tool": "cv_select.py select --cv {pool} --outcomes shots/outcomes.json --published published.json --out selection.json", "gate": "CV selection"}
+  ]}
+ ]
+}

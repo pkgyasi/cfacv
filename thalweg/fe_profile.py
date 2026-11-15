@@ -359,50 +359,100 @@ def window_drift(Z, scale):   # kept for callers; from_driver uses window_motion
     return float(np.sqrt((d ** 2).sum(axis=1)).max())
 
 
+def _to_curve(pts, curve):
+    """Distance from each point to the polyline `curve` (both already scaled)."""
+    a = curve[:-1]; ab = curve[1:] - a; l2 = np.maximum((ab * ab).sum(axis=1), 1e-300)
+    out = np.empty(len(pts))
+    for i, p in enumerate(pts):
+        t = np.clip(((p - a) * ab).sum(axis=1) / l2, 0.0, 1.0)
+        out[i] = np.sqrt((((a + t[:, None] * ab) - p) ** 2).sum(axis=1).min())
+    return out
+
+
+def _fine(x, per_segment=12):
+    """A fine polyline along the natural cubic spline through the points x."""
+    from scipy.interpolate import CubicSpline
+    s = np.concatenate([[0.0], np.cumsum(np.sqrt((np.diff(x, axis=0) ** 2).sum(axis=1)) + 1e-12)])
+    return CubicSpline(s, x, bc_type="natural")(np.linspace(0.0, s[-1], (len(x) - 1) * per_segment + 1))
+
+
+def plateau_motion(Z, scale):
+    """The driver's plateau test (tw::plateau), on these frames.
+
+    The frames are cut into four equal blocks.  For every image, g2 is its
+    squared distance, as a curve, between the first block's mean string and
+    the last's, and f2 the same between neighbouring blocks (mean of the
+    three pairs).  Returns
+      systematic  the largest sqrt(g2 - f2) over the images: the movement
+                  across these frames that the string's own wander between
+                  neighbouring blocks does not account for;
+      wander      the rms of sqrt(f2) over the images."""
+    Z = np.asarray(Z, float) / scale
+    L = len(Z) // 4
+    if L < 1:
+        raise ValueError("need at least 4 frames")
+    Q = [Z[len(Z) - (4 - j) * L: len(Z) - (3 - j) * L].mean(axis=0) for j in range(4)]
+
+    def sq(A, B):
+        return (_to_curve(B, _fine(A)) ** 2 + _to_curve(A, _fine(B)) ** 2) / 2.0
+    g2 = sq(Q[0], Q[3]); f2 = (sq(Q[0], Q[1]) + sq(Q[1], Q[2]) + sq(Q[2], Q[3])) / 3.0
+    return float(np.sqrt(np.clip(g2 - f2, 0.0, None)).max()), float(np.sqrt(f2.mean()))
+
+
 def stationary(Z, scale, max_drift):
-    """Has the string stopped over these frames?  Not when it wandered, when
-    its fitted net motion exceeds max_drift, or when it shows a drift that is
-    statistically real and more than a third of max_drift.  The last clause
-    is what refuses a steadily drifting string: such a string always has
-    SOME short window over which it moved less than any given limit."""
-    net, t, wander = window_motion(Z, scale)
-    return bool(wander <= max_drift and net <= max_drift and not (t > 3.5 and net > max_drift / 3.0)), net, t, wander
+    """Has the string come to rest over these frames?  The same question the
+    driver asks, answered the same way (plateau_motion): no image has moved
+    across them by more than max_drift beyond the string's own wander.
+
+    (Until 2026-11-15 this compared a fitted net motion and the largest
+    excursion with a limit of 0.03.  A string that moves on a noisy force
+    with a constant step wanders by 0.06 to 0.07 between any two stretches
+    of its run, at rest or not, so that test failed every real run.)
+    Returns (ok, net, t, wander, systematic); net and t are the straight-line
+    fit of window_motion, kept for the report."""
+    net, t, _ = window_motion(Z, scale)
+    systematic, wander = plateau_motion(Z, scale)
+    return bool(systematic <= max_drift), net, t, wander, systematic
 
 
-def from_driver(paths, scale, last=None, nblocks=6, max_drift=0.03):
+def from_driver(paths, scale, last=None, nblocks=6, max_drift=0.2):
     """Free-energy profile from the forces a thalweg driver run recorded.
 
     Each frame holds every image's mean gradient over that frame's updates
     and the mean position they were measured at.  Only frames from after the
-    string stopped moving are used: the longest run of final frames that
-    `stationary` accepts.  `last` uses that many final frames instead, but
-    they are tested the same way and the result says so if they fail."""
+    string came to rest are used: the longest run of final frames that
+    `stationary` accepts and that covers at least the last half of the run.
+    (A creeping string always has SOME short final stretch over which it
+    moved less than any limit; half the run is what the driver tests too.)
+    `last` uses that many final frames instead, but they are tested the same
+    way and the result says so if they fail."""
     upd, Z, G, nup = read_driver_forces(paths)
     need = 2 * nblocks
     if len(Z) < need:
         raise ValueError(f"{len(Z)} frames recorded; need at least {need}")
     if last is None:
         first = None
-        for f in range(0, len(Z) - need + 1):
+        for f in range(0, max(1, min(len(Z) // 2, len(Z) - need) + 1)):
             if stationary(Z[f:], scale, max_drift)[0]:
                 first = f; break
         if first is None:
-            _, net, t, wander = stationary(Z[-need:], scale, max_drift)
-            raise ValueError(f"the string is still moving: over its last {need} frames the image that moved most went "
-                             f"{net:.3f} scaled units ({t:.1f} standard errors; limit {max_drift}), and strayed {wander:.3f} "
-                             "from its mean. Run it longer after it stops.")
+            half = Z[min(len(Z) // 2, len(Z) - need):]
+            _, net, t, wander, systematic = stationary(half, scale, max_drift)
+            raise ValueError(f"the string is still moving: over the last {len(half)} frames one image moved "
+                             f"{systematic:.3f} scaled units beyond the string's own wander of {wander:.3f} "
+                             f"(limit {max_drift}). Run it longer, or pin its ends if one is creeping.")
     else:
         first = max(0, len(Z) - last)
     use = slice(first, len(Z))
     nf = len(Z) - first
     if nf < need:
         raise ValueError(f"{nf} frames given; need at least {need}")
-    ok, net, t, wander = stationary(Z[use], scale, max_drift)
+    ok, net, t, wander, systematic = stationary(Z[use], scale, max_drift)
     zbar = Z[use].mean(axis=0)
     res = from_force_samples(zbar, [-G[use, i, :] for i in range(Z.shape[1])], scale, nblocks)
     res.update({"frames_used": nf, "frames_total": len(Z), "first_update": int(upd[first]), "last_update": int(upd[-1]),
                 "updates_per_frame": int(nup[-1]), "drift_in_window": net, "drift_t": t, "wander_in_window": wander,
-                "stationary": ok})
+                "systematic_in_window": systematic, "stationary": ok})
     return res
 
 
@@ -455,8 +505,9 @@ def main(argv=None):
     p.add_argument("--scales", required=True)
     p.add_argument("--last", type=int, help="use this many final frames (default: the longest final run over which the "
                                            "string did not move); they are tested the same way")
-    p.add_argument("--max-drift", type=float, default=0.03,
-                   help="largest scaled distance any image may move, or stray from its mean, across the frames used [0.03]")
+    p.add_argument("--max-drift", type=float, default=0.2,
+                   help="largest scaled distance any image may have moved across the frames used, beyond the "
+                        "string's own wander between neighbouring quarters of them (the driver's plateau test) [0.2]")
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--out", default="profile_driver")
     p = sub.add_parser("compare")
@@ -490,8 +541,8 @@ def main(argv=None):
             sys.exit(str(e))
         z = res["z"]
         print(f"{res['frames_used']} of {res['frames_total']} frames used (updates {res['first_update']} to {res['last_update']}, "
-              f"{res['updates_per_frame']} updates each); across them the image that moved most went {res['drift_in_window']:.3f} "
-              f"scaled units ({res['drift_t']:.1f} standard errors) and strayed at most {res['wander_in_window']:.3f} from its mean")
+              f"{res['updates_per_frame']} updates each); across them one image moved {res['systematic_in_window']:.3f} "
+              f"scaled units beyond the string's own wander of {res['wander_in_window']:.3f}")
         print(f"GATE stationary string: {'PASS' if res['stationary'] else 'FAIL'} (limit {a.max_drift} scaled units)")
         print(f"{'image':>5s} {'arc':>7s} {'F':>8s} {'+/-':>6s}")
         for i in range(len(z)):

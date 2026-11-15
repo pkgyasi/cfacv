@@ -316,7 +316,7 @@ def test_profile_from_driver_forces(tmp_path):
     zfin = np.column_stack([np.linspace(0, 1, n), np.zeros(n)])
     lines = ["# update image n_updates z dF/dz"]
     for fr in range(nfr):
-        shift = 0.5 * np.exp(-fr / 3.0)                      # early frames are far from the final string
+        shift = 3.0 * np.exp(-fr / 4.0)                      # early frames are far from the final string
         for i in range(n):
             z = zfin[i] + [0, shift]
             g = np.array([3 * np.pi / 2 * np.sin(np.pi * z[0]), 0.0]) + rng.normal(0, 0.3, 2)
@@ -418,7 +418,30 @@ def test_driver_profile_refuses_a_drifting_string_and_one_moving_image(tmp_path)
     # the same string, stopped for its last 80 frames: those are used, and only those
     f.write_text("\n".join(_force_frames(np.concatenate([0.01 * np.arange(120), np.full(80, 1.2)]), rng)) + "\n")
     res = fp.from_driver([str(f)], np.ones(2))
-    assert 78 <= res["frames_used"] <= 100 and res["drift_in_window"] <= 0.03   # a few frames of the last creep fit within the limit
+    # the last half of the run at least; the tail of the creep that fits within the limit comes with it
+    assert 100 <= res["frames_used"] <= 130 and res["systematic_in_window"] <= 0.2 and res["stationary"]
+
+
+def test_plateau_tells_a_resting_string_from_a_creeping_one(tmp_path):
+    """Both strings wander alike between neighbouring stretches; only one goes anywhere."""
+    import fe_profile as fp
+    rng = np.random.default_rng(21)
+    n, nfr = 12, 800
+    base = np.column_stack([np.arange(n, dtype=float), np.zeros(n)])
+    w = np.zeros((nfr, n)); 
+    for f in range(1, nfr):
+        w[f] = 0.8 * w[f - 1] + rng.normal(0, 0.04, n)        # slow wander across the string
+    rest = np.repeat(base[None], nfr, axis=0); rest[:, :, 1] += w
+    creep = rest.copy(); creep[:, 6:, 1] += 0.001 * np.arange(nfr)[:, None]   # the far half creeps 0.8 over the run
+    s_rest, f_rest = fp.plateau_motion(rest[nfr // 2:], np.ones(2))
+    s_creep, f_creep = fp.plateau_motion(creep[nfr // 2:], np.ones(2))
+    assert s_rest < 0.1 and 0.22 < s_creep < 0.36             # 0.1 per block: sqrt(8) x 0.1 = 0.28
+    assert f_rest < 0.1 and f_creep < 0.1                     # a limit of 0.1 on neighbouring stretches passes both
+    assert fp.stationary(rest[nfr // 2:], np.ones(2), 0.2)[0] and not fp.stationary(creep[nfr // 2:], np.ones(2), 0.2)[0]
+    # sliding along the path is not movement: the same string with its images respaced
+    slid = base.copy(); slid[1:-1, 0] += 0.3
+    Z = np.concatenate([np.repeat(base[None], 40, axis=0), np.repeat(slid[None], 40, axis=0)])
+    assert fp.plateau_motion(Z, np.ones(2))[0] < 1e-6
 
 
 def test_driver_force_legs_overlap_and_cut_frames(tmp_path):

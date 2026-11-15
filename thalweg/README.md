@@ -101,6 +101,19 @@ fe_profile.py compute / compare           -> profile
 committor.py pick ; setup ; array ; tally
 ```
 
+## Python on picotte
+
+The system Python on picotte has numpy and scipy but not MDAnalysis, which
+the scripts that read structures and trajectories need. An environment with
+all of it lives on group storage:
+
+    source /ifs/groups/abramsGrp/pg565/envs/thalweg_env.sh
+
+It loads the Python 3.11 module, activates the environment, and sets
+`THALWEG` and `CFACV_BASEDIR`. In a batch script that runs `module purge`,
+source it after the purge. A purge also unloads the SLURM module, so do not
+call `sbatch` from a shell where you have purged.
+
 ## Tests
 
 ```

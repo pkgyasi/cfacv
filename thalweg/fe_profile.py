@@ -626,7 +626,7 @@ def compute(z, theta, k, periodic, scale, nblocks=10, min_overlap=0.05, discard=
     return res
 
 
-def reference_smoothed(z, runs, k, periodic, kT=0.596, n_boot=3000, seed=0):
+def reference_smoothed(z, runs, k, periodic, kT=0.596, n_boot=3000, seed=0, zero=0):
     """The profile restrained runs SHOULD give, from unbiased trajectories.
 
     With a harmonic restraint of force constant k in each CV the mean force
@@ -645,7 +645,13 @@ def reference_smoothed(z, runs, k, periodic, kT=0.596, n_boot=3000, seed=0):
     1.90 at 1.0.
 
     runs: list of (frames, D) arrays, one per independent trajectory.
-    Errors come from resampling whole trajectories.  Returns a dict."""
+    Errors come from resampling whole trajectories.  F is zeroed at image
+    `zero` (a profile's start image, so the two are compared like with like),
+    and the barrier is defined as a profile's is: F[top] - F[start], top the
+    highest image and start the lowest before it.  A resample with no frame
+    near some image has no F there and is dropped; how many were is returned
+    (dropping them leaves out the resamples that would widen the error).
+    Returns a dict."""
     z = np.asarray(z, float); k = np.asarray(k, float) * np.ones(z.shape[1]); periodic = np.asarray(periodic, bool)
     S = np.zeros((len(runs), len(z))); S2 = np.zeros((len(runs), len(z)))
     for a, x in enumerate(runs):
@@ -656,15 +662,19 @@ def reference_smoothed(z, runs, k, periodic, kT=0.596, n_boot=3000, seed=0):
     tot = S.sum(axis=0)
     if tot.min() <= 0:
         raise ValueError("no unbiased frame near some image: the trajectories never visit that part of the path")
-    F = -kT * np.log(tot / tot[0]); rng = np.random.default_rng(seed); Fb = []
+    F = -kT * np.log(tot / tot[zero]); rng = np.random.default_rng(seed); Fb = []
     for _ in range(n_boot):
         c = S[rng.integers(0, len(runs), len(runs))].sum(axis=0)
         if c.min() > 0:
-            Fb.append(-kT * np.log(c / c[0]))
-    Fb = np.array(Fb); top = int(F.argmax())
-    return {"z": z, "F": F, "F_se": Fb.std(axis=0), "barrier": float(F.max()), "barrier_se": float(Fb.max(axis=1).std()),
-            "top_image": top, "delta_F": float(F[-1]), "delta_F_se": float(Fb[:, -1].std()),
-            "effective_frames": tot ** 2 / S2.sum(axis=0), "k": k, "runs": len(runs), "resamples_used": len(Fb)}
+            Fb.append(-kT * np.log(c / c[zero]))
+    if not Fb:
+        raise ValueError("every bootstrap resample left some image with no unbiased frame near it")
+    Fb = np.array(Fb); top = int(F.argmax()); start = int(F[: top + 1].argmin())
+    return {"z": z, "F": F, "F_se": Fb.std(axis=0), "zero_image": int(zero),
+            "barrier": float(F[top] - F[start]), "barrier_se": float((Fb[:, top] - Fb[:, start]).std()),
+            "top_image": top, "start_image": start, "delta_F": float(F[-1] - F[0]), "delta_F_se": float((Fb[:, -1] - Fb[:, 0]).std()),
+            "effective_frames": tot ** 2 / S2.sum(axis=0), "k": k, "runs": len(runs), "resamples_used": len(Fb),
+            "resamples_dropped": int(n_boot - len(Fb))}
 
 
 def main(argv=None):
@@ -701,12 +711,16 @@ def main(argv=None):
     p.add_argument("--profile", required=True, help="a profile JSON from 'compute' or 'driver' (its images are used)")
     p.add_argument("--cvout", nargs="+", required=True, help="cfacv CV reports of unbiased runs, one per trajectory, in the profile's CVs")
     p.add_argument("--k", type=float, nargs="+", required=True, help="the restraint force constant the profile's runs used, one per CV or one for all")
-    p.add_argument("--cv", help="CV definition JSON, to know which CVs are periodic (default: all periodic if the profile has no types)")
+    p.add_argument("--cv", help="CV definition JSON, to know which CVs are periodic (required when the profile does not "
+                   "record its CV types)")
     p.add_argument("--temperature", type=float, default=300.0)
     p.add_argument("--tolerance", type=float, default=0.3, help="a difference at an image counts against the gate only above this "
                    "many kcal/mol as well as above 4 standard errors [0.3, half of kT at 300 K]: near a basin both errors "
                    "are a few thousandths and any difference is many of them")
-    p.add_argument("--min-frames", type=float, default=20.0, help="effective unbiased frames an image needs for the comparison to count [20]")
+    p.add_argument("--min-frames", type=float, default=20.0, help="effective unbiased frames below which the reference is thin "
+                   "at an image; thin at the top or next to it fails the gate [20]")
+    p.add_argument("--max-dropped", type=float, default=0.05, help="largest fraction of bootstrap resamples that may be "
+                   "dropped for leaving an image empty [0.05]")
     p.add_argument("--out")
     p = sub.add_parser("compare")
     p.add_argument("--a", required=True); p.add_argument("--b", required=True)
@@ -735,36 +749,71 @@ def main(argv=None):
         P = load_json(a.profile); z = np.array(P["z"], float)
         if a.cv:
             from common import CVSet
-            full = CVSet.load(a.cv); periodic = full.subset(full.string).periodic
+            full = CVSet.load(a.cv); sub_ = full.subset(full.string); periodic = sub_.periodic
+            if len(periodic) != z.shape[1]:
+                sys.exit(f"{a.cv} defines {len(periodic)} string CVs; the profile has {z.shape[1]}")
+            if "types" in P and [t == "DIHED" for t in P["types"]] != list(periodic):
+                sys.exit(f"{a.cv} gives CV types {sub_.types}; the profile was computed with {P['types']}")
+        elif "types" in P:
+            periodic = np.array([t == "DIHED" for t in P["types"]])
         else:
-            periodic = np.ones(z.shape[1], bool)
+            sys.exit("the profile does not say which of its CVs are periodic (a 'driver' profile, or one from before "
+                     "2026-11-15): give --cv")
         runs = [read_cvout(f)["Th"][1] for f in a.cvout]
+        start = int(P.get("start_image", 0))
         try:
-            R = reference_smoothed(z, runs, a.k, periodic, kT=0.0019872041 * a.temperature)
+            R = reference_smoothed(z, runs, a.k, periodic, kT=0.0019872041 * a.temperature, zero=start)
         except ValueError as e:
             sys.exit(str(e))
-        F = np.array(P["F"], float); se = np.sqrt(np.array(P.get("F_se", np.zeros(len(z))), float) ** 2 + R["F_se"] ** 2)
+        F = np.array(P["F"], float); F = F - F[start]
+        se = np.sqrt(np.array(P.get("F_se", np.zeros(len(z))), float) ** 2 + R["F_se"] ** 2)
         print(f"{R['runs']} unbiased trajectories; restraint width sqrt(kT/k) = " + ", ".join(f"{v:.3f}" for v in np.sqrt(0.0019872041 * a.temperature / R["k"])))
+        print(f"both zeroed at image {start}, the profile's start")
         print(f"{'image':>5s} {'profile':>8s} {'reference':>9s} {'+/-':>6s} {'frames':>7s}")
         for i in range(len(z)):
             print(f"{i:5d} {F[i]:8.2f} {R['F'][i]:9.2f} {R['F_se'][i]:6.2f} {R['effective_frames'][i]:7.0f}")
-        print(f"barrier      profile {P['barrier']:.2f} +/- {P['barrier_se']:.2f}   reference {R['barrier']:.2f} +/- {R['barrier_se']:.2f}")
+        print(f"barrier      profile {P['barrier']:.2f} +/- {P['barrier_se']:.2f} (image {P.get('top_image', int(F.argmax()))} over "
+              f"{start})   reference {R['barrier']:.2f} +/- {R['barrier_se']:.2f} (image {R['top_image']} over {R['start_image']})")
         print(f"end-to-end   profile {P['delta_F']:.2f} +/- {P['delta_F_se']:.2f}   reference {R['delta_F']:.2f} +/- {R['delta_F_se']:.2f}")
+        ok = True
+        # THIN IMAGES are not dropped: they are compared with their (larger)
+        # error, and where they are the barrier's own the reference cannot
+        # test the barrier at all
         thin = R["effective_frames"] < a.min_frames
         if thin.any():
-            print(f"images {np.flatnonzero(thin).tolist()} have fewer than {a.min_frames:g} effective unbiased frames: the reference says little there")
-        d = np.abs(F - R["F"]); use = ~thin; use[0] = False
+            print(f"images {np.flatnonzero(thin).tolist()} have fewer than {a.min_frames:g} effective unbiased frames: the reference "
+                  "says little there")
+        tops = {int(P.get("top_image", int(F.argmax()))), int(R["top_image"])}
+        near_top = sorted(j for t in tops for j in (t - 1, t, t + 1) if 0 <= j < len(z) and thin[j])
+        if near_top:
+            ok = False
+            print(f"FAIL: images {sorted(set(near_top))} at the top have fewer than {a.min_frames:g} effective unbiased frames: "
+                  "the unbiased runs do not sample the barrier well enough to test it")
+        # BOOTSTRAP: resamples with an empty image were dropped
+        frac = R["resamples_dropped"] / float(R["resamples_dropped"] + R["resamples_used"])
+        if R["resamples_dropped"]:
+            print(f"{R['resamples_dropped']} of {R['resamples_dropped'] + R['resamples_used']} bootstrap resamples ({frac:.1%}) left "
+                  "some image with no unbiased frame and were dropped; the reference's errors are too small by an unknown amount")
+        if frac > a.max_dropped:
+            ok = False
+            print(f"FAIL: more than {a.max_dropped:.0%} of the bootstrap resamples were dropped: too few runs reach some image")
+        d = np.abs(F - R["F"]); use = np.ones(len(z), bool); use[start] = False
         zs = d / np.maximum(se, 1e-12)
         zmax = float(zs[use].max()) if use.any() else float("nan")
         bad = use & (zs > 4.0) & (d > a.tolerance)
-        db = abs(P["barrier"] - R["barrier"]) / np.hypot(P["barrier_se"], R["barrier_se"])
-        ok = bool(db <= 3.0 and not bad.any())
-        print(f"largest difference at an image {d.max():.2f} kcal/mol (image {int(d.argmax())}); in combined standard errors {zmax:.1f}; "
-              f"barriers {db:.1f} combined standard errors apart")
+        comb = float(np.hypot(P["barrier_se"], R["barrier_se"]))
+        db = abs(P["barrier"] - R["barrier"]) / comb
+        ok = bool(ok and db <= 3.0 and not bad.any())
+        print(f"largest difference at an image {d[use].max():.2f} kcal/mol (image {int(np.flatnonzero(use)[d[use].argmax()])}); in "
+              f"combined standard errors {zmax:.1f}; barriers {db:.1f} combined standard errors apart")
+        t0 = int(R["top_image"])
+        print(f"     a barrier difference under {3.0 * comb:.2f} kcal/mol would not show; at the top image, a difference under "
+              f"{max(4.0 * se[t0], a.tolerance):.2f}")
         if bad.any():
             print(f"images {np.flatnonzero(bad).tolist()} differ by more than 4 standard errors and more than {a.tolerance} kcal/mol")
         print(f"GATE profile against unbiased dynamics: {'PASS' if ok else 'FAIL'} (barrier within 3 combined standard errors; "
-              f"no image off by both 4 standard errors and {a.tolerance} kcal/mol)")
+              f"no image off by both 4 standard errors and {a.tolerance} kcal/mol; the top sampled; under "
+              f"{a.max_dropped:.0%} of resamples dropped)")
         if a.out:
             save_json(a.out, R)
         return 0 if ok else 1
@@ -823,6 +872,7 @@ def main(argv=None):
                       kT=0.0019872041 * a.temperature)
     except ValueError as e:
         sys.exit(str(e))
+    res["types"] = list(s["types"]); res["cvs"] = list(s.get("cvs", []))      # 'reference' needs to know which CVs are periodic
     dr = res["discarded_fraction"]
     print(f"discarded as equilibration: {'a floor plus what is detected per image' if discard == 'auto' else 'fixed'}; "
           f"median {np.median(dr):.0%}, most {dr.max():.0%} (image {int(dr.argmax())}); {res['blocks']} blocks; "

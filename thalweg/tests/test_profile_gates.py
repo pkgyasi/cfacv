@@ -278,3 +278,143 @@ def test_stability_sees_the_reviewers_psi_drift(tmp_path):
     rc, out = _main(["compute", "--dir", G5 + "/drift16_0.05", "--scales", sc, "--out", str(tmp_path / "p")])
     assert "GATE stability: FAIL" in out, out
     assert rc == 1
+
+
+# ------------------------------------------------------------------ findings 5, 6, 7: the reference gate
+KT = 0.0019872041 * 300.0
+
+
+def _cvs(tmp_path, d):
+    """A CV definition file with d distances."""
+    p = tmp_path / "cvs.json"
+    p.write_text(json.dumps({"cvs": [{"name": f"d{j}", "type": "BOND", "atoms": ["bynum 1", "bynum 2"]} for j in range(d)]}))
+    return str(p)
+
+
+def _double_well_runs(tmp_path, seed=12, nruns=20, ntot=2_000_000, Fbar=3.0):
+    """iid frames from F(x) = Fbar (x^2 - 1)^2 + harmonic y, written as cfacv reports, one per run."""
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(-2, 2, ntot); x = x[rng.random(len(x)) < np.exp(-Fbar * (x * x - 1) ** 2 / KT)]
+    y = rng.normal(0, np.sqrt(KT / 5.0), len(x))
+    files = []
+    for a, r in enumerate(np.array_split(np.column_stack([x, y]), nruns)):
+        p = tmp_path / f"u{a}.cvout"; files.append(str(p))
+        p.write_text("".join(f"CFACV/C) Th {s} {v[0]:.6f} {v[1]:.6f}\n" for s, v in enumerate(r)))
+    return files
+
+
+def _smoothed(zx, k, Fbar=3.0):
+    g = np.linspace(-2.5, 2.5, 20001); rho = np.exp(-Fbar * (g * g - 1) ** 2 / KT)
+    return np.array([-KT * np.log(np.trapezoid(rho * np.exp(-0.5 * k * (g - a) ** 2 / KT), g)) for a in zx])
+
+
+def _profile_json(path, z, F, se, types=("BOND", "BOND")):
+    top = int(F.argmax()); start = int(F[: top + 1].argmin()); F = F - F[start]
+    P = {"z": z.tolist(), "F": F.tolist(), "F_se": [se] * len(z), "barrier": float(F[top] - F[start]), "barrier_se": se,
+         "delta_F": float(F[-1] - F[0]), "delta_F_se": se, "top_image": top, "start_image": start}
+    if types is not None:
+        P["types"] = list(types)
+    path.write_text(json.dumps(P))
+    return P
+
+
+def test_reference_zeroes_profile_and_reference_at_the_same_image(tmp_path):
+    """Finding 5. A profile that starts on a wall is zeroed at its minimum
+    (start_image 2 here) and the reference at image 0, and the barriers were
+    F[top]-F[start] against F.max()-F[0]: an exact profile failed."""
+    files = _double_well_runs(tmp_path)
+    k = 40.0
+    z = np.column_stack([np.linspace(-1.35, 1.0, 17), np.zeros(17)])
+    F = _smoothed(z[:, 0], k)
+    P = _profile_json(tmp_path / "p.json", z, F, 0.05)
+    assert P["start_image"] > 0 and F[0] - F[P["start_image"]] > 0.4
+    rc, out = _main(["reference", "--profile", str(tmp_path / "p.json"), "--cvout", *files, "--k", str(k), "--cv", _cvs(tmp_path, 2)])
+    assert rc == 0, out
+
+
+G6 = "/home/DREXEL/pg565/fep/fusion_peptide/6cm3_9d9d0_equilibration_results/t4l_paper/thalweg_review3/break/g6"
+ALAD = "/home/DREXEL/pg565/fep/fusion_peptide/6cm3_9d9d0_equilibration_results/t4l_paper/validation_alad4d"
+
+
+@pytest.mark.skipif(not os.path.isfile(G6 + "/perfect_start1.json"), reason="the reviewer's files are not here")
+def test_reference_passes_the_reviewers_perfect_profile_with_start_image_1():
+    """Finding 5 on the reviewer's case: the alanine reference itself, zeroed
+    at image 1, failed by 0.63 kcal/mol at every image."""
+    refs = [f"{ALAD}/ref/ref{i}.cvout" for i in range(48)]
+    rc, out = _main(["reference", "--profile", G6 + "/perfect_start1.json", "--cvout", *refs, "--k", "100",
+                     "--cv", ALAD + "/cvs.json"])
+    assert rc == 0, out
+
+
+def test_reference_says_what_it_cannot_see(tmp_path):
+    """Finding 6. A profile 20% low with an honest error of 0.15 is 2.3
+    combined errors from the reference: the 3-error gate cannot catch it.
+    It must say so, by printing the smallest difference it would catch;
+    40% low it must fail."""
+    files = _double_well_runs(tmp_path)
+    k = 40.0
+    z = np.column_stack([np.linspace(-1.0, 1.0, 17), np.zeros(17)])
+    F = _smoothed(z[:, 0], k); F -= F[0]
+    _profile_json(tmp_path / "p8.json", z, 0.8 * F, 0.2)
+    rc, out = _main(["reference", "--profile", str(tmp_path / "p8.json"), "--cvout", *files, "--k", str(k), "--cv", _cvs(tmp_path, 2)])
+    assert "would not show" in out, out
+    line = [l for l in out.splitlines() if "would not show" in l][0]
+    smallest = float(line.split("under")[1].split()[0])
+    assert smallest > 0.2 * F.max()                     # it says, in numbers, that it could not have seen this one
+    _profile_json(tmp_path / "p6.json", z, 0.6 * F, 0.2)
+    rc, out = _main(["reference", "--profile", str(tmp_path / "p6.json"), "--cvout", *files, "--k", str(k), "--cv", _cvs(tmp_path, 2)])
+    assert rc == 1, out
+
+
+def test_reference_fails_when_it_is_too_thin_at_the_barrier(tmp_path):
+    """Finding 6. Images with under --min-frames effective unbiased frames were
+    dropped from the per-image test without a word in the verdict; they are the
+    barrier images.  With the top thin the reference cannot test the barrier."""
+    files = _double_well_runs(tmp_path, ntot=2_500_000, Fbar=6.0, nruns=20)
+    k = 40.0
+    z = np.column_stack([np.linspace(-1.0, 1.0, 17), np.zeros(17)])
+    F = _smoothed(z[:, 0], k, Fbar=6.0); F -= F[0]
+    _profile_json(tmp_path / "p.json", z, F, 0.1)               # right, but nothing can show it is
+    rc, out = _main(["reference", "--profile", str(tmp_path / "p.json"), "--cvout", *files, "--k", str(k), "--cv", _cvs(tmp_path, 2)])
+    assert "fewer than 20" in out
+    assert rc == 1, out
+
+
+def test_reference_counts_the_bootstrap_resamples_it_could_not_use(tmp_path):
+    """Finding 6. A resample with no frame near some image was dropped
+    silently, which leaves out exactly the resamples that would widen the
+    error.  Two runs of twenty reach the far image: one resample in eight
+    has none of them."""
+    import fe_profile as fp
+    rng = np.random.default_rng(3)
+    runs = [rng.normal(-1.2, 0.1, (3000, 1)) for _ in range(18)] + [rng.normal(1.2, 0.1, (3000, 1)) for _ in range(2)]
+    files = []
+    for a, r in enumerate(runs):
+        p = tmp_path / f"u{a}.cvout"; files.append(str(p))
+        p.write_text("".join(f"CFACV/C) Th {s} {v[0]:.6f}\n" for s, v in enumerate(r)))
+    z = np.linspace(-1.2, 1.2, 9)[:, None]
+    R = fp.reference_smoothed(z, runs, 400.0, [False], kT=KT, n_boot=400)
+    F = np.asarray(R["F"]); top = int(F.argmax())
+    P = {"z": z.tolist(), "F": F.tolist(), "F_se": [0.1] * 9, "barrier": float(F[top] - F[: top + 1].min()), "barrier_se": 0.1,
+         "delta_F": float(F[-1]), "delta_F_se": 0.1, "top_image": top, "start_image": int(F[: top + 1].argmin()), "types": ["BOND"]}
+    (tmp_path / "p.json").write_text(json.dumps(P))
+    rc, out = _main(["reference", "--profile", str(tmp_path / "p.json"), "--cvout", *files, "--k", "400", "--cv", _cvs(tmp_path, 1)])
+    assert "resamples" in out and rc == 1, out
+
+
+def test_reference_needs_the_cv_types(tmp_path):
+    """Finding 7. Without --cv every CV was wrapped as a torsion, distances included."""
+    files = _double_well_runs(tmp_path, ntot=400_000)
+    z = np.column_stack([np.linspace(-1.0, 1.0, 9), np.zeros(9)])
+    _profile_json(tmp_path / "p.json", z, _smoothed(z[:, 0], 40.0), 0.05, types=None)
+    rc, out = _main(["reference", "--profile", str(tmp_path / "p.json"), "--cvout", *files, "--k", "40"])
+    assert rc not in (0, None) and "--cv" in out, out
+
+
+def test_compute_stores_the_cv_types(tmp_path):
+    """Finding 7: compute writes the CV types into the profile."""
+    rng = np.random.default_rng(5)
+    z, theta, k = _ramp_runs(rng)
+    sc = _write_compute_dir(str(tmp_path / "r"), z, theta, [k], ["BOND"])
+    _main(["compute", "--dir", str(tmp_path / "r"), "--scales", sc, "--discard", "0", "--out", str(tmp_path / "p")])
+    assert json.load(open(str(tmp_path / "p") + ".json")).get("types") == ["BOND"]

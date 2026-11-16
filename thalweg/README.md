@@ -17,17 +17,17 @@ Written 2026-11-14 as `stringtools`; renamed thalweg the same day. Fork-local: n
 | stage | file | what it does |
 |---|---|---|
 | 2 | `endpoint_analysis.py` | CV statistics of the two end states, the joint separation test, the periodic-image check; writes `<out>_scales.json`, `<out>_basins.json` and `<out>_cvstats.json` (default prefix `endpoints`) |
-| all | `thalweg_run.py` | runs the stages of one settings file in order, keeps a record in `.thalweg/` of the run directory, and stops at the first failed gate; run it again and it carries on. A changed step redoes everything after it; a NAMD run is redone when its config is newer than its log; one runner per directory; an interrupt stops what it started. `examples/alad_cvsel.json` is a complete settings file |
-| 3 | `cv_select.py`, `cvsel_shot.tcl` | chooses the CVs from the system's own data: candidate enumeration, targeted-MD and shot setup, a basin model over the whole candidate pool, and likelihood maximization with a BIC stop. Configurations, not shots, are the sample; the gate is a permutation test. A basin is a core of its state (the features that tell the states apart are capped at 2.5 spreads, and entering takes two consecutive tests); with the basin model built first each shot stops when it enters one, and a tenth of them run on as an audit of that |
+| all | `thalweg_run.py` | runs the stages of one settings file in order, keeps a record in `.thalweg/` of the run directory, and stops at the first failed gate; run it again and it carries on. A gate step counts as passed only when it exits 0 AND prints a `GATE ...: PASS` line and no FAIL. A step is redone when its command, a declared input (size and time) or its run list changes, or when a declared output (or a tool's `--out`) is missing; a changed step redoes everything after it; a NAMD run is redone when its config, or a `#PRE` stage before it, is newer than its log; `--only` reruns one stage and clears every later one; one runner per directory; an interrupt stops what it started. `examples/alad_cvsel.json` is a complete settings file |
+| 3 | `cv_select.py`, `cvsel_shot.tcl` | chooses the CVs from the system's own data: candidate enumeration, targeted-MD and shot setup, a basin model over the whole candidate pool, and likelihood maximization with a BIC stop. Each CV after the first must also pass its own conditional permutation test (the chosen CVs fixed, the others permuted between blocks), so noise does not ride along behind a real CV. The block is the source trajectory of a configuration (recorded by `shots`, carried by `outcomes`): it is the sample size, the cross-validation fold and the permutation unit; without block ids clustered configurations look independent, and `select` warns. A basin is a core of its state (the features that tell the states apart are capped at 2.5 spreads, and entering takes two consecutive tests); with the basin model built first each shot stops when it enters one, and a tenth of them run on as an audit of that |
 | 3 | `harvest_centers.py` | centers from TAMD trajectories at a minimum SCALED spacing; keeps each center's configuration |
 | 3, 6 | `meanforce.py` | sets up restrained MD at a list of points; collects block-averaged mean forces; `metric` measures the metric tensor at each point from its configuration (no MD) |
 | 3 | `fesmap.py` | single-sweep free-energy map in scaled, periodic-aware CV space; sigma by cross-validation |
-| 4 | `path_search.py` | lowest-barrier routes on the map: graph search, alternatives, zero-temperature strings between the two basins' minima on the map, and random-start strings, whose routes join the table when the graph search could not return them. With `--forces` it refits the map on subsets of the centers and says how firm the ranking is. A string through a side minimum is reported as such. When the map carries a metric tensor (`fesmap.py fit --metric-tensor`, opt-in) strings relax to where M grad F lies along them, the condition that defines a minimum free-energy path. They are moved against the part of grad F the path does not balance, with M^-1 as preconditioner and upwind tangents, after a first relaxation without the tensor; the tensor is a smooth average over nearby centers. On alanine dipeptide these strings lie 0.17 to 0.28 scaled units from the MD strings of three routes, the tensor-free ones 0.37 to 0.63; barriers and their order are the same, since both kinds of path cross the same saddles |
+| 4 | `path_search.py` | lowest-barrier routes on the map: graph search, alternatives, zero-temperature strings between the two basins' minima on the map, and random-start strings, whose routes join the table when the graph search could not return them. With `--forces` it refits the map on subsets of the centers, resampling the force noise (from `forces.dat.se`, or else the map's left-out residual), and says how firm the ranking is; a refit whose string jumps channel or does not converge counts against the ranking, not for it. Two routes are one channel when every blend of them stays on the data and within 0.25 kcal/mol of both tops. A string with an image held back by the support guard is reported as not converged. On the alanine map: 7 channels, the lowest (2.71 kcal/mol) firmly below three of them and only likely below the other three (81 to 94% of refits). `--central-finish` adds a central-tangent finishing pass (opt-in: it converged on 5 of 8 channels and brought none closer to MD). A string through a side minimum is reported as such. When the map carries a metric tensor (`fesmap.py fit --metric-tensor`, opt-in) strings relax to where M grad F lies along them, the condition that defines a minimum free-energy path. They are moved against the part of grad F the path does not balance, with M^-1 as preconditioner and upwind tangents, after a first relaxation without the tensor; the tensor is a smooth average over nearby centers. On alanine dipeptide these strings lie 0.17 to 0.28 scaled units from the MD strings of three routes, the tensor-free ones 0.37 to 0.63; barriers and their order are the same, since both kinds of path cross the same saddles |
 | 4 | `init_string.py` | image anchors -> the files the cfacv string driver starts from; warm-ups; the initiation gate |
-| 5 | `string_monitor.py` | convergence of a string from its history file; merged-or-distinct for two strings; warns when the string doubles back on itself |
-| 6 | `fe_profile.py` | profile along a string. Errors from block profiles (each block of every run integrated into a whole profile), with Student-t limits; gates on overlap, stability (halves and trend, for the barrier and the end-to-end difference) and resolution (both numbers); warns when blocks are not longer than the correlation time. `--refine` adds images where the force curves. `driver` gives a first profile from the forces the thalweg driver recorded, once the string is shown to have stopped. `compare` is the path-independence check |
-| 7 | `committor.py`, `committor_shot.tcl` | unbiased shots that stop on basin entry; the transition-state gate (at least 100 committed shots, at least 5 configurations of 10, and the uncommitted bracketed both ways) |
-| 5 | `driver/` | a string driver of its own: wrapped torsions, a measured step, images that move on each update's force with the AVERAGED string as the result, optional pinned ends, a stopping test (drift, force left across the string, profile change), spline respacing, restart. See `driver/README.md`. cfacv's driver is unchanged and still usable |
+| 5 | `string_monitor.py` | convergence of a string from its history file (for a thalweg-driver history the gate needs the driver's own stop; a run that reached its cap fails; fewer than two windows of frames is refused); merged-or-distinct for two strings; warns when the string doubles back on itself |
+| 6 | `fe_profile.py` | profile along a string. Errors from block profiles (each block of every run integrated into a whole profile), with Student-t limits; gates on overlap (fixed bins in robust-spread units), stability (halves and trend for the barrier and the end-to-end difference, and a trend test on every image's force), resolution (every other image, the difference against its own error), block length (correlation from block averaging) and equal runs. `--refine` adds images where the force curves. `driver` gives a first profile from the forces the thalweg driver recorded, only when the last half of the run is at rest (creep and wander gates, in every mode including `--last`) and at least 20,000 updates per image went in; legs must be given in order. `reference` gates a profile against unbiased trajectories. `compare` is the path-independence check |
+| 7 | `committor.py`, `committor_shot.tcl` | unbiased shots that stop on basin entry; the transition-state gate: at least 100 committed shots, at least 5 configurations of 10 holding at least 75% of them, configurations alike (chi-square), and an equivalence test: the 95% interval of the pooled committor, with an error that includes the spread between configurations, inside 0.5 +/- `--equiv` (0.1), with the uncommitted shots bracketed both ways inside the same window. With 200 shots a true 0.5 passes only about 57% of the time; plan on 1,000 |
+| 5 | `driver/` | a string driver of its own: wrapped torsions, a measured step, images that move on each update's force with the AVERAGED string as the result, free ends that slide to their basins or pinned ends, a stopping test (movement over the last half beyond the noise, wander, force left across the string as rms and per image, profile change), spline respacing, restart. See `driver/README.md`. cfacv's driver is unchanged and still usable |
 | 1 | `make_cfacv_inputs.py` | writes cfacv's label PDB and CV file from the CV definition JSON |
 | all | `sbatch/namd_array.sbatch` | one NAMD run per array task from a list file; kills a run that has written nothing for `HANG_MINUTES` |
 | | `common.py` | CV definitions, periodic arithmetic, readers for cfacv's files |
@@ -143,13 +143,17 @@ ignored), without its hang guard.
 
 Validated end to end on alanine dipeptide in four torsions (CHARMM22, TIP3P,
 NAMD 3), on a workstation and on picotte: end-state analysis, center
-harvesting, mean forces at 483 centers, the map (left-out force error 0.23
-with a Gaussian width per CV), the path search, string initiation, string
+harvesting, mean forces at 483 centers, the map (nested left-out force error 0.35 in path units,
+with a Gaussian width per CV; the 0.23 stored before the third review was in the wrong units), the path search, string initiation, string
 refinement with cfacv's driver and with the thalweg driver, profiles from
 dedicated restrained runs, the committor shots, CV selection through
 `thalweg_run.py`, and the profile from the driver's own forces.
-The driver in its present form has stopped strings by its own tests in live
-runs on both alanine channels. The whole workflow has also been run once on
+Under the stopping rule of 2026-11-15 (before the third review) the driver
+stopped five pinned-end alanine runs by its own tests. That rule was fooled
+by out-and-back motion and by slow creep, and was replaced. Under the
+present rule no alanine run has stopped itself: three 120,000-update runs
+(lower channel with free and with pinned ends, second channel with free
+ends) all reached their cap, the closest at 0.202 against 0.2. The whole workflow has also been run once on
 the same molecule in mixed units (two torsions in radians and a distance
 between two-atom groups in angstrom): see the paper's validation section.
 
@@ -164,16 +168,22 @@ sbatch mode); pinned
 ends on a full closed-to-open string; a helper restraint that is not a
 string coordinate.
 
-Two rounds of independent code review (2026-11-15) found and removed defects
-that had let gates pass for the wrong reason; the tests now include a case
-for each. A gate that has never been seen to fail on bad data has not been
+Three rounds of independent code review (2026-11-15) found and removed
+defects that had let gates pass for the wrong reason; the tests now include
+a case for each, written to fail on the code before the fix. A gate that has never been seen to fail on bad data has not been
 tested: see `tests/` for which have.
 
 ## Limits worth remembering
 
 - The map is only as wide as the region the centers cover. `path_search.py`
   keeps strings from moving farther than two center spacings from the data
-  and reports how far each path strays.
+  and reports how far each path strays. On sparse random centers that guard
+  marks most random-start strings not converged; `--support` widens it.
+- Refitting a map with the corrected width selection can choose widths that
+  pass the gate but give worse paths: on the alanine map the refit's strings
+  lie 0.7 to 1.8 scaled units from the MD strings, against 0.17 to 0.28 for
+  the stored widths. Compare a refitted map's strings against MD before
+  adopting it.
 - Barriers read from the map rank channels; their error bar is mostly how
   much the barrier depends on which centers the map has. The reported
   barrier comes from the refined string and `fe_profile.py`.
@@ -188,14 +198,18 @@ tested: see `tests/` for which have.
   Counting frames within a radius of each image, which an earlier
   validation here used, is biased low: on a 4-D test density with a
   barrier of 3.30 it returned 2.80 at a radius of 0.6 scaled units.
-- The mean force is integrated along cubic splines through the images and
-  the forces, not by the trapezoid rule. On the 16-image lower-channel
-  string the trapezoid rule gave 3.18 kcal/mol where splines give 3.32 and
-  unbiased dynamics 3.43 +/- 0.07.
-- A first-look profile from the driver's own forces is good to about 0.3
-  kcal/mol at an image. Its error bars come from six blocks and are too
-  small where the string's wander outlasts a block. The profile of record
-  is the dedicated restrained runs.
+- The mean force is integrated along a cubic-spline path parametrised by
+  arc length in the scaled units, with the force interpolated by local cubic
+  Hermite pieces and integrated exactly by Gauss-Legendre; it is linear in
+  the forces. It amplifies force noise little (1.03 to 1.19 times the
+  trapezoid rule's) and does not overshoot where the force changes sign, as
+  a global spline did. On the driver's own 16-image profiles a global
+  spline was still closer to the reference (rms 0.15 against 0.20).
+- A first-look profile from the driver's own forces is not a result. On
+  16-image alanine strings it came out 0.3 to 0.5 kcal/mol below the
+  unbiased reference, at single images up to 0.6 (1.4 in one run), with
+  error bars of 0.02 to 0.1 that do not cover that; the reference gate now
+  fails them. The profile of record is the dedicated restrained runs.
 - The path search's relaxation counts a string as converged when it moves
   less than its tolerance per iteration, or when it has settled into a
   small chatter whose average no longer moves; it then returns the
@@ -203,10 +217,15 @@ tested: see `tests/` for which have.
 - The driver's step is constant, so the string itself does not converge:
   it fluctuates about the path, and the AVERAGED string is the result, with
   a bias of the order of the step.
-- The driver's stopping tests read the last half of the run: no movement
-  beyond the string's own wander, and no force left across the string. On
-  alanine dipeptide several strings come to rest with a force of 0.35 to
-  0.5 kcal/mol per scaled unit still across them and run to their cap; see
+- The driver's stopping tests read the last half of the run (at least
+  `TW(plateau_span)` updates): no movement between any two of eight blocks
+  beyond the noise, small wander, and no force left across the string, rms
+  or at any one image. With the residual flow the force left on alanine
+  strings is 0.05 to 0.25 kcal/mol per scaled unit. The images next to
+  pinned ends swing 0.2 to 0.45 scaled units over a few thousand updates,
+  and the test reads that as movement, so in practice the runs reach their
+  cap. The profile tool's own stationarity check on the same runs finds a
+  creep of about 0.12; the two disagree, which is open. See
   `driver/README.md`.
 - Shots for CV selection need configurations BETWEEN the basins. Evenly
   spaced targeted-MD frames mostly start inside one (alanine dipeptide: 38

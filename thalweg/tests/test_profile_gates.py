@@ -366,6 +366,29 @@ def test_reference_says_what_it_cannot_see(tmp_path):
     assert rc == 1, out
 
 
+def test_reference_reports_each_difference_with_its_own_error(tmp_path):
+    """Third review, merge check. The largest difference (large error there)
+    was printed next to the largest z-score, which belonged to another image:
+    alanine feR1 read '0.40 kcal/mol (image 16); in combined standard errors
+    10.6' and passed, because image 16 was 1.3 errors off and the 10.6 was
+    image 1's, off by 0.22."""
+    files = _double_well_runs(tmp_path)
+    k = 40.0
+    z = np.column_stack([np.linspace(-1.0, 1.0, 17), np.zeros(17)])
+    F = _smoothed(z[:, 0], k); F -= F[0]
+    P = _profile_json(tmp_path / "p.json", z, F, 0.05)
+    F2 = np.array(P["F"]); se = np.full(len(z), 0.05)
+    F2[3] += 0.25; se[3] = 0.02          # small difference, many errors
+    F2[12] += 0.45; se[12] = 0.6         # large difference, few errors
+    P["F"] = F2.tolist(); P["F_se"] = se.tolist()
+    (tmp_path / "p.json").write_text(json.dumps(P))
+    rc, out = _main(["reference", "--profile", str(tmp_path / "p.json"), "--cvout", *files, "--k", str(k), "--cv", _cvs(tmp_path, 2)])
+    line = [l for l in out.splitlines() if l.startswith("largest difference at an image")][0]
+    assert "(image 12," in line, line
+    z_at_largest = float(line.split("(image 12,")[1].split("combined")[0])
+    assert z_at_largest < 4.0, line      # image 12's own error, not image 3's
+
+
 def test_reference_fails_when_it_is_too_thin_at_the_barrier(tmp_path):
     """Finding 6. Images with under --min-frames effective unbiased frames were
     dropped from the per-image test without a word in the verdict; they are the

@@ -876,8 +876,11 @@ def main(argv=None):
         comb = float(np.hypot(P["barrier_se"], R["barrier_se"]))
         db = abs(P["barrier"] - R["barrier"]) / comb
         ok = bool(ok and db <= 3.0 and not bad.any())
-        print(f"largest difference at an image {d[use].max():.2f} kcal/mol (image {int(np.flatnonzero(use)[d[use].argmax()])}); in "
-              f"combined standard errors {zmax:.1f}; barriers {db:.1f} combined standard errors apart")
+        jd = int(np.flatnonzero(use)[d[use].argmax()]) if use.any() else 0
+        jz = int(np.flatnonzero(use)[zs[use].argmax()]) if use.any() else 0
+        print(f"largest difference at an image {d[jd]:.2f} kcal/mol (image {jd}, {zs[jd]:.1f} combined standard errors); "
+              f"largest in standard errors {zmax:.1f} (image {jz}, {d[jz]:.2f} kcal/mol); barriers {db:.1f} combined standard "
+              "errors apart")
         t0 = int(R["top_image"])
         print(f"     a barrier difference under {3.0 * comb:.2f} kcal/mol would not show; at the top image, a difference under "
               f"{max(4.0 * se[t0], a.tolerance):.2f}")

@@ -454,13 +454,15 @@ def test_driver_profile_refuses_a_drifting_string_and_one_moving_image(tmp_path)
     rng = np.random.default_rng(8)
     # one image out of eleven drifts steadily the whole time: an average over images would hide it
     f = tmp_path / "drift.forces"; f.write_text("\n".join(_force_frames(0.01 * np.arange(200), rng)) + "\n")
-    with pytest.raises(ValueError, match="still moving"):
+    with pytest.raises(ValueError, match="not at rest"):
         fp.from_driver([str(f)], np.ones(2))
-    # the same string, stopped for its last 80 frames: those are used, and only those
-    f.write_text("\n".join(_force_frames(np.concatenate([0.01 * np.arange(120), np.full(80, 1.2)]), rng)) + "\n")
+    # the same string, stopped for its last 120 frames: the last half of the run is at rest, so a profile comes
+    # (stopped for only its last 80, the last half is not: refused since 2026-11-15)
+    f.write_text("\n".join(_force_frames(np.concatenate([0.01 * np.arange(80), np.full(120, 0.8)]), rng)) + "\n")
     res = fp.from_driver([str(f)], np.ones(2))
     # the last half of the run at least; the tail of the creep that fits within the limit comes with it
-    assert 100 <= res["frames_used"] <= 130 and res["systematic_in_window"] <= 0.2 and res["stationary"]
+    # (151 frames here; 175 before the window's first half had to pass as well)
+    assert 100 <= res["frames_used"] <= 155 and res["systematic_in_window"] <= 0.2 and res["stationary"]
 
 
 def test_plateau_tells_a_resting_string_from_a_creeping_one(tmp_path):

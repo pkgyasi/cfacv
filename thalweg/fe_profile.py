@@ -437,8 +437,10 @@ def read_driver_forces(paths):
 
     A leg that was killed leaves frames past the restart point the next leg
     resumed from; when a leg starts, the earlier legs' frames at or after its
-    first update are dropped.  A line or a frame cut short is dropped."""
-    frames = {}; width = None; n = None
+    first update are dropped.  A line or a frame cut short is dropped.  A leg
+    that starts at or before the previous leg's start is refused: given in the
+    wrong order, a later leg would be thrown away whole."""
+    frames = {}; width = None; n = None; prev_first = None
     for p in paths:
         rows = []
         with open(p, errors="replace") as fh:
@@ -458,6 +460,10 @@ def read_driver_forces(paths):
         a = np.array(rows)
         n = int(a[:, 1].max()) + 1 if n is None else n
         first = int(a[0, 0])
+        if prev_first is not None and first <= prev_first:
+            raise ValueError(f"{p} starts at update {first}, at or before the leg given before it (update {prev_first}): "
+                             "give the legs in the order they ran")
+        prev_first = first
         for k in [k for k in frames if k >= first]:
             del frames[k]
         for u in np.unique(a[:, 0]):
@@ -538,60 +544,86 @@ def plateau_motion(Z, scale):
     return float(np.sqrt(np.clip(g2 - f2, 0.0, None)).max()), float(np.sqrt(f2.mean()))
 
 
-def stationary(Z, scale, max_drift):
-    """Has the string come to rest over these frames?  The same question the
-    driver asks, answered the same way (plateau_motion): no image has moved
-    across them by more than max_drift beyond the string's own wander.
+def stationary(Z, scale, max_drift, max_wander=0.15):
+    """Has the string come to rest over these frames?  The driver's plateau
+    statistic (plateau_motion), read as a creep, and a limit on the wander.
 
-    (Until 2026-11-15 this compared a fitted net motion and the largest
-    excursion with a limit of 0.03.  A string that moves on a noisy force
-    with a constant step wanders by 0.06 to 0.07 between any two stretches
-    of its run, at rest or not, so that test failed every real run.)
-    Returns (ok, net, t, wander, systematic); net and t are the straight-line
-    fit of window_motion, kept for the report."""
+      creep   sqrt(2) x the plateau statistic: a steady creep of D across the
+              frames gives a plateau statistic of D / sqrt(2), so this is D.
+              (Until 2026-11-15 the statistic itself was held to max_drift, so
+              a creep of 0.28 passed a limit of 0.2.)
+      wander  the rms over the images of the distance between neighbouring
+              quarters' mean strings.  An excursion out and back leaves the
+              first and last quarters together and the plateau statistic at
+              0; it shows here.  A string at rest on the alanine runs wanders
+              by 0.05 to 0.10 (0.06-0.07 typical, driver README); the limit,
+              0.15, is twice the typical value.  It does not catch an
+              excursion of one image alone smaller than about 0.3.
+    Returns (ok, net, t, wander, creep); net and t are the straight-line fit
+    of window_motion, kept for the report (along-path sliding counts in them,
+    so they are not tested)."""
     net, t, _ = window_motion(Z, scale)
     systematic, wander = plateau_motion(Z, scale)
-    return bool(systematic <= max_drift), net, t, wander, systematic
+    creep = float(np.sqrt(2.0) * systematic)
+    return bool(creep <= max_drift and wander <= max_wander), net, t, wander, creep
 
 
-def from_driver(paths, scale, last=None, nblocks=6, max_drift=0.2):
+def from_driver(paths, scale, last=None, nblocks=6, max_drift=0.2, max_wander=0.15, min_frames=40):
     """Free-energy profile from the forces a thalweg driver run recorded.
 
     Each frame holds every image's mean gradient over that frame's updates
-    and the mean position they were measured at.  Only frames from after the
-    string came to rest are used: the longest run of final frames that
-    `stationary` accepts and that covers at least the last half of the run.
-    (A creeping string always has SOME short final stretch over which it
-    moved less than any limit; half the run is what the driver tests too.)
-    `last` uses that many final frames instead, but they are tested the same
-    way and the result says so if they fail."""
+    and the mean position they were measured at.  The string must be at rest
+    (`stationary`) over the LAST HALF of the run, whatever frames are then
+    used: a creeping string always has some short final stretch over which
+    it moved less than any limit, and half the run is what the driver tests
+    too.  Otherwise this refuses (ValueError).  The frames used are then the
+    longest final run that also passes, or the last `last` frames, which must
+    pass as well.  Fewer than min_frames frames are refused: each quarter of
+    the plateau test is then a handful of frames.
+
+    The window is the longest whose frames pass and whose first half passes
+    too (a fast move early in a long window reads as wander to the plateau
+    statistic).  Being the longest that passes, its creep still sits near the
+    limit by construction; what that creep does to the profile is seen by the
+    per-image force trend test in from_force_samples."""
     upd, Z, G, nup = read_driver_forces(paths)
-    need = 2 * nblocks
-    if len(Z) < need:
-        raise ValueError(f"{len(Z)} frames recorded; need at least {need}")
+    n = len(Z); h0 = n // 2
+    need = max(int(min_frames), 2 * nblocks)
+    if n - h0 < 2 * nblocks or n < need:
+        raise ValueError(f"{n} frames recorded; the profile needs at least {need}, and the string has to be shown at rest "
+                         f"over the last half of the run")
+
+    def refuse(W, what):
+        _, net, t, wander, creep = stationary(W, scale, max_drift, max_wander)
+        raise ValueError(f"the string is not at rest over {what} ({len(W)} frames): one image crept {creep:.3f} scaled units "
+                         f"beyond the string's own wander (limit {max_drift}), and the string wandered {wander:.3f} between "
+                         f"neighbouring quarters (limit {max_wander}). Run it longer, or pin its ends if one is creeping.")
+    if not stationary(Z[h0:], scale, max_drift, max_wander)[0]:
+        refuse(Z[h0:], "the last half of the run")
     if last is None:
-        first = None
-        for f in range(0, max(1, min(len(Z) // 2, len(Z) - need) + 1)):
-            if stationary(Z[f:], scale, max_drift)[0]:
+        first = h0
+        for f in range(0, h0):
+            # the window AND its own first half: the plateau statistic reads
+            # a fast move early in a long window as wander, and the longest
+            # passing window would take it in
+            if (stationary(Z[f:], scale, max_drift, max_wander)[0]
+                    and stationary(Z[f:f + (n - f) // 2], scale, max_drift, max_wander)[0]):
                 first = f; break
-        if first is None:
-            half = Z[min(len(Z) // 2, len(Z) - need):]
-            _, net, t, wander, systematic = stationary(half, scale, max_drift)
-            raise ValueError(f"the string is still moving: over the last {len(half)} frames one image moved "
-                             f"{systematic:.3f} scaled units beyond the string's own wander of {wander:.3f} "
-                             f"(limit {max_drift}). Run it longer, or pin its ends if one is creeping.")
     else:
-        first = max(0, len(Z) - last)
-    use = slice(first, len(Z))
-    nf = len(Z) - first
+        first = max(0, n - int(last))
+        if not stationary(Z[first:], scale, max_drift, max_wander)[0]:
+            refuse(Z[first:], f"the last {n - first} frames asked for")
+    nf = n - first
     if nf < need:
-        raise ValueError(f"{nf} frames given; need at least {need}")
-    ok, net, t, wander, systematic = stationary(Z[use], scale, max_drift)
+        raise ValueError(f"{nf} frames would be used; need at least {need}")
+    use = slice(first, n)
+    ok, net, t, wander, creep = stationary(Z[use], scale, max_drift, max_wander)
     zbar = Z[use].mean(axis=0)
     res = from_force_samples(zbar, [-G[use, i, :] for i in range(Z.shape[1])], scale, nblocks)
-    res.update({"frames_used": nf, "frames_total": len(Z), "first_update": int(upd[first]), "last_update": int(upd[-1]),
-                "updates_per_frame": int(nup[-1]), "updates_used": int(nup[use].sum()), "drift_in_window": net, "drift_t": t, "wander_in_window": wander,
-                "systematic_in_window": systematic, "stationary": ok})
+    res.update({"frames_used": nf, "frames_total": n, "first_update": int(upd[first]), "last_update": int(upd[-1]),
+                "updates_per_frame": int(nup[-1]), "updates_used": int(nup[use].sum()), "drift_in_window": net, "drift_t": t,
+                "wander_in_window": wander, "systematic_in_window": creep, "creep_in_window": creep, "stationary": ok,
+                "max_drift": float(max_drift), "max_wander": float(max_wander)})
     return res
 
 
@@ -700,10 +732,14 @@ def main(argv=None):
     p.add_argument("--forces", nargs="+", required=True, help="the run's .forces files, one per leg, in order")
     p.add_argument("--scales", required=True)
     p.add_argument("--last", type=int, help="use this many final frames (default: the longest final run over which the "
-                                           "string did not move); they are tested the same way")
+                                           "string did not move); they are tested the same way, and the last half of "
+                                           "the run must pass whatever this is")
     p.add_argument("--max-drift", type=float, default=0.2,
-                   help="largest scaled distance any image may have moved across the frames used, beyond the "
-                        "string's own wander between neighbouring quarters of them (the driver's plateau test) [0.2]")
+                   help="largest creep (scaled distance) any image may show across the frames, beyond the string's "
+                        "own wander between neighbouring quarters of them: sqrt(2) x the driver's plateau statistic [0.2]")
+    p.add_argument("--max-wander", type=float, default=0.15,
+                   help="largest rms distance between neighbouring quarters' mean strings [0.15]")
+    p.add_argument("--min-frames", type=int, default=40, help="fewest frames a profile may rest on [40]")
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--min-updates", type=int, default=20000, help="updates per image the profile must rest on [20000]")
     p.add_argument("--out", default="profile_driver")
@@ -820,14 +856,15 @@ def main(argv=None):
     if a.cmd == "driver":
         scale = np.array(load_json(a.scales)["scale"])
         try:
-            res = from_driver(a.forces, scale, a.last, a.blocks, a.max_drift)
+            res = from_driver(a.forces, scale, a.last, a.blocks, a.max_drift, a.max_wander, a.min_frames)
         except ValueError as e:
             sys.exit(str(e))
         z = res["z"]
         print(f"{res['frames_used']} of {res['frames_total']} frames used (updates {res['first_update']} to {res['last_update']}, "
-              f"{res['updates_per_frame']} updates each); across them one image moved {res['systematic_in_window']:.3f} "
+              f"{res['updates_per_frame']} updates each); across them one image crept {res['creep_in_window']:.3f} "
               f"scaled units beyond the string's own wander of {res['wander_in_window']:.3f}")
-        print(f"GATE stationary string: {'PASS' if res['stationary'] else 'FAIL'} (limit {a.max_drift} scaled units)")
+        print(f"GATE stationary string: {'PASS' if res['stationary'] else 'FAIL'} (over the last half of the run and the frames "
+              f"used: creep under {a.max_drift}, wander under {a.max_wander} scaled units)")
         res["updates_ok"] = bool(res["updates_used"] >= a.min_updates)
         print(f"GATE updates: {'PASS' if res['updates_ok'] else 'FAIL'} ({res['updates_used']} updates per image went into this "
               f"profile; limit {a.min_updates})")

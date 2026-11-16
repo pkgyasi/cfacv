@@ -418,3 +418,92 @@ def test_compute_stores_the_cv_types(tmp_path):
     sc = _write_compute_dir(str(tmp_path / "r"), z, theta, [k], ["BOND"])
     _main(["compute", "--dir", str(tmp_path / "r"), "--scales", sc, "--discard", "0", "--out", str(tmp_path / "p")])
     assert json.load(open(str(tmp_path / "p") + ".json")).get("types") == ["BOND"]
+
+
+# ------------------------------------------------------------------ finding 8: is the driver's string at rest?
+def _frames(shift_fn, rng, L=400, nimg=12, noise=0.03):
+    base = np.column_stack([np.linspace(0, 3, nimg), np.sin(np.linspace(0, 3, nimg))])
+    return np.array([base + shift_fn(t) + noise * rng.standard_normal(base.shape) for t in np.linspace(0, 1, L)])
+
+
+def test_an_excursion_out_and_back_is_not_rest():
+    """Finding 8. Every image goes 0.6 out and comes back: the first and last
+    quarters agree, so the plateau statistic is 0 and it passed."""
+    import fe_profile as fp
+    rng = np.random.default_rng(7)
+    Z = _frames(lambda t: 0.6 * np.sin(np.pi * t) * np.array([0.0, 1.0]), rng)
+    assert not fp.stationary(Z, np.ones(2), 0.2)[0]
+    assert fp.stationary(_frames(lambda t: 0.0 * t, rng), np.ones(2), 0.2)[0]
+
+
+def test_a_creep_of_a_quarter_unit_is_not_rest():
+    """Finding 8. A steady creep of D gives a plateau statistic of D/sqrt(2):
+    0.25 across the window passed a limit of 0.2."""
+    import fe_profile as fp
+    rng = np.random.default_rng(7)
+    Z = _frames(lambda t: 0.25 * t * np.array([0.0, 1.0]), rng)
+    assert not fp.stationary(Z, np.ones(2), 0.2)[0]
+    Z = _frames(lambda t: 0.1 * t * np.array([0.0, 1.0]), rng)
+    assert fp.stationary(Z, np.ones(2), 0.2)[0]
+
+
+def _creep_file(path, nfr, rate, rng, nup=100, n=11):
+    lines = ["# update image n_updates z dF/dz"]
+    for fr in range(nfr):
+        for i in range(n):
+            x = i / (n - 1.0)
+            g = np.array([3 * np.pi / 2 * np.sin(np.pi * x), 0.0]) + rng.normal(0, 0.3, 2)
+            y = rate * fr if i >= 5 else 0.0                     # half the string creeps across it all the time
+            lines.append(f"{(fr + 1) * nup} {i} {nup} {x} {y + rng.normal(0, 0.01)} {g[0]} {g[1]}")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_last_does_not_skip_the_half_run_test(tmp_path):
+    """Finding 8. --last N tested only the last N frames: a string creeping the
+    whole run passed with a short enough N."""
+    import fe_profile as fp
+    f = tmp_path / "creep.forces"; _creep_file(f, 400, 0.002, np.random.default_rng(1))
+    with pytest.raises(ValueError):
+        fp.from_driver([str(f)], np.ones(2))
+    for last in (40, 100):
+        with pytest.raises(ValueError):
+            fp.from_driver([str(f)], np.ones(2), last=last)
+
+
+def test_a_short_run_is_refused(tmp_path):
+    """Finding 8. 16 frames passed (the least was two per block)."""
+    import fe_profile as fp
+    rng = np.random.default_rng(2)
+    for nfr in (16, 30):
+        f = tmp_path / f"s{nfr}.forces"; f.write_text("\n".join(_driver_lines(rng, nfr, 100)) + "\n")
+        with pytest.raises(ValueError):
+            fp.from_driver([str(f)], np.ones(2))
+
+
+def test_legs_in_the_wrong_order_are_refused(tmp_path):
+    """Finding 8. A later leg given first was silently thrown away by the earlier
+    one (its frames are all 'after the restart point')."""
+    import fe_profile as fp
+    lines = _driver_lines(np.random.default_rng(3), 200, 100)
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_text("\n".join(lines[:1 + 100 * 11]) + "\n"); b.write_text(lines[0] + "\n" + "\n".join(lines[1 + 100 * 11:]) + "\n")
+    assert len(fp.read_driver_forces([str(a), str(b)])[0]) == 200
+    with pytest.raises(ValueError, match="order"):
+        fp.read_driver_forces([str(b), str(a)])
+
+
+FINAL = ALAD + "/chk/final"
+
+
+@pytest.mark.skipif(not os.path.isfile(FINAL + "/pr1b.forces"), reason="the alanine driver runs are not here")
+def test_the_known_creeping_run_is_refused_in_every_mode_and_the_resting_ones_are_not():
+    """Finding 8 on real runs: pr1b creeps (refused by default, but passed with
+    --last 40 or 100); pr0D2, pr0D3, pr1D1 and pr0R must still give a profile."""
+    import fe_profile as fp
+    scale = np.array(json.load(open(ALAD + "/scales.json"))["scale"])
+    for last in (None, 40, 100, 200):
+        with pytest.raises(ValueError):
+            fp.from_driver([FINAL + "/pr1b.forces"], scale, last=last)
+    for name in ("pr0D2", "pr0D3", "pr1D1", "pr0R"):
+        r = fp.from_driver([f"{FINAL}/{name}.forces"], scale)
+        assert r["stationary"], name

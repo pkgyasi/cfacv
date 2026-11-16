@@ -103,6 +103,7 @@ string_monitor.py status / compare        -> stringN_final.dat  (+ stringN_drive
 fe_profile.py driver                      -> a first profile, free
 meanforce.py setup --points stringN_final.dat ; array
 fe_profile.py compute / compare           -> profile
+fe_profile.py reference                   -> the profile against unbiased trajectories, where there are any
 committor.py pick ; setup ; array ; tally
 ```
 
@@ -147,6 +148,10 @@ with a Gaussian width per CV), the path search, string initiation, string
 refinement with cfacv's driver and with the thalweg driver, profiles from
 dedicated restrained runs, the committor shots, CV selection through
 `thalweg_run.py`, and the profile from the driver's own forces.
+The driver in its present form has stopped strings by its own tests in live
+runs on both alanine channels. The whole workflow has also been run once on
+the same molecule in mixed units (two torsions in radians and a distance
+between two-atom groups in angstrom): see the paper's validation section.
 
 T4 lysozyme: a smoke test only. A closed system (2LZM) and an open one (150L
 chain D) were built; a 12-image string between the closed basin and a point
@@ -155,7 +160,7 @@ updates without reaching its stopping test. Nothing on T4 lysozyme is a
 result.
 
 Not run: the SLURM array wrapper as a job array on picotte (the runner's
-sbatch mode); an MD string run to rest from a metric-tensor starting string; pinned
+sbatch mode); pinned
 ends on a full closed-to-open string; a helper restraint that is not a
 string coordinate.
 
@@ -174,20 +179,59 @@ tested: see `tests/` for which have.
   barrier comes from the refined string and `fe_profile.py`.
 - The profile is the free energy of the CVs integrated along the path. It
   is not a free energy that includes the width of the transition tube.
+- What restrained runs measure is, exactly, the gradient of the free energy
+  smoothed by a Gaussian of variance kT/k in each CV (Maragliano, Roux and
+  Vanden-Eijnden 2014, eq. 25). `fe_profile.py` prints that width against
+  each CV's length scale. `fe_profile.py reference` computes the same
+  smoothed free energy at a profile's images from unbiased trajectories
+  and gates the profile against it; it has no radius or bin to choose.
+  Counting frames within a radius of each image, which an earlier
+  validation here used, is biased low: on a 4-D test density with a
+  barrier of 3.30 it returned 2.80 at a radius of 0.6 scaled units.
+- The mean force is integrated along cubic splines through the images and
+  the forces, not by the trapezoid rule. On the 16-image lower-channel
+  string the trapezoid rule gave 3.18 kcal/mol where splines give 3.32 and
+  unbiased dynamics 3.43 +/- 0.07.
+- A first-look profile from the driver's own forces is good to about 0.3
+  kcal/mol at an image. Its error bars come from six blocks and are too
+  small where the string's wander outlasts a block. The profile of record
+  is the dedicated restrained runs.
+- The path search's relaxation counts a string as converged when it moves
+  less than its tolerance per iteration, or when it has settled into a
+  small chatter whose average no longer moves; it then returns the
+  average.
 - The driver's step is constant, so the string itself does not converge:
   it fluctuates about the path, and the AVERAGED string is the result, with
   a bias of the order of the step.
-- The driver's stopping test holds a run while a force across the string is
-  demonstrably there; it does not wait for the force to be resolved below
-  its tolerance, which would cost as much sampling as a profile.
+- The driver's stopping tests read the last half of the run: no movement
+  beyond the string's own wander, and no force left across the string. On
+  alanine dipeptide several strings come to rest with a force of 0.35 to
+  0.5 kcal/mol per scaled unit still across them and run to their cap; see
+  `driver/README.md`.
 - Shots for CV selection need configurations BETWEEN the basins. Evenly
   spaced targeted-MD frames mostly start inside one (alanine dipeptide: 38
   usable configurations of 180, 6 with shots going both ways). Frames from
   the images around the barrier tops of MD strings do far better (`shots
   --dcd` takes any trajectories: 183 usable of 210, 82 going both ways), but
   they come from runs restrained in the string's CVs, so they vary little in
-  those CVs across the path and cannot show that one of them matters. Either
-  way the committor test is what checks the outcome.
+  those CVs across the path and cannot show that one of them matters.
+  Exploration frames that the basin model puts in neither basin (`shots
+  --between`) are unrestrained and need no string, but on alanine dipeptide
+  44% of their shots never reached either basin in 50 ps (they sit in other
+  basins) and 12% of the audited ones left the basin they first entered, so
+  that selection fails its gate. Either way the committor test is what
+  checks the outcome.
+- The map's barriers are too low where it has no centers on the route:
+  2.71 and 3.92 kcal/mol for two alanine routes against 3.3 and 4.4 to 4.6
+  from MD. `path_search.py --route-points` writes the route images that
+  have no center nearby, `meanforce.py setup --centers` starts runs at them
+  from the nearest stored configuration, and a refit with those 131 points
+  gave 3.26 and 4.47. The strings' positions did not move closer to the MD
+  strings.
+- Candidate CVs name the segment as well as the residue number when the
+  selection holds more than one segment, and a group's centre of mass is
+  taken after its atoms are brought to one periodic image. Neither has been
+  run on a real multi-chain system.
 - `t4l_cvs.json` uses the paper's residue numbers and takes chi1 as
   N-CA-CB-CG. The CVs come from a steered-MD and TAMD study in another force
   field and engine; that they are adequate string CVs here is a hypothesis.

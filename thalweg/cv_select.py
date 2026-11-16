@@ -124,19 +124,28 @@ def candidates(a):
     prot = u.select_atoms(a.protein)
     res = prot.residues
     seg = f"({a.protein}) and "
+    # Residues are told apart by segment AND residue number: in a system of
+    # several chains the same number occurs once per chain, and a selection
+    # by number alone would name two atoms.  With one segment the names and
+    # selections stay as they were.
+    multi = len({r.segid for r in res}) > 1
+    lab = (lambda r: f"{r.segid}{r.resid}") if multi else (lambda r: f"{r.resid}")
+    rsel = (lambda r: f"{seg}segid {r.segid} and resid {r.resid}") if multi else (lambda r: f"{seg}resid {r.resid}")
+    if len({(r.segid, r.resid) for r in res}) != len(res):
+        sys.exit("two residues share a segment name and a residue number: give them distinct segids first")
     ca = [r.atoms.select_atoms("name CA") for r in res]
     keep = [k for k, g in enumerate(ca) if len(g) == 1]
-    ca_idx = np.array([ca[k][0].index for k in keep]); ca_res = np.array([res[k].resid for k in keep])
+    ca_idx = np.array([ca[k][0].index for k in keep]); ca_res = np.array(keep)      # position of the residue in `res`
     # salt-bridge ends
-    acid = [(r.resid, r.atoms.select_atoms(f"name {ACID[r.resname]}")[0].index) for r in res if r.resname in ACID and len(r.atoms.select_atoms(f"name {ACID[r.resname]}"))]
-    base = [(r.resid, r.atoms.select_atoms(f"name {BASE[r.resname]}")[0].index) for r in res if r.resname in BASE and len(r.atoms.select_atoms(f"name {BASE[r.resname]}"))]
+    acid = [(k, r.atoms.select_atoms(f"name {ACID[r.resname]}")[0].index) for k, r in enumerate(res) if r.resname in ACID and len(r.atoms.select_atoms(f"name {ACID[r.resname]}"))]
+    base = [(k, r.atoms.select_atoms(f"name {BASE[r.resname]}")[0].index) for k, r in enumerate(res) if r.resname in BASE and len(r.atoms.select_atoms(f"name {BASE[r.resname]}"))]
     # chi1 = N-CA-CB-XG
     chi = []
-    for r in res:
+    for k, r in enumerate(res):
         n, c, b = (r.atoms.select_atoms(f"name {x}") for x in ("N", "CA", "CB"))
         g = [x for nm in GAMMA for x in r.atoms.select_atoms(f"name {nm}")][:1]
         if len(n) == len(c) == len(b) == 1 and g:
-            chi.append((r.resid, [n[0].index, c[0].index, b[0].index, g[0].index], g[0].name))
+            chi.append((k, [n[0].index, c[0].index, b[0].index, g[0].index], g[0].name))
     groups = [ca_idx, np.array([i for _, i in acid], int), np.array([i for _, i in base], int),
               np.array([q for _, quad, _ in chi for q in quad], int)]
     C = _frames(a.psf, a.closed, groups, a.skip, a.stride)
@@ -149,7 +158,7 @@ def candidates(a):
     es = effect_size(d(C[0]), d(O[0]))
     for i, j in pick_spread(es, list(zip(ca_res[ii], ca_res[jj])), a.n_ca, a.gap):
         k = np.where((ca_res[ii] == i) & (ca_res[jj] == j))[0][0]
-        cvs.append({"name": f"ca_{i}_{j}", "type": "BOND", "atoms": [f"{seg}resid {i} and name CA", f"{seg}resid {j} and name CA"]})
+        cvs.append({"name": f"ca_{lab(res[i])}_{lab(res[j])}", "type": "BOND", "atoms": [f"{rsel(res[i])} and name CA", f"{rsel(res[j])} and name CA"]})
         table.append((cvs[-1]["name"], float(es[k])))
     # salt bridges
     if len(acid) and len(base):
@@ -161,9 +170,9 @@ def candidates(a):
         es[np.minimum(dc.mean(0), do.mean(0)) > a.max_bridge] = 0      # never in contact in either state
         for k in np.argsort(-es)[:a.n_bridge]:
             (ra, _), (rb, _) = acid[pa[k]], base[pb[k]]
-            rn_a, rn_b = res[[r.resid for r in res].index(ra)].resname, res[[r.resid for r in res].index(rb)].resname
-            cvs.append({"name": f"sb_{rb}_{ra}", "type": "BOND",
-                        "atoms": [f"{seg}resid {rb} and name {BASE[rn_b]}", f"{seg}resid {ra} and name {ACID[rn_a]}"]})
+            rn_a, rn_b = res[ra].resname, res[rb].resname
+            cvs.append({"name": f"sb_{lab(res[rb])}_{lab(res[ra])}", "type": "BOND",
+                        "atoms": [f"{rsel(res[rb])} and name {BASE[rn_b]}", f"{rsel(res[ra])} and name {ACID[rn_a]}"]})
             table.append((cvs[-1]["name"], float(es[k])))
     # chi1
     if chi:
@@ -171,8 +180,8 @@ def candidates(a):
         es = effect_size(t(C[3]), t(O[3]), periodic=True)
         for k in np.argsort(-es)[:a.n_chi]:
             rid, _, gname = chi[k]
-            cvs.append({"name": f"chi1_{rid}", "type": "DIHED",
-                        "atoms": [f"{seg}resid {rid} and name {x}" for x in ("N", "CA", "CB", gname)]})
+            cvs.append({"name": f"chi1_{lab(res[rid])}", "type": "DIHED",
+                        "atoms": [f"{rsel(res[rid])} and name {x}" for x in ("N", "CA", "CB", gname)]})
             table.append((cvs[-1]["name"], float(es[k])))
     # published CVs join the pool under their own names
     if a.include:
@@ -319,10 +328,23 @@ def shots(a):
     # trajectory which enters a basin stays there
     every = int(round(1 / a.audit_fraction)) if (stop and a.audit_fraction > 0) else 0
     audit = set(range(every // 2, per * len(a.dcd), every)) if every else set()
+    between = None
+    if a.between:
+        if not a.cv:
+            sys.exit("--between needs --cv, the candidate pool the basin model was trained on")
+        between = (BasinClassifier.load(a.between), CVSet.load(a.cv)); n_all = n_out = 0
     for dcd in a.dcd:
         u = mda.Universe(a.psf, dcd)
         nf = len(u.trajectory)
-        for fr in np.unique(np.linspace(0, nf - 1, per).astype(int)):
+        pool = np.arange(nf)
+        if between:
+            # only frames the basin model puts in NEITHER basin: a frame inside
+            # one commits there whatever the CVs, and tells the selection nothing
+            lab = np.asarray(between[0].basin(CVCalculator(between[1], u).trajectory()))
+            pool = np.flatnonzero(lab == ""); n_all += nf; n_out += len(pool)
+            if len(pool) == 0:
+                print(f"{dcd}: no frame outside both basins"); continue
+        for fr in np.unique(pool[np.linspace(0, len(pool) - 1, min(per, len(pool))).astype(int)]):
             ts = u.trajectory[fr]
             stem = os.path.join(a.out, "configs", f"config{c:04d}")
             u.atoms.write(stem + ".coor", file_format="NAMDBIN"); write_xsc(stem + ".xsc", ts.dimensions)
@@ -342,6 +364,8 @@ def shots(a):
         fh.write("\n".join(confs) + "\n")
     save_json(os.path.join(a.out, "setup.json"), {"n_configs": c, "per_config": a.per_config, "steps": a.steps,
                                                   "stop_on_basin": bool(stop), "audit": sorted(k for k in audit if k < c)})
+    if between:
+        print(f"{n_out} of {n_all} frames lie outside both basins; configurations were taken from those")
     print(f"{len(confs)} unbiased trajectories from {c} configurations set up in {a.out}/"
           + (f"; each stops when it enters a basin (tested every {a.chunk} steps, cap {a.steps})" if stop else ""))
 
@@ -787,6 +811,10 @@ def main(argv=None):
     p.add_argument("--label", help="cfacv label PDB of the candidate pool (with --classifier)")
     p.add_argument("--cvinp", help="cfacv cv.inp of the candidate pool, same CV order as the pool JSON (with --classifier)")
     p.add_argument("--chunk", type=int, default=500, help="MD steps between basin tests [500]")
+    p.add_argument("--between", help="basin model from 'classifier': take configurations only from frames it puts in "
+                                     "neither basin (with --cv).  For trajectories that cross between the states, "
+                                     "such as the exploration runs")
+    p.add_argument("--cv", help="the candidate pool (with --between)")
     p.add_argument("--audit-fraction", type=float, default=0.1,
                    help="share of the configurations whose shots run their full length without stopping, to check "
                         "that a trajectory which enters a basin stays there [0.1]; 0 for none")

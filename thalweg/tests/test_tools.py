@@ -579,3 +579,105 @@ def test_equilibration_is_detected_not_assumed():
     none = fp.compute(z, [t.copy() for t in theta], k, np.zeros(2, bool), np.ones(2), discard=0.0)
     assert np.median(auto["discarded_fraction"]) > 0.05
     assert abs(auto["delta_F"] - 1.0) < abs(none["delta_F"] - 1.0)
+
+
+def test_group_centre_is_whole_across_the_box_edge():
+    """A two-atom group cut by the box edge: its centre is between the atoms
+    on one side of the edge, not in the middle of the box."""
+    mda = pytest.importorskip("MDAnalysis")
+    from common import CVSet, CVCalculator
+    u = mda.Universe.empty(4, trajectory=True)
+    u.add_TopologyAttr("masses", np.ones(4)); u.add_TopologyAttr("names", ["A", "B", "C", "D"])
+    u.dimensions = [20.0, 20.0, 20.0, 90, 90, 90]
+    # group 1: atoms at x = 19.5 and 0.5 (one unit apart through the edge); group 2: atoms at x = 4.5 and 5.5
+    u.atoms.positions = np.array([[19.5, 5, 5], [0.5, 5, 5], [4.5, 5, 5], [5.5, 5, 5]], dtype=np.float32)
+    cv = CVSet([{"name": "d", "type": "BOND", "atoms": ["index 0 1", "index 2 3"]}])
+    d = CVCalculator(cv, u).frame()[0]
+    assert abs(d - 5.0) < 1e-4            # centres at x = 20 (= 0) and 5; the naive centre of mass would sit at x = 10
+
+
+def test_candidates_name_the_chain_when_there_is_more_than_one(tmp_path):
+    """Two chains with the same residue numbers: every candidate must select
+    one atom per group, and its name must say which chain."""
+    mda = pytest.importorskip("MDAnalysis")
+    import cv_select as cs, json, types
+    rng = np.random.default_rng(1)
+    resn = ["ALA", "ASP", "LYS", "LEU", "GLU", "ARG", "VAL", "SER"]
+    names, resids, segs, resnames = [], [], [], []
+    gam = {"ASP": "CG", "LYS": "CG", "LEU": "CG", "GLU": "CG", "ARG": "CG", "VAL": "CG1", "SER": "OG"}
+    extra = {"ASP": ["CG"], "LYS": ["NZ"], "GLU": ["CD"], "ARG": ["CZ"]}
+    for seg in ("A", "B"):
+        for i, rn in enumerate(resn):
+            ats = ["N", "CA", "CB"] + ([gam[rn]] if rn in gam else []) + [x for x in extra.get(rn, []) if x != gam.get(rn)]
+            for at in ats: names.append(at); resids.append(i + 1); segs.append(seg); resnames.append(rn)
+    n = len(names)
+    keys = list(dict.fromkeys(zip(segs, resids)))
+    resindex = np.array([keys.index(k) for k in zip(segs, resids)])
+    u = mda.Universe.empty(n, n_residues=len(keys), n_segments=2, atom_resindex=resindex,
+                           residue_segindex=[0 if k[0] == "A" else 1 for k in keys], trajectory=True)
+    u.add_TopologyAttr("names", names); u.add_TopologyAttr("resids", [k[1] for k in keys])
+    u.add_TopologyAttr("resnames", [resnames[list(resindex).index(r)] for r in range(len(keys))])
+    u.add_TopologyAttr("segids", ["A", "B"]); u.add_TopologyAttr("masses", np.full(n, 12.0))
+    base = rng.normal(0, 6, (n, 3))
+    def write(tag, shift):
+        pos = base.copy(); pos[np.array(segs) == "B"] += shift          # chain B moves between the states
+        frames = pos[None] + rng.normal(0, 0.1, (30, n, 3))
+        u.load_new(frames.astype(np.float32)); u.dimensions = [80, 80, 80, 90, 90, 90]
+        u.atoms.write(str(tmp_path / "sys.pdb"))
+        with mda.Writer(str(tmp_path / f"{tag}.dcd"), n) as w:
+            for ts in u.trajectory: w.write(u.atoms)
+    write("closed", np.zeros(3)); write("open", np.array([6.0, 0, 0]))
+    a = types.SimpleNamespace(psf=str(tmp_path / "sys.pdb"), closed=[str(tmp_path / "closed.dcd")], opened=[str(tmp_path / "open.dcd")],
+                              protein="all", skip=0, stride=1, min_sep=2, n_ca=6, gap=1, n_bridge=3, max_bridge=1e9, n_chi=3,
+                              include=None, out=str(tmp_path / "cand"))
+    cs.candidates(a)
+    pool = json.load(open(str(tmp_path / "cand") + ".json")) if os.path.exists(str(tmp_path / "cand") + ".json") else json.load(open(a.out))
+    uu = mda.Universe(str(tmp_path / "sys.pdb"))
+    assert pool["cvs"]
+    for c in pool["cvs"]:
+        assert any(ch in c["name"] for ch in ("A", "B")), c["name"]
+        for sel in c["atoms"]:
+            assert "segid" in sel and len(uu.select_atoms(sel)) == 1, sel
+    assert any(c["name"].startswith("ca_A") and "_B" in c["name"] for c in pool["cvs"])      # an inter-chain distance, which is what moved
+
+
+def test_spline_integration_beats_the_trapezoid_rule_on_a_curved_path():
+    """F = 3 sin^2(pi x / 2) + 2 y^2 along a quarter-circle-like path sampled at few images."""
+    import fe_profile as fp
+    F = lambda p: 3 * np.sin(np.pi * p[:, 0] / 2) ** 2 + 2 * p[:, 1] ** 2
+    f = lambda p: -np.column_stack([3 * np.pi / 2 * np.sin(np.pi * p[:, 0]), 4 * p[:, 1]])     # minus the gradient
+    t = np.linspace(0, 1, 9)
+    z = np.column_stack([t, 0.5 * np.sin(np.pi * t)])                                           # a bent path from (0,0) to (1,0)
+    exact = F(z) - F(z[:1])
+    err_spline = np.abs(fp.integrate(z, f(z)) - exact).max()
+    err_trap = np.abs(fp.integrate_trapezoid(z, f(z)) - exact).max()
+    assert err_spline < 0.03 and err_trap > 4 * err_spline
+    # linear in the forces, so block profiles add up
+    a, b = f(z), f(z)[::-1].copy()
+    assert np.allclose(fp.integrate(z, a + 2 * b), fp.integrate(z, a) + 2 * fp.integrate(z, b))
+    # three images: falls back to the trapezoid rule
+    assert np.allclose(fp.integrate(z[:3], f(z[:3])), fp.integrate_trapezoid(z[:3], f(z[:3])))
+
+
+def test_reference_from_unbiased_frames_is_the_smoothed_free_energy():
+    """Frames drawn from a known 2-D density: the reference at a few points
+    must equal the free energy of that density smoothed by the restraint's
+    Gaussian (worked out on a grid), and must differ from the unsmoothed one
+    by the amount the smoothing predicts."""
+    import fe_profile as fp
+    rng = np.random.default_rng(12); kT = 0.596; k = 40.0
+    Fx = lambda x: 3.0 * (x * x - 1) ** 2                      # double well in x, barrier 3 at x = 0
+    x = rng.uniform(-2, 2, 4_000_000); x = x[rng.random(len(x)) < np.exp(-Fx(x) / kT)]
+    y = rng.normal(0, np.sqrt(kT / 5.0), len(x))               # harmonic in y, k_y = 5
+    runs = np.array_split(np.column_stack([x, y]), 20)
+    z = np.array([[-1.0, 0.0], [-0.5, 0.0], [0.0, 0.0], [0.5, 0.0], [1.0, 0.0]])
+    R = fp.reference_smoothed(z, runs, k, np.zeros(2, bool), kT=kT, n_boot=300)
+    g = np.linspace(-2.5, 2.5, 20001); rho = np.exp(-Fx(g) / kT)
+    smooth = np.array([-kT * np.log(np.trapezoid(rho * np.exp(-0.5 * k * (g - zi) ** 2 / kT), g)) for zi in z[:, 0]])
+    smooth -= smooth[0]
+    assert np.abs(R["F"] - smooth).max() < 4 * R["F_se"].max() + 0.03
+    assert abs(R["barrier"] - smooth.max()) < 0.1
+    assert 3.0 - smooth.max() > 0.15                           # the restraint flattens the barrier, and the reference follows it
+    assert R["effective_frames"].min() > 50
+    with pytest.raises(ValueError):
+        fp.reference_smoothed(np.array([[-1.0, 0.0], [9.0, 0.0]]), runs, k, np.zeros(2, bool), kT=kT, n_boot=10)

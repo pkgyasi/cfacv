@@ -94,9 +94,11 @@ def cv_values_from_points(cvtype, pts):
 class CVCalculator:
     """Evaluates a CVSet on an MDAnalysis Universe.
 
-    The groups of one CV are made whole relative to the first group by the
-    minimum-image convention, so a CV is right even when the trajectory was
-    written with wrapping on.
+    Each group is made whole (its atoms brought to the image nearest its
+    first atom) before its centre of mass is taken, and the groups of one CV
+    are then brought to the image nearest the first group, so a CV is right
+    even when the trajectory was written with wrapping on and a group
+    straddles the box edge.
     """
 
     def __init__(self, cvset, universe):
@@ -115,8 +117,23 @@ class CVCalculator:
     def _centers(self, gs):
         from MDAnalysis.lib.distances import minimize_vectors
         box = self.u.dimensions
-        pts = [g.center_of_mass() if g.n_atoms > 1 else g.positions[0].astype(float) for g in gs]
-        if box is not None and np.all(box[:3] > 0):
+        have_box = box is not None and np.all(box[:3] > 0)
+
+        def centre(g):
+            if g.n_atoms == 1:
+                return g.positions[0].astype(float)
+            if not have_box:
+                return g.center_of_mass()
+            # a group cut in two by the box edge (a wrapped trajectory) has its
+            # centre of mass in the middle of the box: bring every atom to the
+            # image nearest the group's first atom before averaging.  Right for
+            # any group smaller than half the box.
+            p0 = g.positions[0].astype(float)
+            d = minimize_vectors((g.positions - g.positions[0]).astype(np.float32), box).astype(float)
+            m = g.masses
+            return p0 + (d * m[:, None]).sum(axis=0) / m.sum() if m.sum() > 0 else p0 + d.mean(axis=0)
+        pts = [centre(g) for g in gs]
+        if have_box:
             ref = pts[0]
             pts = [ref] + [ref + minimize_vectors((p - ref)[None, :].astype(np.float32), box)[0]
                            for p in pts[1:]]

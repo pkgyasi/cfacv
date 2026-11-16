@@ -44,11 +44,39 @@ import numpy as np
 from common import block_mean_se, load_json, path_length, read_cvout, save_json, wrap
 
 
-def integrate(z, f):
-    """Profile from mean forces (f = -dF/dz) at the images z (continuous)."""
+def integrate_trapezoid(z, f):
+    """Profile from mean forces (f = -dF/dz) at the images z (continuous), by the trapezoid rule."""
     dz = np.diff(z, axis=0)
     steps = -0.5 * np.sum((f[:-1] + f[1:]) * dz, axis=1)
     return np.concatenate([[0.0], np.cumsum(steps)])
+
+
+def integrate(z, f, fine=24):
+    """Profile from mean forces (f = -dF/dz) at the images z (continuous).
+
+    The path and the force along it are each carried by a cubic spline
+    through the images, and F = -int f . dz is taken along that curve.  The
+    trapezoid rule, the usual choice, treats the path as straight between
+    images and the force as linear: on a 16-image alanine dipeptide string
+    it gave a barrier of 3.18 kcal/mol (3.00 with every other image) where
+    this gives 3.28 (3.25), against 3.43 +/- 0.07 from unbiased dynamics.
+    The result is still linear in the forces.  With fewer than four images
+    it falls back to the trapezoid rule."""
+    z = np.asarray(z, float); f = np.asarray(f, float)
+    if len(z) < 4:
+        return integrate_trapezoid(z, f)
+    from scipy.interpolate import CubicSpline
+    # a parameter along the path that does not depend on the CVs' units: each
+    # CV's steps divided by the range it covers along the string
+    span = np.ptp(z, axis=0); span[span <= 0] = 1.0
+    s = np.concatenate([[0.0], np.cumsum(np.sqrt(((np.diff(z, axis=0) / span) ** 2).sum(axis=1)) + 1e-12)])
+    zs, fs = CubicSpline(s, z), CubicSpline(s, f)
+    out = [0.0]
+    for a, b in zip(s[:-1], s[1:]):
+        x = np.linspace(a, b, fine + 1)
+        y = (fs(x) * zs(x, 1)).sum(axis=1)
+        out.append(out[-1] - float(((y[:-1] + y[1:]) * 0.5 * np.diff(x)).sum()))
+    return np.array(out)
 
 
 def integration_weights(z):
@@ -91,8 +119,12 @@ def neighbour_overlap(theta, z, periodic, bins=40):
     return np.array(out)
 
 
-def refine_images(z, f, scale, n_extra):
-    """Anchors with n_extra images added where the mean force curves most.
+def refine_images(z, f, scale, n_extra, must_split=()):
+    """Anchors with n_extra images added where the mean force curves most,
+    after one image in the middle of every segment listed in must_split
+    (segments whose two ensembles do not overlap: curvature does not see
+    those, and on a 47-image alanine string two such segments were all that
+    kept the overlap gate from passing).
 
     The segments next to the largest second difference of the scaled mean
     force are split at their midpoints, largest first; a segment already
@@ -100,6 +132,9 @@ def refine_images(z, f, scale, n_extra):
     the original segments that were split)."""
     z = [np.asarray(p, float) for p in z]; f = [np.asarray(v, float) for v in f]
     seg = list(range(len(z) - 1)); split = []
+    for s0 in sorted(set(int(v) for v in must_split), reverse=True):      # from the far end, so indices stay valid
+        z.insert(s0 + 1, 0.5 * (z[s0] + z[s0 + 1])); f.insert(s0 + 1, 0.5 * (f[s0] + f[s0 + 1]))
+        split.append(seg[s0]); seg.insert(s0 + 1, seg[s0])
     for _ in range(n_extra):
         # the trapezoid rule is exact for a force that changes linearly; its
         # error follows the CURVATURE of the force, so a segment is scored by
@@ -261,14 +296,23 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5):
     res["resolved_barrier"] = bool(abs(res["barrier"] - res["barrier_half_images"]) <= t95 * res["barrier_se"] + resolution_tol)
     res["resolved_delta_F"] = bool(abs(res["delta_F"] - res["delta_F_half_images"]) <= t95 * res["delta_F_se"] + resolution_tol)
     res["resolved"] = bool(res["resolved_barrier"] and res["resolved_delta_F"])
-    # the trapezoid rule's error falls four-fold when the spacing halves, so a
-    # third of (all - half) estimates what is left with all the images
+    # a rule whose error falls four-fold when the spacing halves leaves a
+    # third of (all - half) with all the images.  The spline rule does better
+    # than that on a smooth profile, so this is on the safe side.
     res["barrier_discretisation"] = abs(res["barrier"] - res["barrier_half_images"]) / 3.0
     res["delta_F_discretisation"] = abs(res["delta_F"] - res["delta_F_half_images"]) / 3.0
+    Ft = integrate_trapezoid(z, f)
+    res["barrier_trapezoid"] = float(Ft[top] - Ft[start]); res["delta_F_trapezoid"] = float(Ft[-1] - Ft[0])
     return res
 
 
 def print_gates(res):
+    w = res.get("restraint_width")
+    if w is not None and np.max(w) > 0.3:
+        print("NOTE: the restraint lets a CV move by " + ", ".join(f"{v:.2f}" for v in np.asarray(w))
+              + " of its length scale (sqrt(kT/k) / scale, per CV). The profile is of the free energy smoothed over "
+              "that width, exactly; features narrower than it are flattened. A stiffer restraint narrows it; "
+              "'fe_profile.py reference' compares like with like whatever the stiffness.")
     t = res["stability_limit_t"]
     print(f"GATE stability: {'PASS' if res['stable'] else 'FAIL'} (first against second half of the data, each with its own error, "
           f"and the trend through all {res['blocks']} blocks; limit {t:.1f} standard errors)")
@@ -479,7 +523,51 @@ def compute(z, theta, k, periodic, scale, nblocks=10, min_overlap=0.05, discard=
     ov = neighbour_overlap(theta, z, periodic)
     res["overlap"] = ov; res["min_overlap"] = float(ov.min())
     res["overlap_ok"] = bool(ov.min() >= min_overlap)
+    # the restraint's own width against each CV's length scale: what the runs
+    # measure is the free energy smoothed over that width (see reference_smoothed)
+    res["restraint_width"] = np.sqrt(0.596 / np.maximum(k, 1e-12)) / np.asarray(scale, float)
     return res
+
+
+def reference_smoothed(z, runs, k, periodic, kT=0.596, n_boot=3000, seed=0):
+    """The profile restrained runs SHOULD give, from unbiased trajectories.
+
+    With a harmonic restraint of force constant k in each CV the mean force
+    k<z - theta> is the gradient of F_k(z) = -kT ln [rho * G](z), the free
+    energy of the unbiased density rho smoothed by a Gaussian of variance
+    kT/k per CV.  That is exact for any k, not a stiff-restraint limit.  So
+    with unbiased frames theta_t,
+
+        F_k(z_i) - F_k(z_0) = -kT ln [ sum_t w_i(t) / sum_t w_0(t) ],
+        w_i(t) = exp(-sum_j k_j (z_ij - theta_tj)^2 / 2kT),
+
+    estimates the very quantity mean-force integration along the images
+    gives, with nothing to choose.  Counting frames within a radius of each
+    image does not: it averages the density over the ball, and on a 4-D test
+    density with a barrier of 3.30 it returned 2.80 at a radius of 0.6 and
+    1.90 at 1.0.
+
+    runs: list of (frames, D) arrays, one per independent trajectory.
+    Errors come from resampling whole trajectories.  Returns a dict."""
+    z = np.asarray(z, float); k = np.asarray(k, float) * np.ones(z.shape[1]); periodic = np.asarray(periodic, bool)
+    S = np.zeros((len(runs), len(z))); S2 = np.zeros((len(runs), len(z)))
+    for a, x in enumerate(runs):
+        x = np.asarray(x, float)
+        for i, zi in enumerate(z):
+            d = wrap(x - zi, periodic)
+            w = np.exp(-0.5 * (d * d * k).sum(axis=1) / kT); S[a, i] = w.sum(); S2[a, i] = (w * w).sum()
+    tot = S.sum(axis=0)
+    if tot.min() <= 0:
+        raise ValueError("no unbiased frame near some image: the trajectories never visit that part of the path")
+    F = -kT * np.log(tot / tot[0]); rng = np.random.default_rng(seed); Fb = []
+    for _ in range(n_boot):
+        c = S[rng.integers(0, len(runs), len(runs))].sum(axis=0)
+        if c.min() > 0:
+            Fb.append(-kT * np.log(c / c[0]))
+    Fb = np.array(Fb); top = int(F.argmax())
+    return {"z": z, "F": F, "F_se": Fb.std(axis=0), "barrier": float(F.max()), "barrier_se": float(Fb.max(axis=1).std()),
+            "top_image": top, "delta_F": float(F[-1]), "delta_F_se": float(Fb[:, -1].std()),
+            "effective_frames": tot ** 2 / S2.sum(axis=0), "k": k, "runs": len(runs), "resamples_used": len(Fb)}
 
 
 def main(argv=None):
@@ -510,6 +598,17 @@ def main(argv=None):
                         "string's own wander between neighbouring quarters of them (the driver's plateau test) [0.2]")
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--out", default="profile_driver")
+    p = sub.add_parser("reference", help="what a profile should be, from unbiased trajectories (see reference_smoothed)")
+    p.add_argument("--profile", required=True, help="a profile JSON from 'compute' or 'driver' (its images are used)")
+    p.add_argument("--cvout", nargs="+", required=True, help="cfacv CV reports of unbiased runs, one per trajectory, in the profile's CVs")
+    p.add_argument("--k", type=float, nargs="+", required=True, help="the restraint force constant the profile's runs used, one per CV or one for all")
+    p.add_argument("--cv", help="CV definition JSON, to know which CVs are periodic (default: all periodic if the profile has no types)")
+    p.add_argument("--temperature", type=float, default=300.0)
+    p.add_argument("--tolerance", type=float, default=0.3, help="a difference at an image counts against the gate only above this "
+                   "many kcal/mol as well as above 4 standard errors [0.3, half of kT at 300 K]: near a basin both errors "
+                   "are a few thousandths and any difference is many of them")
+    p.add_argument("--min-frames", type=float, default=20.0, help="effective unbiased frames an image needs for the comparison to count [20]")
+    p.add_argument("--out")
     p = sub.add_parser("compare")
     p.add_argument("--a", required=True); p.add_argument("--b", required=True)
     a = ap.parse_args(argv)
@@ -533,6 +632,43 @@ def main(argv=None):
               f"{B['barrier_se']:.2f}: {verdict}")
         return 0 if ok else 1
 
+    if a.cmd == "reference":
+        P = load_json(a.profile); z = np.array(P["z"], float)
+        if a.cv:
+            from common import CVSet
+            full = CVSet.load(a.cv); periodic = full.subset(full.string).periodic
+        else:
+            periodic = np.ones(z.shape[1], bool)
+        runs = [read_cvout(f)["Th"][1] for f in a.cvout]
+        try:
+            R = reference_smoothed(z, runs, a.k, periodic, kT=0.0019872041 * a.temperature)
+        except ValueError as e:
+            sys.exit(str(e))
+        F = np.array(P["F"], float); se = np.sqrt(np.array(P.get("F_se", np.zeros(len(z))), float) ** 2 + R["F_se"] ** 2)
+        print(f"{R['runs']} unbiased trajectories; restraint width sqrt(kT/k) = " + ", ".join(f"{v:.3f}" for v in np.sqrt(0.0019872041 * a.temperature / R["k"])))
+        print(f"{'image':>5s} {'profile':>8s} {'reference':>9s} {'+/-':>6s} {'frames':>7s}")
+        for i in range(len(z)):
+            print(f"{i:5d} {F[i]:8.2f} {R['F'][i]:9.2f} {R['F_se'][i]:6.2f} {R['effective_frames'][i]:7.0f}")
+        print(f"barrier      profile {P['barrier']:.2f} +/- {P['barrier_se']:.2f}   reference {R['barrier']:.2f} +/- {R['barrier_se']:.2f}")
+        print(f"end-to-end   profile {P['delta_F']:.2f} +/- {P['delta_F_se']:.2f}   reference {R['delta_F']:.2f} +/- {R['delta_F_se']:.2f}")
+        thin = R["effective_frames"] < a.min_frames
+        if thin.any():
+            print(f"images {np.flatnonzero(thin).tolist()} have fewer than {a.min_frames:g} effective unbiased frames: the reference says little there")
+        d = np.abs(F - R["F"]); use = ~thin; use[0] = False
+        zs = d / np.maximum(se, 1e-12)
+        zmax = float(zs[use].max()) if use.any() else float("nan")
+        bad = use & (zs > 4.0) & (d > a.tolerance)
+        db = abs(P["barrier"] - R["barrier"]) / np.hypot(P["barrier_se"], R["barrier_se"])
+        ok = bool(db <= 3.0 and not bad.any())
+        print(f"largest difference at an image {d.max():.2f} kcal/mol (image {int(d.argmax())}); in combined standard errors {zmax:.1f}; "
+              f"barriers {db:.1f} combined standard errors apart")
+        if bad.any():
+            print(f"images {np.flatnonzero(bad).tolist()} differ by more than 4 standard errors and more than {a.tolerance} kcal/mol")
+        print(f"GATE profile against unbiased dynamics: {'PASS' if ok else 'FAIL'} (barrier within 3 combined standard errors; "
+              f"no image off by both 4 standard errors and {a.tolerance} kcal/mol)")
+        if a.out:
+            save_json(a.out, R)
+        return 0 if ok else 1
     if a.cmd == "driver":
         scale = np.array(load_json(a.scales)["scale"])
         try:
@@ -544,6 +680,10 @@ def main(argv=None):
               f"{res['updates_per_frame']} updates each); across them one image moved {res['systematic_in_window']:.3f} "
               f"scaled units beyond the string's own wander of {res['wander_in_window']:.3f}")
         print(f"GATE stationary string: {'PASS' if res['stationary'] else 'FAIL'} (limit {a.max_drift} scaled units)")
+        if res["frames_used"] * res["updates_per_frame"] < 20000:
+            print(f"NOTE: only {res['frames_used'] * res['updates_per_frame']} updates per image went into this profile. On alanine dipeptide a "
+                  "profile from 5,400 updates passed its gates and was 0.3 kcal/mol low at the barrier and 0.7 off end to end: "
+                  "with so few, blocks are shorter than the force stays correlated and the errors are too small.")
         print(f"{'image':>5s} {'arc':>7s} {'F':>8s} {'+/-':>6s}")
         for i in range(len(z)):
             print(f"{i:5d} {res['arc'][i]:7.2f} {res['F'][i]:8.2f} {res['F_se'][i]:6.2f}")
@@ -597,10 +737,14 @@ def main(argv=None):
     np.savetxt(a.out + ".dat", np.column_stack([np.arange(len(z)), res["arc"], res["F"], res["F_se"]]),
                fmt=["%d", "%.4f", "%.4f", "%.4f"], header="image  scaled_arc  F(kcal/mol)  standard_error")
     n_extra = a.refine if a.refine else (0 if res["resolved"] else len(z) - 1)
+    low = [int(i) for i in np.flatnonzero(np.asarray(res["overlap"]) < a.min_overlap)]
+    if low and not n_extra:
+        n_extra = -1                                         # only the segments that do not overlap
     if n_extra:
-        new, split = refine_images(z, res["mean_force"], scale, n_extra)
+        new, split = refine_images(z, res["mean_force"], scale, max(n_extra, 0), must_split=low)
         np.savetxt(a.out + "_refined.dat", new, fmt="%.6f",
-                   header=f"{len(z)} images plus {n_extra} added where the mean force changes fastest")
+                   header=f"{len(z)} images plus {len(low)} in segments whose ensembles do not overlap and {max(n_extra, 0)} "
+                          "where the mean force changes fastest")
         res["refined_images"] = len(new); res["split_segments"] = sorted(set(split))
         print(f"wrote {a.out}_refined.dat: {len(new)} images; extra images went into segments {sorted(set(split))}. "
               "Prepare them with init_string.py or meanforce.py and recompute.")

@@ -226,8 +226,20 @@ def across_metric(m, path, g_u):
     return g_u - np.sum(g_u * n, axis=1, keepdims=True) * n
 
 
-def _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends):
+def _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends, window=100):
+    """Returns (path, iterations, converged).  Converged means either that no
+    image moved more than `stop` in an iteration, or that the string has
+    settled into a small chatter: its mean over one window of iterations
+    lies within 5 x stop of its mean over the window before, while single
+    iterations still move it by up to 50 x stop.  In the second case the
+    window mean is returned.  (Upwind tangents switch sides where the profile
+    is flat, and a string there can jitter by a few 1e-4 scaled units for
+    ever without going anywhere; a string that is still travelling moves its
+    window mean by a hundred times its per-iteration move and is not let
+    through.)  _relax.chatter holds the per-iteration move in that case."""
     converged = False
+    _relax.chatter = 0.0
+    acc = np.zeros_like(path); nacc = 0; prev_mean = None; big = 0.0
     for it in range(max_iter):
         g_u = m.gradient(path) * m.metric                    # dF/du
         if m.M is not None:
@@ -245,6 +257,17 @@ def _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends):
         if move < stop:
             converged = True
             break
+        acc += path; nacc += 1; big = max(big, move)
+        if nacc == window:
+            mean = acc / nacc
+            if prev_mean is not None and big < 50.0 * stop and \
+                    np.max(np.linalg.norm((mean - prev_mean) / m.metric, axis=1)) < 5.0 * stop:
+                path = redistribute(mean, n_images, m.metric)
+                if fix_ends:
+                    path[0], path[-1] = new[0], new[-1]
+                converged = True; _relax.chatter = float(big)
+                break
+            prev_mean = mean; acc = np.zeros_like(path); nacc = 0; big = 0.0
     return path, it + 1, converged
 
 
@@ -501,7 +524,7 @@ def search(m, z_closed, z_open, n_images=20, n_channels=3, k=8, n_random=50, see
             "exclude_radius": excl, "same_channel": same_channel, "support": support}
 
 
-def barrier_uncertainty(m, z, f, channels, n_boot=100, frac=0.8, seed=0, f_se=None):
+def barrier_uncertainty(m, z, f, channels, n_boot=100, frac=0.8, seed=0, f_se=None, relax=False):
     """How much of each channel's barrier is the map and how much the centers.
 
     The map is refitted n_boot times on random subsets of the centers, with
@@ -513,9 +536,17 @@ def barrier_uncertainty(m, z, f, channels, n_boot=100, frac=0.8, seed=0, f_se=No
     A subset of a fraction `frac` drawn without replacement varies LESS than
     the full sample's own uncertainty: the spread has to be multiplied by
     sqrt(frac / (1 - frac)), which is 2 for the default 0.8 (the delete-d
-    jackknife).  Both numbers returned include that factor.  They are
-    conditional on the paths: the routes are not searched for again on each
-    refit, so a refit that would prefer another route does not show here.
+    jackknife).  Both numbers returned include that factor.
+
+    With relax=False the paths are held fixed and each barrier is read along
+    the same images on every refit.  With relax=True each channel's string is
+    relaxed again on every refit (ends taken down to that map's minima), so
+    the error includes how far the route itself moves when the map changes;
+    barrier_uncertainty.moved then holds, per channel, the rms distance the
+    relaxed strings lie from the original and the share of refits on which
+    the string did not converge (those refits keep the fixed path).  Either
+    way the routes are not SEARCHED for again, so a refit that would prefer
+    a route not in the list does not show.
 
     What this error is: mostly how much the barrier depends on WHICH centers
     the map has, not the noise in their forces.  With f_se (the standard
@@ -523,12 +554,22 @@ def barrier_uncertainty(m, z, f, channels, n_boot=100, frac=0.8, seed=0, f_se=No
     noise alone, from refits with the forces perturbed by their errors."""
     rng = np.random.default_rng(seed)
     B = np.empty((n_boot, len(channels)))
+    moved = np.zeros((n_boot, len(channels))); failed = np.zeros(len(channels))
     for b in range(n_boot):
         idx = rng.choice(len(z), size=int(frac * len(z)), replace=False)
         mb = FESMap.fit(z[idx], f[idx], m.sigma, m.scale, m.periodic, metric=m.metric)
         for c, ch in enumerate(channels):
-            F = mb.value(np.asarray(ch["anchors"]))
+            path = np.asarray(ch["anchors"], float)
+            if relax:
+                start = path.copy(); start[0], start[-1] = descend(mb, path[0]), descend(mb, path[-1])
+                new, _, conv = relax_string(mb, start, len(path))
+                if conv:
+                    moved[b, c] = path_distance(new, path, m.metric); path = new
+                else:
+                    failed[c] += 1
+            F = mb.value(path)
             B[b, c] = F.max() - F[0]                          # every string starts at the same point
+    barrier_uncertainty.moved = (np.sqrt((moved ** 2).mean(axis=0)), failed / n_boot) if relax else None
     k = np.sqrt(frac / (1.0 - frac))
     sd = k * B.std(axis=0, ddof=1)
     holds = []
@@ -566,6 +607,14 @@ def main(argv=None):
     ap.add_argument("--forces", help="the centers-and-forces file the map was fitted to; enables the "
                     "uncertainty of the barriers and of the channel ranking")
     ap.add_argument("--bootstrap", type=int, default=100, help="map refits for that uncertainty [100]")
+    ap.add_argument("--route-points", help="also write the images of every route that lie farther than --route-gap from "
+                    "any center, one point per line: places to measure the mean force next, so that the map "
+                    "is refitted with data on the routes themselves ('meanforce.py setup --points ... --centers ...')")
+    ap.add_argument("--route-gap", type=float, default=0.3, help="scaled distance from the nearest center beyond which a "
+                    "route image is worth a new center [0.3]")
+    ap.add_argument("--fixed-paths", action="store_true",
+                    help="read each refit's barriers along the fixed strings instead of relaxing every string again "
+                         "on every refit (faster; the error then leaves out how far a route moves with the map)")
     ap.add_argument("--no-metric-tensor", action="store_true",
                     help="relax along -grad F even if the map carries a measured metric tensor")
     ap.add_argument("--basins", required=True, help="basins.json from endpoint_analysis.py")
@@ -596,7 +645,8 @@ def main(argv=None):
         fse = np.loadtxt(a.forces + ".se") if os.path.exists(a.forces + ".se") else None
         if fse is not None and fse.shape != ff.shape:
             fse = None
-        out = barrier_uncertainty(m, zf, ff, res["channels"], a.bootstrap, seed=a.seed, f_se=fse)
+        mplain = FESMap.load(a.map); mplain.M = None     # refits carry no tensor: relax them without one
+        out = barrier_uncertainty(mplain, zf, ff, res["channels"], a.bootstrap, seed=a.seed, f_se=fse, relax=not a.fixed_paths)
         sd, holds = out[0], out[1]; noise = out[2] if len(out) > 2 else None
         for i, c in enumerate(res["channels"]):
             c["barrier_sd"] = float(sd[i])
@@ -610,8 +660,27 @@ def main(argv=None):
         np.savetxt(f"{a.out}_anchors_{i}.dat", c["anchors"], fmt="%.6f",
                    header=f"channel {i} ({c['found_by']}): {a.images} images, map barrier {c['barrier']:.3f} kcal/mol")
     print("(barriers in kcal/mol from the coarse map: for ranking only)")
+    if a.route_points:
+        pts = []
+        for c in res["channels"]:
+            anc = np.asarray(c["anchors"], float)
+            far = m.nearest_center_distance(anc) > a.route_gap
+            for p in anc[far]:
+                p = np.array([((v + np.pi) % (2 * np.pi)) - np.pi if per else v for v, per in zip(p, m.periodic)])
+                if not pts or min(np.linalg.norm(diff(np.array(pts), p, m.periodic) / m.metric, axis=1)) > a.route_gap / 2:
+                    pts.append(p)
+        np.savetxt(a.route_points, np.array(pts).reshape(-1, len(m.metric)), fmt="%.6f",
+                   header=f"route images farther than {a.route_gap} scaled units from every center")
+        print(f"wrote {len(pts)} route images with no center within {a.route_gap} scaled units to {a.route_points}")
     if sd is not None:
-        print("the +/- is how much a barrier depends on WHICH centers the map has (refits on subsets, paths fixed)"
+        mv = getattr(barrier_uncertainty, "moved", None)
+        if mv is not None:
+            print("on each refit every string was relaxed again: they moved (rms, scaled units) "
+                  + ", ".join(f"{v:.2f}" for v in mv[0])
+                  + ("; did not converge on " + ", ".join(f"{100 * v:.0f}%" for v in mv[1]) + " of refits" if mv[1].max() > 0 else ""))
+            res["refit_moved"] = [float(v) for v in mv[0]]; res["refit_unconverged"] = [float(v) for v in mv[1]]
+        print("the +/- is how much a barrier depends on WHICH centers the map has (refits on subsets, "
+              + ("strings relaxed again on each)" if mv is not None else "paths fixed)")
               + (f"; the part that is noise in the forces is {', '.join(f'{v:.2f}' for v in noise)}" if noise is not None else ""))
     for i, c in enumerate(res["channels"]):
         if not c["converged"]:

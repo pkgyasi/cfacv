@@ -507,3 +507,21 @@ def test_the_known_creeping_run_is_refused_in_every_mode_and_the_resting_ones_ar
     for name in ("pr0D2", "pr0D3", "pr1D1", "pr0R"):
         r = fp.from_driver([f"{FINAL}/{name}.forces"], scale)
         assert r["stationary"], name
+
+
+# ------------------------------------------------------------------ finding 9: overlap
+def test_overlap_is_not_fooled_by_one_outlying_frame():
+    """Finding 9. Bins spanned min to max: one frame far out put both disjoint
+    ensembles in one or two bins and the overlap read 0.5 to 1."""
+    import fe_profile as fp
+    rng = np.random.default_rng(7)
+    z = np.array([[0.0, 0.0], [1.0, 0.0]]); per = [False, False]
+    a = z[0] + 0.077 * rng.standard_normal((4000, 2)); b = z[1] + 0.077 * rng.standard_normal((4000, 2))
+    assert fp.neighbour_overlap([a, b], z, per)[0] < 0.01
+    a[5] = [-300.0, 0.0]
+    assert fp.neighbour_overlap([a, b], z, per)[0] < 0.01
+    # and it still measures overlap: two Gaussians 2 sd apart overlap by 2 Phi(-1) = 0.317
+    zz = np.array([[0.0, 0.0], [0.154, 0.0]])
+    a = zz[0] + 0.077 * rng.standard_normal((20000, 2)); b = zz[1] + 0.077 * rng.standard_normal((20000, 2))
+    b[:3] = [[40.0, 0.0]] * 3
+    assert abs(fp.neighbour_overlap([a, b], zz, per)[0] - 0.317) < 0.03

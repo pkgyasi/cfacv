@@ -146,18 +146,32 @@ def integrate(z, f, scale=None, s=None, at=None):
     return nodes[k] + piece(k, (at - s[k]) / h[k])
 
 
-def neighbour_overlap(theta, z, periodic, bins=40):
-    """Overlap of neighbouring ensembles projected on the local tangent."""
+def neighbour_overlap(theta, z, periodic, bins_per_sd=4, reach=6.0):
+    """Overlap of neighbouring ensembles projected on the local tangent: the
+    overlapping coefficient sum_bins min(p_a, p_b), 2 Phi(-d / 2 sd) for two
+    Gaussians d apart.
+
+    The bins are a fixed width, a quarter of the pooled robust standard
+    deviation (1.4826 x median absolute deviation), over the two medians
+    +/- `reach` of those; frames outside count in the totals but overlap
+    nothing.  (Until 2026-11-15 the bins spanned the data's min to max, and one
+    stray frame put two disjoint ensembles in the same bin: 0.5 to 1.0.)"""
     out = []
     for i in range(len(z) - 1):
         t = z[i + 1] - z[i]
         L2 = np.sum(t * t)
         a = wrap(theta[i] - z[i], periodic) @ t / L2          # 0 at image i, 1 at image i+1
         b = wrap(theta[i + 1] - z[i], periodic) @ t / L2
-        lo, hi = min(a.min(), b.min()), max(a.max(), b.max())
-        ha, _ = np.histogram(a, bins=bins, range=(lo, hi))
-        hb, _ = np.histogram(b, bins=bins, range=(lo, hi))
-        out.append(float(np.minimum(ha / ha.sum(), hb / hb.sum()).sum()))
+        ma, mb = np.median(a), np.median(b)
+        sa, sb = (1.4826 * np.median(np.abs(x - m)) for x, m in ((a, ma), (b, mb)))
+        sd = float(np.sqrt(0.5 * (sa * sa + sb * sb)))
+        if sd <= 0:
+            out.append(float(ma == mb)); continue
+        lo, hi = min(ma, mb) - reach * sd, max(ma, mb) + reach * sd
+        nb = int(np.ceil((hi - lo) / (sd / bins_per_sd)))
+        ha, _ = np.histogram(a, bins=nb, range=(lo, hi))
+        hb, _ = np.histogram(b, bins=nb, range=(lo, hi))
+        out.append(float(np.minimum(ha / len(a), hb / len(b)).sum()))
     return np.array(out)
 
 

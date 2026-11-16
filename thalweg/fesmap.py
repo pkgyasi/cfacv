@@ -154,6 +154,8 @@ def check_inputs(z, f, scale, periodic, folds):
     if not (np.all(np.isfinite(z)) and np.all(np.isfinite(f))):
         bad = np.where(~(np.isfinite(z).all(axis=1) & np.isfinite(f).all(axis=1)))[0]
         raise ValueError(f"centers or forces are not finite on {len(bad)} rows (first: row {bad[0]})")
+    if not np.any(f != 0):
+        raise ValueError("every mean force is zero: there is no surface to fit")
     if int(folds) < 2:
         raise ValueError(f"--folds {folds}: a left-out error needs at least 2 folds")
     if len(z) < 2 * int(folds):

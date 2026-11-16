@@ -145,6 +145,14 @@ def test_fit_refuses_nan_forces(tmp_path):
     assert isinstance(e.value.code, str) and "finite" in e.value.code, e.value.code
 
 
+def test_fit_refuses_all_zero_forces(tmp_path):
+    z, f = smooth_data(60)
+    p = write_case(tmp_path, "zero", z, 0 * f)
+    with pytest.raises(SystemExit) as e:
+        fesmap.main(["fit", "--forces", p, "--scales", str(tmp_path / "s.json"), "--out", str(tmp_path / "m.json")])
+    assert isinstance(e.value.code, str) and "zero" in e.value.code, e.value.code
+
+
 # --------------------------------------------------------------------------
 # analytic surfaces for the relaxation (the reviewer's ana.py / ana2.py)
 # --------------------------------------------------------------------------

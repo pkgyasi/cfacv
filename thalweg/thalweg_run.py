@@ -28,7 +28,16 @@ A step is one of
              launcher unless its log already ends cleanly; a config may start
              with "#PRE other.conf" lines, run first (see init_string.py).
   "shell"    any other command.
-and may carry "gate": a label printed when the step fails.
+and may carry
+  "gate"     a label: the step is a gate.  It passes only if it exits 0 AND
+             prints a line "GATE <...>: PASS" (and none saying FAIL); a gate
+             step that exits 0 without saying PASS has not passed.
+  "inputs"   files (wildcards allowed) the step reads.  Their sizes and
+             modification times are part of the step's signature: change one
+             and the step, and everything after it, is redone.
+  "outputs"  files the step writes.  If one is missing the step is redone.
+             A tool step's "--out X" is taken as an output without being
+             declared (X, or files beginning with X, must exist).
 
 Launchers for run lists
   "local"    runs the configs here, "parallel" at a time, each with
@@ -47,8 +56,9 @@ Options
   --from STAGE     forget the record from this stage on, and run from there
                    (a NAMD run is still skipped if its log is newer than its
                    config and ends cleanly; delete the logs to force those)
-  --only STAGE     run this stage alone, whatever the record says, and leave
-                   the record as it is (a rerun on the side)
+  --only STAGE     run this stage alone, whatever the record says.  It is
+                   recorded as done, and every stage AFTER it is forgotten:
+                   they were built on the output it has just replaced
   --status         print the record
 
 One runner works in a directory at a time (a lock file says who); if it is
@@ -59,7 +69,9 @@ The record is .thalweg/<settings name>-<tag>.state.json in the directory you run
 in, and the logs go to .thalweg/<settings name>.logs/: the record belongs to
 the run directory, so one settings file can serve several.  A step is redone
 when its command changes, and so is every step after it.  A NAMD run is
-redone when its config is newer than its log.  {thalweg} is the toolkit's
+redone when its config is newer than its log, and a run with "#PRE" stages
+is redone whenever one of them is (its log must be newer than theirs); a
+runlist step is not done while any of its runs is not.  {thalweg} is the toolkit's
 directory.  Braces that do not name a variable are left alone.
 
 Example:
@@ -151,11 +163,32 @@ def newest_change(stem):
     return t
 
 
-def run_namd(conf, command, hang_minutes):
+def pre_of(conf):
+    try:
+        with open(conf) as fh:
+            return [l.split()[1] for l in fh if l.startswith("#PRE ") and len(l.split()) > 1]
+    except OSError:
+        return []
+
+
+def chain_complete(conf):
+    """A run and its #PRE stages are all complete, and the run came after
+    them: a PRE stage run again makes the run that starts from it stale."""
+    log = stem_of(conf) + ".log"
+    if not log_complete(log, conf):
+        return False
+    for q in pre_of(conf):
+        ql = stem_of(q) + ".log"
+        if not log_complete(ql, q) or os.path.getmtime(ql) >= os.path.getmtime(log):
+            return False
+    return True
+
+
+def run_namd(conf, command, hang_minutes, force=False):
     """One NAMD run with a guard against a hung process.  Returns '' or an error."""
     stem = stem_of(conf)
     log = stem + ".log"
-    if log_complete(log, conf):
+    if not force and log_complete(log, conf):
         return ""
     with open(log, "w") as out:
         # its own process group, so a kill reaches NAMD and not just the shell that started it
@@ -187,17 +220,19 @@ def run_namd(conf, command, hang_minutes):
 
 
 def run_with_pre(conf, command, hang_minutes):
-    try:
-        with open(conf) as fh:
-            pre = [l.split()[1] for l in fh if l.startswith("#PRE ") and len(l.split()) > 1]
-    except OSError as e:
-        return f"{conf}: {e.strerror}"
+    if not os.path.exists(conf):
+        return f"{conf}: No such file or directory"
+    pre = pre_of(conf)
+    stale = False                     # once one stage runs, every stage after it must run too
     for c in pre + [conf]:
         if ABORT.is_set():
             return f"{conf}: not started (an earlier run hung, or the runner was interrupted)"
-        err = run_namd(c, command, hang_minutes)
+        log = stem_of(c) + ".log"
+        done = log_complete(log, c) and not stale
+        err = run_namd(c, command, hang_minutes, force=not done)
         if err:
             return err
+        stale = stale or not done
     return ""
 
 
@@ -217,7 +252,7 @@ def do_runlist(path, launcher, logfh):
         if "--wait" not in cmd and " -W" not in cmd:
             raise Stop("launcher: the sbatch command needs --wait, or the runner cannot tell when the array ends")
         print(f"      {cmd}", flush=True)
-        if all(log_complete(stem_of(c) + ".log", c) for c in confs):
+        if all(chain_complete(c) for c in confs):
             return f"{len(confs)} runs (all already complete; nothing submitted)"
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                              start_new_session=True)
@@ -232,7 +267,7 @@ def do_runlist(path, launcher, logfh):
             JOBS.discard(job)
         if p.returncode and job is None:
             raise Stop(f"sbatch failed (exit {p.returncode}): {lines[-1] if lines else 'no message'}")
-        bad = [c for c in confs if not log_complete(stem_of(c) + ".log", c)]
+        bad = [c for c in confs if not chain_complete(c)]
         if p.returncode or bad:
             raise Stop(f"{len(bad)} of {len(confs)} runs in {path} did not finish cleanly"
                        + (f", e.g. {bad[0]}" if bad else f" (sbatch exit {p.returncode})"))
@@ -241,7 +276,7 @@ def do_runlist(path, launcher, logfh):
         raise Stop(f"launcher: unknown mode '{mode}'")
     command = launcher.get("command", "namd3 +p4 {conf}")
     hang = float(launcher.get("hang_minutes", 30))
-    skipped = sum(log_complete(stem_of(c) + ".log", c) for c in confs)
+    skipped = sum(chain_complete(c) for c in confs)
     errors = []; par = max(1, int(launcher.get("parallel", 1))); streak = [0]
 
     def one(c):
@@ -269,16 +304,62 @@ def do_command(cmd, logfh):
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                          start_new_session=True)
     LIVE.add(p)
-    tail = []
+    tail = []; gates = []
     for line in p.stdout:
         logfh.write(line)
+        if re.match(r"\s*GATE\b", line):
+            gates.append(line.strip())
         if "Warning" in line or "warnings.warn" in line:
             continue
         tail.append(line.rstrip()); tail = tail[-6:]
         if "GATE" in line or line.startswith("WARNING"):
             print("      " + line.rstrip(), flush=True)
     p.wait(); LIVE.discard(p)
-    return p.returncode, tail
+    return p.returncode, tail, gates
+
+
+def gate_verdict(gates):
+    """'' if the GATE lines say PASS and none says FAIL, else the reason."""
+    if not gates:
+        return "it printed no GATE line"
+    bad = [g for g in gates if not re.search(r":\s*PASS\b", g)]
+    if bad:
+        return f"it printed '{bad[0]}'"
+    return ""
+
+
+def stamp(patterns):
+    """Sizes and modification times of the files the patterns name."""
+    out = []
+    for pat in patterns:
+        hits = sorted(glob.glob(pat))
+        out.append(f"{pat}=" + (";".join(f"{f}:{os.path.getsize(f)}:{os.stat(f).st_mtime_ns}" for f in hits if os.path.isfile(f))
+                                if hits else "MISSING"))
+    return "|".join(out)
+
+
+def tool_out(what):
+    """The value of a tool command's --out, if it has one."""
+    try:
+        toks = shlex.split(what)
+    except ValueError:
+        return None
+    for i, t in enumerate(toks):
+        if t == "--out" and i + 1 < len(toks):
+            return toks[i + 1]
+        if t.startswith("--out="):
+            return t[6:]
+    return None
+
+
+def missing_outputs(step, kind, what, v):
+    pats = [subst(x, v) for x in step.get("outputs", [])]
+    miss = [x for x in pats if not glob.glob(x)]
+    if kind == "tool" and "outputs" not in step:
+        o = tool_out(what)
+        if o and not os.path.exists(o) and not glob.glob(glob.escape(o) + "*"):
+            miss.append(o)
+    return miss
 
 
 def main(argv=None):
@@ -389,11 +470,31 @@ def main(argv=None):
                 # run in this invocation, nothing after it counts as done.
                 # (of the launcher only the mode counts: running six at a time
                 # instead of four is not a different calculation)
-                sig = hashlib.sha1((prev_sig + kind + cmd + (launcher.get("mode", "local") if kind == "runlist" else "")).encode()).hexdigest()[:12]
+                # declared inputs count by size and time; a run list by its content
+                ins = stamp([subst(x, v) for x in step.get("inputs", [])])
+                if kind == "runlist":
+                    try:
+                        ins += "|list=" + hashlib.sha1(open(what, "rb").read()).hexdigest()
+                    except OSError:
+                        ins += "|list=MISSING"
+                sig = hashlib.sha1((prev_sig + kind + cmd + (launcher.get("mode", "local") if kind == "runlist" else "") + ins).encode()).hexdigest()[:12]
                 prev_sig = sig
                 if skip_stage:
                     continue
                 done = state.get(key, {}).get("sig") == sig and not redone and not a.only
+                gone = missing_outputs(step, kind, what, v) if done else []
+                if gone:
+                    print(f"   note: step {ti + 1} of '{st['name']}' is recorded done, but {gone[0]} is missing: redoing it")
+                    done = False
+                if done and kind == "runlist":
+                    try:
+                        confs = [l.strip() for l in open(what) if l.strip() and not l.strip().startswith("#")]
+                    except OSError:
+                        confs = []
+                    stale = [c for c in confs if not chain_complete(c)]
+                    if stale:
+                        print(f"   note: {len(stale)} run(s) of {what} are no longer complete (e.g. {stale[0]}): redoing the step")
+                        done = False
                 label = f"   {ti + 1}. {kind}: {what if len(what) < 110 else what[:107] + '...'}"
                 if a.status or a.dry_run:
                     print(f"{label}   [{'done ' + state[key]['when'] if done else 'to do'}]")
@@ -412,18 +513,39 @@ def main(argv=None):
                     if kind == "runlist":
                         note = do_runlist(what, launcher, logfh)
                     else:
-                        rc, tail = do_command(cmd, logfh)
-                        if rc:
+                        rc, tail, gates = do_command(cmd, logfh)
+                        why = gate_verdict(gates) if (step.get("gate") and not rc) else ""
+                        if rc or why:
                             for line in tail:
                                 print("      | " + line)
-                            raise Stop(f"stage '{st['name']}', step {ti + 1} failed (exit {rc})"
+                            raise Stop(f"stage '{st['name']}', step {ti + 1} failed ("
+                                       + (f"exit {rc}" if rc else f"exit 0, but {why}") + ")"
                                        + (f": GATE {step['gate']} did not pass" if step.get("gate") else "")
                                        + f". Log: {logname}")
                         note = tail[-1] if tail else ""
-                if not a.only:                               # --only is a rerun on the side; it leaves the record alone
-                    state[key] = {"sig": sig, "when": time.strftime("%Y-%m-%d %H:%M"), "seconds": round(time.time() - t0, 1)}
-                    save_state()
+                        miss = missing_outputs(step, kind, what, v)
+                        if miss:
+                            raise Stop(f"stage '{st['name']}', step {ti + 1} finished but did not write {miss[0]}. Log: {logname}")
+                state[key] = {"sig": sig, "when": time.strftime("%Y-%m-%d %H:%M"), "seconds": round(time.time() - t0, 1)}
+                save_state()
                 print(f"      ok in {time.time() - t0:.0f} s{': ' + note if note else ''}", flush=True)
+            if a.only and not skip_stage and not (a.dry_run or a.status):
+                # what comes after was built on the output this stage has just replaced
+                later = [k for n in names[si + 1:] for k in state if k.startswith(n + "#")]
+                for k in later:
+                    del state[k]
+                save_state()
+                if later:
+                    print(f"NOTE: '{st['name']}' was run again, so the record of the {len(names) - si - 1} stage(s) after it is "
+                          "cleared: they will be redone on the next run", flush=True)
+    except BrokenPipeError:
+        # whoever read the output has gone (a pipe into head): stop quietly
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY); os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        take_down()
+        failed = "the output pipe was closed"
     except Stop as e:
         failed = str(e)
     except KeyboardInterrupt:
@@ -439,10 +561,22 @@ def main(argv=None):
         print(f"STOPPED: {failed}")
         print("Nothing after this step was run. Fix it and run again WITHOUT --from; finished steps are kept.")
         return 1
-    if not (a.dry_run or a.status):
+    if a.only and not (a.dry_run or a.status):
+        print(f"stage '{a.only}' finished (only that stage was run; run without --only for the rest)")
+    elif not (a.dry_run or a.status):
         print("all stages finished")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # output piped into something that stopped reading (head): no traceback
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        rc = 1
+    sys.exit(rc)

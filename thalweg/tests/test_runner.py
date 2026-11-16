@@ -13,9 +13,9 @@ def run(settings, *args):
     return r.returncode, r.stdout + r.stderr
 
 
-def write(tmp_path, gate_ok, command="sh {conf}"):
+def write(tmp_path, gate_ok, command="sh {conf}", confs=True):
     # "NAMD" here is a shell script that writes what a finished run writes
-    for i in range(3):
+    for i in range(3 if confs else 0):
         (tmp_path / f"r{i}.conf").write_text(f"echo run {i} >> order.txt; echo 'End of program'\n")
     (tmp_path / "runs.list").write_text("r0.conf\nr1.conf\nr2.conf\n")
     s = {"vars": {"word": "hello"},
@@ -34,8 +34,9 @@ def test_stops_at_a_failed_gate_and_resumes(tmp_path):
     assert (tmp_path / "a.txt").read_text().strip() == "hello"
     assert not (tmp_path / "z.txt").exists()                     # nothing after the gate ran
     assert len((tmp_path / "order.txt").read_text().split("\n")) == 4
-    # fix the gate: the finished steps are not run again
-    write(tmp_path, gate_ok=True)
+    # fix the gate: the finished steps are not run again (a rewritten config
+    # WOULD be: a config newer than its log is a run to redo)
+    write(tmp_path, gate_ok=True, confs=False)
     rc, out = run(p)
     assert rc == 0 and "all stages finished" in out and out.count("[done") == 2
     assert (tmp_path / "z.txt").exists()

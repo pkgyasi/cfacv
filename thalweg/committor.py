@@ -7,12 +7,23 @@
          draws fresh velocities (its own seed), runs in chunks, and stops as
          soon as the string CVs enter a basin or the step cap is reached.
   tally  counts where the trajectories went and tests the gate:
-           * the pooled commitment probability is 0.5 within its error;
+           * EQUIVALENCE to 1/2: the 95% interval of the pooled commitment
+             probability lies inside [0.5 - equiv, 0.5 + equiv] (--equiv,
+             0.1).  "Not shown to differ from 1/2" is not the test: it passes
+             a committor of 0.4 whenever the data are few.  The interval's
+             error is the larger of the binomial one and the spread between
+             configurations (shots from one configuration are not
+             independent of each other);
            * the per-configuration values are consistent with ONE probability
              (a chi-square test).  A pooled 0.5 made of configurations that
-             commit all one way or all the other is not a transition state;
+             commit all one way or all the other is not a transition state.
+             Configurations with too few committed shots cannot take part,
+             so most of the committed shots must come from ones that can;
            * few trajectories reached the cap uncommitted.  They are counted
-             and reported, never dropped.
+             and reported, never dropped: p is also bracketed by sending all
+             of them one way and then the other, and the bracket must lie in
+             the same fixed window (it does at 20% uncommitted with p = 1/2,
+             so --max-uncommitted and --equiv agree at their defaults).
 
 Basins are the boxes from endpoint analysis: every string CV within
 nsigma standard deviations of the basin centre.
@@ -123,21 +134,31 @@ def setup(a):
           f"submit {a.out}/runs.list as an array of 1-{len(confs)}")
 
 
-def tally_counts(counts, max_uncommitted=0.2, alpha=0.05, min_committed=100, min_per_config=10, min_configs=5):
+def tally_counts(counts, max_uncommitted=0.2, alpha=0.05, min_committed=100, min_per_config=10, min_configs=5,
+                 equiv=0.1, min_tested_fraction=0.75):
     """counts: list of (n_closed, n_open, n_uncommitted, n_missing) per configuration."""
     from scipy.stats import chi2
-    c = np.array(counts, dtype=float)
+    c = np.array(counts, dtype=float).reshape(-1, 4)
     nA, nB, nU = c[:, 0], c[:, 1], c[:, 2]
     n = nA + nB
     with np.errstate(invalid="ignore", divide="ignore"):
         p = np.where(n > 0, nB / n, np.nan)
     N = n.sum()
     P = nB.sum() / N if N else float("nan")
-    se = float(np.sqrt(P * (1 - P) / N)) if N else float("nan")
+    se_bin = float(np.sqrt(P * (1 - P) / N)) if N else float("nan")
+    # shots of one configuration share it, so their outcomes are not
+    # independent: the error of the pooled value is also estimated from the
+    # spread between configurations (the cluster-robust error of a ratio)
+    k = int(np.sum(n > 0))
+    se_cfg = float(np.sqrt(k / (k - 1) * np.sum((nB - P * n) ** 2)) / N) if (N and k > 1) else float("nan")
+    se = float(np.nanmax([se_bin, se_cfg])) if N else float("nan")
     # homogeneity: are the per-configuration values draws from one binomial?
     # a configuration with a handful of shots says nothing about homogeneity
     use = n >= min_per_config
-    testable = bool(use.sum() >= min_configs)
+    tested_fraction = float(n[use].sum() / N) if N else 0.0
+    # ... and configurations left out of that test must not carry the pooled
+    # value: forty all-one-way configurations of four shots each are not tested
+    testable = bool(use.sum() >= min_configs and tested_fraction >= min_tested_fraction)
     if 0 < P < 1 and use.sum() > 1:
         stat = float(np.sum((nB[use] - n[use] * P) ** 2 / (n[use] * P * (1 - P))))
         dof = int(use.sum() - 1)
@@ -148,59 +169,93 @@ def tally_counts(counts, max_uncommitted=0.2, alpha=0.05, min_committed=100, min
     # "not shown to differ from 1/2" passes on lack of evidence when N is
     # small (7 closed, 13 open of 20 passed), so a minimum count is part of it
     enough = bool(N >= min_committed)
-    half = 2 * np.sqrt(0.25 / N) if N else float("nan")
+    # equivalence: the 95% interval of P must lie inside a FIXED window about
+    # 1/2.  (A window of 2 standard errors shrinks as N grows, so that a true
+    # 1/2 with a few uncommitted fails, and grows as N shrinks, so that 0.4
+    # passes.)
+    ci = (P - 1.96 * se, P + 1.96 * se) if N else (float("nan"),) * 2
     # the uncommitted are not in P; where they would have gone is unknown, so
     # P is bracketed by sending all of them one way and then the other, and
-    # BOTH ends must be inside the window
+    # BOTH ends must be inside the same window
     tot = N + nU.sum()
     lo, hi = (float(nB.sum() / tot), float((nB.sum() + nU.sum()) / tot)) if tot else (float("nan"),) * 2
-    centred = bool(enough and abs(P - 0.5) <= half and lo >= 0.5 - half and hi <= 0.5 + half)
+    tol = 1e-9
+    centred = bool(enough and ci[0] >= 0.5 - equiv - tol and ci[1] <= 0.5 + equiv + tol)
+    bracketed = bool(enough and lo >= 0.5 - equiv - tol and hi <= 0.5 + equiv + tol)
     homogeneous = bool(np.isfinite(pval) and pval >= alpha)
     res = {"per_config_p_open": p, "per_config_committed": n, "pooled_p_open": float(P), "pooled_se": se,
+           "binomial_se": se_bin, "between_config_se": se_cfg, "ci95": [float(ci[0]), float(ci[1])],
            "committed": int(N), "uncommitted": int(nU.sum()), "missing": int(c[:, 3].sum()),
            "uncommitted_fraction": unc, "chi2": stat, "dof": dof, "p_value": pval,
-           "centred": centred, "enough": enough, "min_committed": int(min_committed),
-           "window": [0.5 - half, 0.5 + half] if N else None, "p_bounds": [lo, hi],
-           "testable": testable, "configs_used": int(use.sum()),
+           "centred": centred, "bracketed": bracketed, "enough": enough, "min_committed": int(min_committed),
+           "window": [0.5 - equiv, 0.5 + equiv], "equiv": equiv, "p_bounds": [lo, hi],
+           "testable": testable, "configs_used": int(use.sum()), "tested_fraction": tested_fraction,
            "homogeneous": homogeneous, "few_uncommitted": bool(unc <= max_uncommitted)}
-    res["pass"] = bool(centred and testable and homogeneous and res["few_uncommitted"] and res["missing"] == 0)
+    res["pass"] = bool(centred and bracketed and testable and homogeneous and res["few_uncommitted"] and res["missing"] == 0)
     return res
 
 
+UNCOMMITTED = ("U", "uncommitted", "none", "neither", "cap")
+
+
 def tally(a):
-    s = load_json(os.path.join(a.dir, "setup.json"))
-    A, B = s["basins"]
-    counts, steps = [], []
-    for c in range(s["n_configs"]):
+    path = os.path.join(a.dir, "setup.json")
+    try:
+        s = load_json(path)
+        A, B = s["basins"]
+        nconf, nshots = int(s["n_configs"]), int(s["shots"])
+    except OSError:
+        sys.exit(f"no {path}: not a directory written by 'committor.py setup'")
+    except (ValueError, KeyError, TypeError) as e:
+        sys.exit(f"{path} is damaged or not from 'committor.py setup' ({e})")
+    counts, steps, cut, strange = [], [], [], []
+    for c in range(nconf):
         nA = nB = nU = nM = 0
-        for sh in range(s["shots"]):
+        for sh in range(nshots):
             path = os.path.join(a.dir, f"c{c:02d}", f"s{sh:03d}.result")
             if not os.path.exists(path):
                 nM += 1
                 continue
-            w = open(path).read().split()
-            steps.append(int(w[1]))
+            w = open(path, errors="replace").read().split()
+            try:
+                st = int(w[1])
+            except (IndexError, ValueError):
+                cut.append(path); nM += 1                     # empty or cut short: no result yet
+                continue
+            steps.append(st)
             if w[0] == A:
                 nA += 1
             elif w[0] == B:
                 nB += 1
-            else:
+            elif w[0] in UNCOMMITTED:
                 nU += 1
+            else:
+                strange.append(f"{path}: '{w[0]}'")
         counts.append((nA, nB, nU, nM))
-    r = tally_counts(counts, a.max_uncommitted, min_committed=a.min_committed, min_per_config=a.min_per_config, min_configs=a.min_configs)
+    if strange:
+        sys.exit(f"{len(strange)} result file(s) name an outcome that is neither basin ({A}, {B}) nor uncommitted, "
+                 f"e.g. {strange[0]}: the basins of the setup and of the shots do not agree")
+    if cut:
+        print(f"WARNING: {len(cut)} result file(s) are empty or cut short (counted as missing), e.g. {cut[0]}")
+    r = tally_counts(counts, a.max_uncommitted, min_committed=a.min_committed, min_per_config=a.min_per_config,
+                     min_configs=a.min_configs, equiv=a.equiv)
     print(f"{'config':>6s} {A:>7s} {B:>7s} {'uncomm.':>8s} {'missing':>8s} {'p(' + B + ')':>9s}")
     for c, (nA, nB, nU, nM) in enumerate(counts):
         print(f"{c:6d} {nA:7d} {nB:7d} {nU:8d} {nM:8d} {r['per_config_p_open'][c]:9.2f}")
     print(f"pooled p({B}) = {r['pooled_p_open']:.3f} +/- {r['pooled_se']:.3f} from {r['committed']} committed "
-          f"trajectories; {r['uncommitted']} uncommitted ({r['uncommitted_fraction']:.1%}), {r['missing']} missing")
+          f"trajectories (error: binomial {r['binomial_se']:.3f}, from the spread between configurations "
+          f"{r['between_config_se']:.3f}; the larger is used); {r['uncommitted']} uncommitted ({r['uncommitted_fraction']:.1%}), "
+          f"{r['missing']} missing")
     if steps:
         print(f"trajectory length: median {int(np.median(steps))} steps, longest {max(steps)}")
     print(f"  at least {a.min_committed} committed trajectories      : {'yes' if r['enough'] else 'NO'} ({r['committed']})")
-    if r["window"]:
-        print(f"  centred on 0.5 within 2 standard errors : {'yes' if r['centred'] else 'NO'} (window {r['window'][0]:.2f} to {r['window'][1]:.2f}; "
-              f"with the uncommitted sent all one way or the other, p is {r['p_bounds'][0]:.2f} to {r['p_bounds'][1]:.2f})")
+    print(f"  95% interval inside {r['window'][0]:.2f} to {r['window'][1]:.2f}        : {'yes' if r['centred'] else 'NO'} "
+          f"({r['ci95'][0]:.3f} to {r['ci95'][1]:.3f})")
+    print(f"  ... with the uncommitted sent either way: {'yes' if r['bracketed'] else 'NO'} "
+          f"(p is {r['p_bounds'][0]:.3f} to {r['p_bounds'][1]:.3f})")
     print(f"  enough configurations to test sameness  : {'yes' if r['testable'] else 'NO'} "
-          f"({r['configs_used']} with at least {a.min_per_config} committed; {a.min_configs} needed)")
+          f"({r['configs_used']} with at least {a.min_per_config} committed; {a.min_configs} needed; they hold "
+          f"{r['tested_fraction']:.0%} of the committed shots, 75% needed)")
     print(f"  configurations consistent with one value: {'yes' if r['homogeneous'] else 'NO'} "
           f"(chi-square {r['chi2']:.1f} on {r['dof']} dof, p = {r['p_value']:.3f})")
     print(f"  uncommitted fraction within {a.max_uncommitted:.0%}       : {'yes' if r['few_uncommitted'] else 'NO'}")
@@ -236,6 +291,8 @@ def main(argv=None):
     p = sub.add_parser("tally")
     p.add_argument("--dir", default="shots")
     p.add_argument("--max-uncommitted", type=float, default=0.2)
+    p.add_argument("--equiv", type=float, default=0.1,
+                   help="half-width of the window about 1/2 that the 95%% interval of p must lie in [0.1]")
     p.add_argument("--min-per-config", type=int, default=10, help="committed trajectories a configuration needs to count [10]")
     p.add_argument("--min-configs", type=int, default=5, help="such configurations needed for the sameness test [5]")
     p.add_argument("--min-committed", type=int, default=100,

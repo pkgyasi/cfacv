@@ -14,7 +14,14 @@ file the string driver writes on replica 0 and reports numbers.
              * spacing of the images in scaled arc length.
            The gate passes when the largest drift is below --tol.  It writes
            the window-averaged string, which is the path the free-energy
-           stage samples.
+           stage samples.  Two windows of a creeping string can agree to
+           within --tol while it creeps, so for a history from the thalweg
+           driver, which applies its own (stronger) stopping tests over half
+           the run, the gate also needs the driver's verdict that the string
+           stopped; a history that ends at the update cap, or before the
+           driver's verdict, fails.  With fewer than two windows of frames
+           there is nothing to judge, and the tool says so (the window is not
+           shrunk to fit).
   compare  two strings: their mean scaled separation against their combined
            scatter.  Merged strings are one path; separated ones are two
            channels and both go to the free-energy stage.
@@ -41,12 +48,19 @@ def read_history(paths):
 
     Returns (iters, z) with z of shape (frames, replicas, nCV).  A later file
     overrides an earlier one where their iterations overlap."""
-    frames = {}; final = {}; thalweg = False
+    frames = {}; final = {}; thalweg = False; verdict = None
     for path in paths:
         with open(path, errors="replace") as fh:
             for line in fh:
                 if line.startswith("TW iter"):
                     thalweg = True
+                    m = re.match(r"^TW iter\s*(\d+) : (finished, .*|converged.*)$", line.strip())
+                    if m:
+                        # the last word of the last file is the driver's verdict
+                        if m.group(2).startswith("finished"):
+                            verdict = (int(m.group(1)), m.group(2)[len("finished, "):])
+                        elif verdict is None or verdict[0] < int(m.group(1)):
+                            verdict = (int(m.group(1)), "converged")
                 m = _LINE.match(line)
                 if not m:
                     continue
@@ -57,6 +71,8 @@ def read_history(paths):
                 # the thalweg driver's FINAL block is its own result, the string averaged over
                 # its last window; it is not one more frame, and carries the last frame's number
                 (final if m.group(1) else frames.setdefault(int(m.group(2)), {}))[int(m.group(3))] = vals
+    read_history.thalweg = thalweg
+    read_history.verdict = verdict
     if not frames:
         raise ValueError("no 'reparam z' lines found")
     nrep = max(len(f) for f in frames.values())
@@ -66,7 +82,6 @@ def read_history(paths):
     if not iters:
         raise ValueError("no complete frame in the history")
     z = np.array([[frames[i][r] for r in range(nrep)] for i in iters])
-    read_history.thalweg = thalweg
     read_history.final = (np.array([final[r] for r in range(nrep)])
                           if len(final) == nrep and all(len(v) == ncv for v in final.values()) else None)
     return np.array(iters), z
@@ -152,8 +167,8 @@ def main(argv=None):
     p.add_argument("--dual", action="store_true",
                    help="cfacv's own driver in dual mode: the first half of the replicas are the string. "
                         "NOT for the thalweg driver, which writes only the string's images")
-    p.add_argument("--window", type=int, default=0,
-                   help="frames per averaging window [100, or a quarter of the frames recorded when there are fewer than 200]")
+    p.add_argument("--window", type=int, default=100,
+                   help="frames per averaging window [100]; at least two windows of frames are needed")
     p.add_argument("--tol", type=float, default=0.25, help="gate: largest tolerated drift in scaled units [0.25]")
     p.add_argument("--out", default="string")
     p = sub.add_parser("compare")
@@ -164,28 +179,56 @@ def main(argv=None):
     p.add_argument("--factor", type=float, default=2.0, help="merged if the largest separation < factor x scatter")
     p.add_argument("--cv", help="CV definition JSON; needed when any CV is a torsion, so differences are wrapped")
     a = ap.parse_args(argv)
-    scale = np.array(load_json(a.scales)["scale"])
+    try:
+        scale = np.array(load_json(a.scales)["scale"], float)
+    except OSError as e:
+        sys.exit(f"{a.scales}: {e.strerror}")
+    except (ValueError, KeyError) as e:
+        sys.exit(f"{a.scales} is not a scales file ({e})")
 
     if a.cmd == "compare":
         per = None
         if a.cv:
             full = CVSet.load(a.cv); per = full.subset(full.string).periodic
-        r = compare(np.loadtxt(a.a), np.loadtxt(a.b), scale, a.scatter_a, a.scatter_b, a.factor, per)
+        ss = []
+        for f in (a.a, a.b):
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    z = np.atleast_2d(np.loadtxt(f))
+            except (OSError, ValueError) as e:
+                sys.exit(f"{f}: cannot read a string from it ({e})")
+            if z.size == 0 or z.shape[0] < 2 or z.shape[1] != len(scale):
+                sys.exit(f"{f}: not a string of {len(scale)} CVs (read {z.shape[0] if z.size else 0} rows)")
+            ss.append(z)
+        try:
+            r = compare(ss[0], ss[1], scale, a.scatter_a, a.scatter_b, a.factor, per)
+        except ValueError as e:
+            sys.exit(str(e))
         print(f"separation: mean {r['mean_separation']:.2f}, largest {r['max_separation']:.2f} scaled units; "
               f"combined scatter {r['combined_scatter']:.2f}")
         print("MERGED: one path" if r["merged"] else "DISTINCT: two channels, both go to the free-energy stage")
         return 0
 
-    iters, z = read_history(a.history)
+    try:
+        iters, z = read_history(a.history)
+    except OSError as e:
+        sys.exit(f"{e.filename}: {e.strerror}")
+    except ValueError as e:
+        sys.exit(f"{', '.join(a.history)}: {e}")
     if a.dual:
         if read_history.thalweg:
             sys.exit("--dual is for cfacv's own driver. This history was written by the thalweg driver, which records "
                      "only the string's images: halving it would judge half a string.")
         z = z[:, : z.shape[1] // 2]
-    if not a.window:
-        a.window = 100 if len(z) >= 200 else max(2, len(z) // 4)
-        if len(z) < 200:
-            print(f"{len(z)} frames recorded: using windows of {a.window} frames (the default of 100 needs 200)")
+    if a.window < 5:
+        sys.exit(f"--window {a.window}: a window of fewer than 5 frames averages nothing")
+    if len(z) < 2 * a.window:
+        # shrinking the window to fit (as this once did, down to 2 frames)
+        # compares two noisy snapshots and calls their agreement convergence
+        sys.exit(f"{len(z)} frames recorded: two windows of {a.window} need {2 * a.window}. Run the string longer, or "
+                 f"choose a smaller --window deliberately (it must still span many times the string's relaxation)")
     if z.shape[2] != len(scale):
         sys.exit(f"history has {z.shape[2]} CVs, scales has {len(scale)}")
     names = CVSet.load(a.cv).string if a.cv else [f"cv{j}" for j in range(z.shape[2])]
@@ -202,8 +245,24 @@ def main(argv=None):
     if res["sharpest_turn"] < 0:
         print(f"WARNING: the string doubles back at image {res['sharpest_turn_image']} "
               f"(turn cosine {res['sharpest_turn']:.2f}); a profile along it would cross that region twice")
+    two = res["pass"]
+    if read_history.thalweg:
+        v = read_history.verdict
+        stopped = bool(v and v[1] in ("converged", "stopped by its plateau and force tests"))
+        if v is None:
+            print("the thalweg driver has not given its verdict yet (no 'finished' line): the run is not over")
+        else:
+            print(f"the thalweg driver's own verdict at update {v[0]}: {v[1]}")
+        if not stopped:
+            print("  the driver's stopping tests (drift over half the run, and the force across the string) did not pass; "
+                  "two windows that agree do not make a string that has stopped creeping")
+        res["driver_verdict"] = v[1] if v else None
+        res["pass"] = bool(two and stopped)
     print(f"GATE path convergence: {'PASS' if res['pass'] else 'FAIL'} "
-          f"(largest drift {res['max_drift']:.3f}, limit {a.tol}; mean scatter {res['mean_scatter']:.3f})")
+          f"(largest drift between the last two windows {res['max_drift']:.3f}, limit {a.tol}"
+          + (f", {'within' if two else 'OVER'}" if read_history.thalweg else "")
+          + f"; mean scatter {res['mean_scatter']:.3f}"
+          + ("; and the driver's verdict" if read_history.thalweg else "") + ")")
     np.savetxt(a.out + "_final.dat", res["string"], fmt="%.6f",
                header=f"string averaged over the last {a.window} frames")
     if read_history.final is not None:

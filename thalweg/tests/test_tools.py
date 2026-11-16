@@ -270,22 +270,23 @@ def test_profile_flags_a_barrier_the_images_do_not_resolve():
 def test_committor_tally_accepts_a_transition_state_only():
     from committor import tally_counts
     rng = np.random.default_rng(9)
-    good = [(20 - b, b, 0, 0) for b in rng.binomial(20, 0.5, 10)]
+    good = [(25 - b, b, 0, 0) for b in rng.binomial(25, 0.5, 40)]
     r = tally_counts(good)
-    assert r["pass"] and abs(r["pooled_p_open"] - 0.5) < 0.1 and abs(r["pooled_se"] - 0.035) < 0.003
+    assert r["pass"] and abs(r["pooled_p_open"] - 0.5) < 0.1 and abs(r["binomial_se"] - 0.0158) < 0.001
+    assert r["pooled_se"] >= r["binomial_se"]
     # pooled 0.5, but every configuration commits one way: NOT a transition state
     split = [(20, 0, 0, 0)] * 5 + [(0, 20, 0, 0)] * 5
     r = tally_counts(split)
-    assert r["centred"] and not r["homogeneous"] and not r["pass"]
+    assert abs(r["pooled_p_open"] - 0.5) < 1e-9 and not r["homogeneous"] and not r["pass"]
     # on the closed side of the barrier
     r = tally_counts([(17, 3, 0, 0)] * 10)
     assert not r["centred"] and not r["pass"]
     # too many trajectories never committed
     r = tally_counts([(6, 6, 8, 0)] * 10)
     assert not r["few_uncommitted"] and not r["pass"]
-    # ... and where they would have gone brackets p: 8/8/4 reads 0.50, but is 0.40 to 0.60 or worse
-    r = tally_counts([(8, 8, 4, 0)] * 10)
-    assert abs(r["pooled_p_open"] - 0.5) < 1e-9 and r["p_bounds"][0] < r["window"][0] and not r["centred"]
+    # ... and where they would have gone brackets p: 7/7/6 reads 0.50, but is 0.35 to 0.65
+    r = tally_counts([(7, 7, 6, 0)] * 10)
+    assert abs(r["pooled_p_open"] - 0.5) < 1e-9 and r["p_bounds"][0] < r["window"][0] and not r["bracketed"] and not r["pass"]
     # one configuration with all the shots and nine with one each: nothing to test sameness with
     r = tally_counts([(45, 46, 0, 0)] + [(1, 0, 0, 0)] * 9)
     assert not r["testable"] and not r["pass"]

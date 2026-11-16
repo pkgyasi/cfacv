@@ -73,16 +73,23 @@ def setup(a):
         if not a.scales:
             sys.exit("--centers needs --scales")
         from init_string import nearest_centers
+        sc = load_json(a.scales)
+        if sc.get("cvs") != cvs.names:
+            sys.exit(f"{a.scales}: scales are for {sc.get('cvs')}, the string CVs are {cvs.names} (same CVs in the same "
+                     "order needed, or the distances to the centers mix up the CVs)")
         mesh = np.atleast_2d(np.loadtxt(os.path.join(a.centers, "mesh.dat")))
-        nearest, dist = nearest_centers(pts, mesh, np.array(load_json(a.scales)["scale"]), np.array([t in PERIODIC_TYPES for t in cvs.types]))
+        if mesh.shape[1] != len(cvs.names):
+            sys.exit(f"{a.centers}/mesh.dat has {mesh.shape[1]} columns; the string has {len(cvs.names)} CVs")
+        nearest, dist = nearest_centers(pts, mesh, np.array(sc["scale"]), np.array([t in PERIODIC_TYPES for t in cvs.types]))
         nearest, dist = np.asarray(nearest, int), np.asarray(dist, float)
         print(f"each point starts from its nearest center; the farthest start is {dist.max():.2f} scaled units from its point "
               f"(median {np.median(dist):.2f}). The first part of each run is the walk there: drop it in 'collect' (--discard).")
     elif not a.start:
         sys.exit("give --start, or --centers and --scales")
-    confs = []
+    confs = []; starts = []
     for i, p in enumerate(pts):
         start = os.path.join(a.centers, f"center{nearest[i]:05d}") if nearest is not None else a.start.format(i=i)
+        starts.append(start)
         for ext in (".coor", ".xsc"):
             if not os.path.exists(start + ext):
                 sys.exit(f"missing {start + ext}")
@@ -96,13 +103,23 @@ def setup(a):
         confs.append(conf)
     with open(os.path.join(a.out, "runs.list"), "w") as fh:
         fh.write("\n".join(confs) + "\n")
-    save_json(os.path.join(a.out, "setup.json"), {"cvs": cvs.names, "types": cvs.types, "k": a.k, "points": pts})
+    save_json(os.path.join(a.out, "setup.json"), {"cvs": cvs.names, "types": cvs.types, "k": a.k, "points": pts, "starts": starts,
+                                                  "start_from": "nearest center" if nearest is not None else "--start"})
     print(f"{len(confs)} runs set up in {a.out}/ ; submit {a.out}/runs.list as an array of 1-{len(confs)}")
 
 
+def _setup(d):
+    path = os.path.join(d, "setup.json")
+    try:
+        return load_json(path)
+    except OSError:
+        sys.exit(f"no {path}: not a directory written by 'meanforce.py setup'")
+    except ValueError as e:
+        sys.exit(f"{path} is damaged ({e})")
+
+
 def collect(a):
-    from common import load_json
-    s = load_json(os.path.join(a.dir, "setup.json"))
+    s = _setup(a.dir)
     periodic = np.array([t == "DIHED" for t in s["types"]])
     k = np.array(s["k"])
     z, f, se, missing = [], [], [], []
@@ -120,6 +137,11 @@ def collect(a):
             print(f"   point {i}: {e}")
     if not z:
         sys.exit("no usable points")
+    if missing and not a.allow_missing:
+        # a map or a profile with holes in it is not what was set up; leaving
+        # them out has to be a decision, not a default
+        sys.exit(f"{len(missing)} of {len(s['points'])} points have no usable mean force; nothing written. "
+                 "Rerun them, or pass --allow-missing to write the others")
     z, f, se = np.array(z), np.array(f), np.array(se)
     write_forces(a.out, z, f, s["types"], f"mean forces from {a.dir}, k = {s['k']}")
     np.savetxt(a.out + ".se", se, fmt="%.6f", header="standard error of each mean-force component (block averages)")
@@ -149,8 +171,7 @@ def metric(a):
     """The metric tensor at each point: averaged over the point's restrained
     run when its log is there (the default), or from the point's starting
     configuration alone (--start, with --cv and --psf)."""
-    from common import load_json, save_json
-    s = load_json(os.path.join(a.dir, "setup.json"))
+    s = _setup(a.dir)
     if not a.start:
         n = len(s["cvs"]); Ms = []; pts = []; missing = 0
         for i in range(len(s["points"])):
@@ -166,23 +187,30 @@ def metric(a):
         return _write_metric(a, s, Ms, "averaged over each restrained run")
     if not (a.cv and a.psf):
         sys.exit("--start needs --cv and --psf")
-    import MDAnalysis as mda
-    from common import CVCalculator
+    from common import CVCalculator, load_namdbin
     cvset = CVSet.load(a.cv).subset(s["cvs"])
+    # each point's own starting configuration, as setup chose it: with
+    # --centers that is the NEAREST center, not center i
+    recorded = s.get("starts")
+    if a.start == "setup":
+        if not recorded:
+            sys.exit(f"{a.dir}/setup.json records no starting configurations (an older setup): give --start as a path stem")
+        starts = recorded
+    else:
+        starts = [a.start.format(i=i) for i in range(len(s["points"]))]
+        if recorded and [os.path.normpath(x) for x in starts] != [os.path.normpath(x) for x in recorded]:
+            k = next(i for i, (x, y) in enumerate(zip(starts, recorded)) if os.path.normpath(x) != os.path.normpath(y))
+            sys.exit(f"setup started point {k} from {recorded[k]} (" + s.get("start_from", "its own start")
+                     + f"), but --start would read {starts[k]}. Pass --start setup to use the configurations setup chose "
+                       "(for --centers, each point's nearest center)")
     Ms = []
-    for i in range(len(s["points"])):
-        u = mda.Universe(a.psf, a.start.format(i=i) + ".coor", format="NAMDBIN")
-        try:
-            xsc = [l for l in open(a.start.format(i=i) + ".xsc") if not l.startswith("#")][-1].split()
-            u.dimensions = [float(xsc[1]), float(xsc[5]), float(xsc[9]), 90, 90, 90]
-        except (OSError, IndexError, ValueError):
-            pass                                              # no cell: the groups are taken as they are
+    for st in starts:
+        u = load_namdbin(a.psf, st + ".coor")                 # with its cell, triclinic or not, when the .xsc is there
         Ms.append(CVCalculator(cvset, u).metric_tensor())
     return _write_metric(a, s, np.array(Ms), "from one configuration per point")
 
 
 def _write_metric(a, s, Ms, how):
-    from common import save_json
     save_json(a.out, {"cvs": s["cvs"], "points": s["points"], "M": Ms, "how": how})
     d = np.array([np.diag(M) for M in Ms])
     off = np.array([np.abs(M - np.diag(np.diag(M))).max() / np.sqrt(np.outer(np.diag(M), np.diag(M))).max() for M in Ms])
@@ -217,15 +245,15 @@ def main(argv=None):
     p.add_argument("--discard", type=float, default=0.2, help="leading fraction of each run to drop")
     p.add_argument("--blocks", type=int, default=5)
     p.add_argument("--out", default="forces.dat")
+    p.add_argument("--allow-missing", action="store_true", help="write the usable points even when some are not")
     p = sub.add_parser("metric", help="metric tensor at each point, for the path search (no MD)")
     p.add_argument("--dir", default="mf"); p.add_argument("--out", default="metric.json")
     p.add_argument("--discard", type=float, default=0.2, help="leading fraction of each run to drop")
     p.add_argument("--start", help="instead of the run averages, use one configuration per point: its path stem, "
-                                   "as given to setup (needs --cv and --psf)")
+                                   "as given to setup, or 'setup' for the ones setup recorded (needs --cv and --psf)")
     p.add_argument("--cv"); p.add_argument("--psf")
     a = ap.parse_args(argv)
-    {"setup": setup, "collect": collect, "metric": metric}[a.cmd](a)
-    return 0
+    return {"setup": setup, "collect": collect, "metric": metric}[a.cmd](a) or 0
 
 
 if __name__ == "__main__":

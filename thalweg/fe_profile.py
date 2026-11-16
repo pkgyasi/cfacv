@@ -26,11 +26,15 @@ It reports, for the Stage 6 gates:
 The start of each run is dropped by detecting its equilibration (the start
 that leaves the most independent samples), unless --discard gives a fraction.
 
-On overlap: with stiff restraints the ensembles of neighbouring images are
-much narrower than their spacing and do not overlap at all.  Integrating a
-mean force does not need them to; it needs the mean force to be resolved,
+On overlap: whether neighbouring ensembles overlap depends on the image
+spacing d against the restraint width sd = sqrt(kT/k); two Gaussians overlap
+by 2 Phi(-d / 2 sd), about 0.05 at d = 4 sd.  (On alanine dipeptide at
+k = 100 kcal/mol/rad^2, sd = 0.077 rad, every profile overlaps somewhat and
+the gate fails only where images are about 0.3-0.4 rad apart.)  Integrating a
+mean force does not need overlap; it needs the mean force to be resolved,
 which is what the resolution check tests.  The overlap gate is kept because
-the proposal names it; --min-overlap 0 turns it off.
+the proposal names it, and refinement splits segments without overlap, which
+the curvature score does not see; --min-overlap 0 turns the gate off.
 
 `compare` checks that the closed-to-open free-energy difference agrees
 between strings.  It must: that difference does not depend on the path.

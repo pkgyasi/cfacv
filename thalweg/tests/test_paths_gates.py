@@ -343,7 +343,7 @@ def test_central_finish_removes_most_of_the_upwind_bias():
     Fy, gy = ring_y(K=20.0)
     m = Analytic(Fy, gy, ROT @ np.diag([1, 25.0]) @ ROT.T, full_centers())
     y0 = np.array([[1, 0], [0.9, 0.9], [-0.9, 0.9], [-1, 0.0]])
-    p, _, c = ps.relax_string(m, y0 @ m.Mh, 20, cut=None)
+    p, _, c = ps.relax_string(m, y0 @ m.Mh, 20, cut=None, finish="central")
     assert c
     d = np.sqrt(np.mean(ps._to_curve(p, m.truth(), np.ones(2)) ** 2))
     # upwind tangents alone leave it D_UP from the true path (measured at 2891a69)

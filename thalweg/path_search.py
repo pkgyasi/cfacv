@@ -231,8 +231,7 @@ def across_metric(m, path, g_u, tangent="upwind"):
     has the conditioning of plain descent and needs no special step or
     iteration cap.  It does need upwind tangents (see `upwind_tangents`),
     because unlike -M grad F it uses the tangent; those put an O(spacing)
-    bias on the path, which `relax_string`'s central finishing pass removes
-    when it converges.  `tangent`: "upwind" or "central"."""
+    bias on the path (numbers in `relax_string`).  `tangent`: "upwind" or "central"."""
     u = path / m.metric
     t = upwind_tangents(u, m.value(path)) if tangent == "upwind" else central_tangents(u)
     n = np.linalg.solve(m.mobility(path), t[:, :, None])[:, :, 0]
@@ -255,9 +254,10 @@ def _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends, window=100,
     string is flagged as chatter-converged.
 
     An image the support guard held back (it would have moved farther from
-    the data than `support`) is not moving because the guard stops it, not
-    because it is relaxed: a string with any image held back in its last
-    `window` iterations is NOT converged, whatever its move (_relax.frozen)."""
+    the data than `support`, by at least `stop`) is not moving because the
+    guard stops it, not because it is relaxed: a string with any image held
+    back in its last `window` iterations is NOT converged, whatever its move
+    (_relax.frozen)."""
     converged = False
     _relax.chatter = 0.0; _relax.frozen = False
     last_frozen = -10 ** 9
@@ -273,7 +273,13 @@ def _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends, window=100,
             d_new = m.nearest_center_distance(new)
             far = (d_new > support) & (d_new >= m.nearest_center_distance(path))
             if far.any():
-                new[far] = path[far]; last_frozen = it
+                # held back only counts when the guard stopped a move the
+                # stopping test would have seen: at convergence the residual
+                # move of an image beyond the support points outward half the
+                # time, and blocking THAT stops nothing
+                if np.max(np.linalg.norm((new[far] - path[far]) / m.metric, axis=1)) >= stop:
+                    last_frozen = it
+                new[far] = path[far]
         new = redistribute(new, n_images, m.metric)
         move = np.max(np.linalg.norm((new - path) / m.metric, axis=1))
         path = new
@@ -297,7 +303,7 @@ def _relax(m, path, n_images, dt, stop, max_iter, support, fix_ends, window=100,
 
 
 def relax_string(m, path, n_images, dt=None, max_iter=None, tol=1e-4, support=None, fix_ends=True, cut=-0.5,
-                 finish="central"):
+                 finish=None):
     """Descent in scaled coordinates plus equal-arc redistribution.  With a
     metric tensor on the map the images move against the part of grad F that
     a minimum free-energy path does not balance (see `across_metric`), which
@@ -320,13 +326,22 @@ def relax_string(m, path, n_images, dt=None, max_iter=None, tol=1e-4, support=No
     cut, fall back in, cut again, never converging.
 
     FINISH.  With a tensor the flow needs upwind tangents to converge, and
-    upwind tangents bias the converged path by O(image spacing): on an
-    analytic ring with a rotated 25:1 tensor, 0.042 / 0.020 / 0.011 rms
-    (scaled) from the true path at 10 / 20 / 40 images.  finish="central"
-    then continues from the converged string with central tangents; the
-    result is kept only if that converges too (move < stop, no image held by
-    the support guard), and otherwise the upwind string is returned.
-    info["finish"] says which ("central", "upwind", or None without a tensor).
+    upwind tangents bias the converged path by O(image spacing).  Measured
+    on an analytic ring (rms distance from the true path, scaled units, at
+    10 / 20 / 40 / 80 images): identity tensor, soft ring 0.070 / 0.031 /
+    0.015 / 0.0076; rotated 25:1 tensor, stiff ring 0.042 / 0.020 / 0.011 /
+    0.0070.  Use enough images for the accuracy wanted.  finish="central"
+    (opt-in) continues from the converged string with central tangents and
+    keeps the result only if that converges cleanly (move < stop, no chatter,
+    no image held by the support guard), else returns the upwind string.
+    Where it converges it is 2-50x closer on those surfaces (0.0011 / 0.0098
+    at 20 images), but it did not converge on 7 of 24 analytic cases (soft
+    rings, 250:1 tensors), was slightly worse on 2, and on the alanine
+    dipeptide Mavg map converged on 5 of 8 channels, moved them 0.06-0.12
+    scaled units and brought none closer to the MD-refined strings (0.275 ->
+    0.283, 0.176 -> 0.186); a failed pass costs another max_iter iterations.
+    So it is not the default.  info["finish"] says which string came back
+    ("central", "upwind", or None without a tensor).
 
     `support`: an image may not move farther from the data than this scaled
     distance unless the move brings it closer, because the fitted surface
@@ -553,7 +568,7 @@ def _channel(m, relaxed, n_it, conv, info, F_ref, found_by, extra=None):
 
 
 def search(m, z_closed, z_open, n_images=20, n_channels=3, k=8, n_random=50, seed=0,
-           exclude_radius=None, same_channel_tol=None, support=None):
+           exclude_radius=None, same_channel_tol=None, support=None, finish=None):
     src, dst = nearest_center(m, z_closed), nearest_center(m, z_open)
     if src == dst:
         raise ValueError("both basins map onto the same center: the map does not separate them")
@@ -589,7 +604,8 @@ def search(m, z_closed, z_open, n_images=20, n_channels=3, k=8, n_random=50, see
     for r in routes:
         if len(channels) >= n_channels:
             break
-        relaxed, n_it, conv = relax_string(m, ends_on(m.centers[r["nodes"]], z_dst), n_images, support=support)
+        relaxed, n_it, conv = relax_string(m, ends_on(m.centers[r["nodes"]], z_dst), n_images, support=support,
+                                           finish=finish)
         info = dict(relax_string.info)
         # a relaxed route may fall into a channel already found
         if any(same(relaxed, c["anchors"]) for c in channels):
@@ -599,7 +615,8 @@ def search(m, z_closed, z_open, n_images=20, n_channels=3, k=8, n_random=50, see
     rng = np.random.default_rng(seed)
     loose = []; n_unconverged = n_frozen = n_beyond = n_chatter = 0
     for _ in range(n_random):
-        relaxed, n_it, conv = relax_string(m, ends_on(random_start(m, src, dst, rng), z_dst), n_images, support=support)
+        relaxed, n_it, conv = relax_string(m, ends_on(random_start(m, src, dst, rng), z_dst), n_images, support=support,
+                                           finish=finish)
         info = dict(relax_string.info)
         if not conv:
             n_unconverged += 1                               # not a relaxed string: it joins nothing and proves nothing
@@ -657,7 +674,7 @@ def force_noise_sd(m, z, f, f_se=None, folds=5):
 
 
 def barrier_uncertainty(m, z, f, channels, n_boot=100, frac=0.8, seed=0, f_se=None, relax=False, support=None,
-                        same=None, f_noise=None):
+                        same=None, f_noise=None, finish=None):
     """How far each channel's barrier, and their order, can be trusted.
 
     The map is refitted n_boot times, each on a random subset of the centers
@@ -738,7 +755,7 @@ def barrier_uncertainty(m, z, f, channels, n_boot=100, frac=0.8, seed=0, f_se=No
             if relax:
                 start = path.copy()
                 start[0], start[-1] = descend(mb, path[0], support), descend(mb, path[-1], support)
-                new, _, conv = relax_string(mb, start, len(path), support=support)
+                new, _, conv = relax_string(mb, start, len(path), support=support, finish=finish)
                 if not conv:
                     status[b, c] = 2; continue
                 if not same(new, path):
@@ -812,6 +829,10 @@ def main(argv=None):
     ap.add_argument("--fixed-paths", action="store_true",
                     help="read each refit's barriers along the fixed strings instead of relaxing every string again "
                          "on every refit (faster; the error then leaves out how far a route moves with the map)")
+    ap.add_argument("--central-finish", action="store_true",
+                    help="with a metric tensor: after each string converges with upwind tangents, continue with central "
+                         "tangents and keep that string if it converges (removes the O(spacing) bias of upwind tangents "
+                         "where it converges; see relax_string)")
     ap.add_argument("--no-metric-tensor", action="store_true",
                     help="relax along -grad F even if the map carries a measured metric tensor")
     ap.add_argument("--basins", required=True, help="basins.json from endpoint_analysis.py")
@@ -820,6 +841,9 @@ def main(argv=None):
     ap.add_argument("--neighbours", type=int, default=8)
     ap.add_argument("--random", type=int, default=50, help="random-start strings for the cross-check")
     ap.add_argument("--exclude-radius", type=float, help="scaled radius removed around each bottleneck")
+    ap.add_argument("--support", type=float, help="farthest an image may move from every center, scaled units "
+                    "(default: twice the median nearest-center spacing).  A string held at this edge is reported "
+                    "as not converged")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="channels")
     a = ap.parse_args(argv)
@@ -832,7 +856,8 @@ def main(argv=None):
     b = load_json(a.basins)
     try:
         res = search(m, np.array(b["closed"]["centre"]), np.array(b["open"]["centre"]), a.images, a.channels,
-                     a.neighbours, a.random, a.seed, a.exclude_radius)
+                     a.neighbours, a.random, a.seed, a.exclude_radius, support=a.support,
+                     finish="central" if a.central_finish else None)
     except ValueError as err:
         print(f"path_search: {err}")
         return 1
@@ -850,7 +875,8 @@ def main(argv=None):
         tol, sup = res["same_channel"], res["support"]
         out = barrier_uncertainty(m, zf, ff, res["channels"], a.bootstrap, seed=a.seed, f_se=fse,
                                   relax=not a.fixed_paths, support=sup,
-                                  same=lambda p, q: same_channel(m, p, q, tol, sup))
+                                  same=lambda p, q: same_channel(m, p, q, tol, sup),
+                                  finish="central" if a.central_finish else None)
         sd, holds = out[0], out[1]; noise = out[2] if len(out) > 2 else None
         st = barrier_uncertainty.stats
         for i, c in enumerate(res["channels"]):

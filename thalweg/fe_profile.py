@@ -103,6 +103,10 @@ def integrate(z, f, scale=None, s=None, at=None):
         (0.4 kcal/mol off at 0.05 of jitter, here 0.02);
       * PCHIP or Akima interpolation of the force: as accurate as this, but
         not linear in the forces.
+    On twelve driver profiles (16-36 evenly spaced images, little noise) the
+    global spline does better: rms 0.15 kcal/mol from the reference against
+    0.20 here (PCHIP 0.17, trapezoid 0.25).  Restrained-run profiles, which
+    are refined to uneven spacing and are what the gates certify, decided it.
     With fewer than four images it falls back to the trapezoid rule.
 
     s: the images' parameter values, if not path_parameter(z, scale) (the
@@ -786,8 +790,8 @@ def main(argv=None):
               f"and {B['delta_F']:.2f} +/- {B['delta_F_se']:.2f} kcal/mol")
         print(f"GATE path independence: {'PASS' if ok else 'FAIL'} (difference {d:.2f}, combined error {se:.2f}, limit {t:.1f} errors)")
         for nm, P in (("a", A), ("b", B)):
-            if not (P.get("stable", True) and P.get("resolved", True)):
-                print(f"WARNING: profile {nm} did not pass its own stability and resolution gates; this comparison rests on it")
+            if not all(P.get(g, True) for g in ("stable", "resolved", "blocks_ok", "samples_ok", "overlap_ok", "updates_ok")):
+                print(f"WARNING: profile {nm} did not pass all its own gates; this comparison rests on it")
         db = A["barrier"] - B["barrier"]
         seb = float(np.hypot(A["barrier_se"], B["barrier_se"]))
         verdict = "unresolved" if abs(db) <= t * seb else ("a is lower" if db < 0 else "b is lower")

@@ -75,7 +75,12 @@ namespace eval tw {
         step_decay  0.0
         frame_updates 100
         nblocks     10
+        plateau_span 10000
+        force_image_tol -1
     }
+    # what the restart file says the step was calibrated under (tw::dump_state,
+    # tw::restart_check); empty in a state file older than this record
+    variable saved_P {}
     variable blk {}
     variable h_signal 0.0
     variable h_noise 0.0
@@ -95,8 +100,6 @@ namespace eval tw {
     variable f_res -1.0
     variable f_noise -1.0
     variable f_clean -1.0
-    # noise per update of the across-string force, kcal/mol per scaled unit (worst image)
-    variable noise_f1 0.0
     variable p_change -1.0
     # the two measures of drift between the last two windows: each image's
     # own displacement, and the distance between the two strings as curves
@@ -130,6 +133,8 @@ namespace eval tw {
     # the force across the string over the last half of the run: rms over
     # the images, its noise (from the four blocks), and with the noise out
     variable fl_res -1.0
+    # the largest per-image long-span force (tw::long_force)
+    variable fl_image -1.0
     variable fl_noise -1.0
     variable fl_clean -1.0
     variable d_sys -1.0
@@ -157,10 +162,30 @@ namespace eval tw {
     variable PI 3.14159265358979323846
 }
 
+# Parameters that index lists or count frames must be whole numbers: a value
+# like 200.5 used to pass here and crash lindex hundreds of updates later.
 proc tw::set_param {name value} {
     variable P
     if {![info exists P($name)]} { error "thalweg: unknown parameter '$name' (known: [lsort [array names P]])" }
+    if {$name in {calibrate nblocks conv_window conv_count frame_updates curve_reach fine hist_max plateau_every
+                  evolve_ends spline polyak plateau drift_curve}} {
+        if {![string is integer -strict $value] || $value < 0} { error "thalweg: TW($name) must be a whole number >= 0, got '$value'" }
+    } elseif {$name eq "flow"} {
+        if {$value ni {metric residual}} { error "thalweg: TW(flow) must be metric or residual, got '$value'" }
+    } elseif {$name ni {pin_first pin_last}} {
+        if {![string is double -strict $value]} { error "thalweg: TW($name) must be a number, got '$value'" }
+    }
     set P($name) $value
+}
+
+# A recorded frame is runs_per_frame updates; the noise limit on the step and
+# the plateau test's span read TW(frame_updates).  A different value made both
+# silently wrong, so it is refused.
+proc tw::check_frame_updates {runs_per_frame} {
+    variable P
+    if {$P(frame_updates) != $runs_per_frame} {
+        error "thalweg: TW(frame_updates) is $P(frame_updates) but runs_per_frame is $runs_per_frame; a recorded frame is runs_per_frame updates, so leave TW(frame_updates) unset"
+    }
 }
 
 proc tw::wrap {x} {
@@ -178,7 +203,7 @@ proc tw::init {z0 scale periodic} {
     variable F_sum {}; variable F_n 0
     variable G_now {}; variable Z_sum {}; variable Z_n 0; variable prof {}
     variable f_res -1.0; variable f_noise -1.0; variable p_change -1.0; variable force_ratio -1.0
-    variable noise_f1 0.0; variable gframes {}; variable f_clean -1.0
+    variable gframes {}; variable f_clean -1.0; variable saved_P {}; variable fl_image -1.0
     variable zhist {}; variable d_sys -1.0; variable d_floor -1.0; variable f_image {}
     variable ghist {}; variable nplat 0; variable fl_res -1.0; variable fl_noise -1.0; variable fl_clean -1.0
     variable hist_chunk 1; variable hz_sum {}; variable hg_sum {}; variable hz_n 0; variable h_since 0
@@ -303,6 +328,15 @@ proc tw::accumulate {glist Mlist} {
 #                  often the ones the path runs along, then barely move: on
 #                  alanine dipeptide M's eigenvalues differ about 250-fold.
 #                  This form moves every direction on the same footing.
+#                  A FREE END image (not pinned, not held) moves against its
+#                  whole gradient in scaled units, -g (s^2 in raw units): the
+#                  residual is zero on any MFEP, so an end moved by it never
+#                  slid down into its basin (ends started half way up the walls
+#                  of a double well stayed there).  Steepest descent in the
+#                  scaled coordinates has the same units as the residual move,
+#                  so the measured step suits both; -M g would not (M's
+#                  eigenvalues span 250-fold on alanine).  An end's minimum is
+#                  a minimum whatever the metric, so it stops in the same place.
 # gscale divides the gradients first (the running sum S_g wants 1/W).
 proc tw::flow_moves {glist {gscale 1.0}} {
     variable D; variable S_M; variable W; variable P; variable z; variable scale; variable N
@@ -312,8 +346,12 @@ proc tw::flow_moves {glist {gscale 1.0}} {
         foreach e [tw::normals $z] { set nv([lindex $e 0]) [lindex $e 1] }
         for {set i 0} {$i < $N} {incr i} {
             set g {}; foreach v [lindex $glist $i] { lappend g [expr {$v / $gscale}] }
-            if {![info exists nv($i)]} { lappend out [lrepeat $D 0.0]; continue }
-            set m {}; foreach r [tw::residual_vec $g $nv($i)] sc $scale { lappend m [expr {-$r * $sc}] }
+            if {[tw::held $i] || ![info exists nv($i)]} { lappend out [lrepeat $D 0.0]; continue }
+            if {[tw::free_end $i]} {
+                set m {}; foreach v $g sc $scale { lappend m [expr {-$v * $sc * $sc}] }
+            } else {
+                set m {}; foreach r [tw::residual_vec $g $nv($i)] sc $scale { lappend m [expr {-$r * $sc}] }
+            }
             lappend out $m
         }
         return $out
@@ -351,8 +389,6 @@ proc tw::tangents {zz} {
     return $out
 }
 
-# Size, in scaled units, of the part of each move that is ACROSS the string.
-# Movement along the string is undone by respacing, so it is not progress.
 # Is image i an end that does not follow the force (pinned, or held by
 # evolve_ends 0)?  Such an end keeps whatever force its position has: that
 # force can never relax, so it must not enter the step, the memory, the noise
@@ -365,18 +401,34 @@ proc tw::held {i} {
     return 0
 }
 
-# Across-string size of each image's move per unit step, for the images that
-# follow the force (held ends are left out).
+proc tw::free_end {i} {
+    variable N
+    return [expr {($i == 0 || $i == $N - 1) && ![tw::held $i]}]
+}
+
+# The part of image img's move m (raw units, per unit step) that is progress,
+# in scaled units: for an interior image the part ACROSS the string (movement
+# along it is undone by respacing); for a free end all of it, because an end
+# that moves along the path lengthens or shortens the string, and respacing
+# keeps the ends where they are.
+proc tw::counted_move {img m t} {
+    variable scale
+    set ms {}; set dot 0.0
+    foreach v $m s $scale tt $t { set x [expr {$v / $s}]; lappend ms $x; set dot [expr {$dot + $x * $tt}] }
+    if {[tw::free_end $img]} { return $ms }
+    set q {}; foreach x $ms tt $t { lappend q [expr {$x - $dot * $tt}] }
+    return $q
+}
+
+# Size of each image's counted move per unit step (tw::counted_move), for the
+# images that follow the force (held ends are left out).
 proc tw::perp_sizes {moves} {
-    variable z; variable scale
+    variable z
     set out {}; set img -1
     foreach m $moves t [tw::tangents $z] {
         incr img
         if {[tw::held $img]} continue
-        set ms {}; set dot 0.0
-        foreach v $m s $scale tt $t { set x [expr {$v / $s}]; lappend ms $x; set dot [expr {$dot + $x * $tt}] }
-        set nn 0.0
-        foreach x $ms tt $t { set y [expr {$x - $dot * $tt}]; set nn [expr {$nn + $y * $y}] }
+        set nn 0.0; foreach y [tw::counted_move $img $m $t] { set nn [expr {$nn + $y * $y}] }
         lappend out [expr {sqrt($nn)}]
     }
     return $out
@@ -390,7 +442,7 @@ proc tw::calibrated {} { variable nacc; variable P; return [expr {$nacc >= $P(ca
 # successive updates is included.  Returns 0 when it cannot be measured.
 proc tw::noise_per_update {} {
     variable blk; variable z; variable scale; variable D; variable N; variable P
-    variable noise_f1; variable noise_ratio
+    variable noise_ratio
     set nb 0; foreach b $blk { if {[lindex $b 0] > 0} { incr nb } }
     if {$nb < 3} { return 0.0 }
     # every block's mean gradient -> its move at unit step -> scaled -> across the string
@@ -400,34 +452,29 @@ proc tw::noise_per_update {} {
         lassign $b cnt sums
         if {$cnt == 0} continue
         set moves [tw::flow_moves $sums $cnt]
-        set pv {}; set fv {}
+        set pv {}
         for {set img 0} {$img < $N} {incr img} {
-            if {[tw::held $img]} { lappend pv {}; lappend fv {}; continue }
-            set t [lindex $tans $img]; set ms {}; set dot 0.0
-            foreach v [lindex $moves $img] sc $scale tt $t { set u [expr {$v / $sc}]; lappend ms $u; set dot [expr {$dot + $u * $tt}] }
-            set q {}; foreach u $ms tt $t { lappend q [expr {$u - $dot * $tt}] }
-            lappend pv $q
-            # the same, as a force (the residual flow's move already is one)
-            lappend fv [expr {$P(flow) eq "residual" ? $q : [tw::solve [tw::mobility_matrix $img] $q]}]
+            if {[tw::held $img]} { lappend pv {}; continue }
+            lappend pv [tw::counted_move $img [lindex $moves $img] [lindex $tans $img]]
         }
-        lappend pvs $pv; lappend fvs $fv; lappend lens $cnt
+        lappend pvs $pv; lappend lens $cnt
     }
     lassign [tw::block_noise $pvs $lens] n1 n2
-    lassign [tw::block_noise $fvs $lens] f1 f2
     # Blocks shorter than the time over which the force stays correlated make
     # the noise look smaller than it is, and the step then comes out too
     # large.  Blocks twice as long (neighbours merged) give a second
     # estimate; the larger of the two is used, and their ratio is kept.
     set noise_ratio [expr {$n1 > 0 && $n2 > 0 ? $n2 / $n1 : -1.0}]
-    set noise_f1 [expr {$f2 > $f1 ? $f2 : $f1}]
     return [expr {$n2 > $n1 ? $n2 : $n1}]
 }
 
 # Noise per update of a vector quantity given as block means (vecs: per
 # block, per image, a vector or {} for a held image; lens: updates per
-# block): the rms over the images of sqrt(variance of a block mean x block
-# length).  Returns that, and the same from blocks twice as long (0 when
-# fewer than three such blocks exist).
+# block): the LARGEST over the images of sqrt(variance of a block mean x
+# block length).  (It was the rms over the images, which let one noisy image
+# among 24 count for a fifth of its noise; the step's promise is per image.)
+# Returns that, and the same from blocks twice as long (0 when fewer than
+# three such blocks exist).
 proc tw::block_noise {vecs lens} {
     set out {}
     foreach level {1 2} {
@@ -449,7 +496,7 @@ proc tw::block_noise {vecs lens} {
         set n [llength $V]
         if {$n < 3} { lappend out 0.0; continue }
         set len 0.0; foreach l $Ln { set len [expr {$len + $l}] }
-        set tot 0.0; set nimg 0
+        set worst 0.0
         set nI [llength [lindex $V 0]]
         for {set img 0} {$img < $nI} {incr img} {
             if {[llength [lindex $V 0 $img]] == 0} continue
@@ -459,9 +506,10 @@ proc tw::block_noise {vecs lens} {
                 set m [expr {$m / $n}]
                 foreach v $V { set sq [expr {$sq + pow([lindex $v $img $d] - $m, 2)}] }
             }
-            set tot [expr {$tot + $sq / ($n - 1) * ($len / $n)}]; incr nimg
+            set v [expr {$sq / ($n - 1) * ($len / $n)}]
+            if {$v > $worst} { set worst $v }
         }
-        lappend out [expr {$nimg ? sqrt($tot / $nimg) : 0.0}]
+        lappend out [expr {sqrt($worst)}]
     }
     return $out
 }
@@ -599,19 +647,24 @@ proc tw::advance {} {
     variable z; variable h; variable P; variable N
     if {![tw::calibrated]} { return [dict create moved 0 h 0.0 perp 0.0 factor 1] }
     set factor 1
-    set moves [tw::raw_move]
+    # the move from the AVERAGED force: needed to set the step, and to move
+    # on when polyak is off; not worked out on the updates that do not use it
+    set moves {}
+    if {$h == 0.0 || !$P(polyak)} { set moves [tw::raw_move] }
     if {$h == 0.0} {
         # set the step once, from forces averaged while the string stood still
         variable h_signal; variable h_noise; variable noise1
         set big 0.0
         foreach v [tw::perp_sizes $moves] { if {$v > $big} { set big $v } }
-        if {$big <= 0.0} { error "thalweg: the averaged force across the string is exactly zero; cannot set a step" }
-        set h_signal [expr {$P(max_move) / $big}]
+        if {$big <= 0.0 && $P(stepsize) <= 0} { error "thalweg: the averaged force across the string is exactly zero; cannot set a step (set TW(stepsize) to give one by hand)" }
+        set h_signal [expr {$big > 0 ? $P(max_move) / $big : 0.0}]
         set noise1 [tw::noise_per_update]
         # a random walk of the noise alone over one drift-test window
         set h_noise [expr {$noise1 > 0 ? $P(noise_frac) * $P(conv_tol) / ($noise1 * sqrt($P(conv_window) * $P(frame_updates))) : $h_signal}]
         if {$P(stepsize) > 0} { set h $P(stepsize) } else { set h [expr {$h_noise < $h_signal ? $h_noise : $h_signal}] }
         variable h0; set h0 $h
+        # what the step was set under, for a restart to check (tw::restart_check)
+        variable saved_P; set saved_P [tw::step_params]
         set tw::step_factor 1
         # (An earlier version lengthened the force-averaging memory here, up
         # to 10,000 updates, and multiplied the MD steps per update, so that
@@ -621,15 +674,19 @@ proc tw::advance {} {
         # stopping test now measures the force over the last window of
         # frames and allows for its own noise; see tw::record_frame.)
     }
-    # Once the string has passed the plateau test (it is at rest under the
-    # constant step), the step may shrink: h = h0 (n_rest / n)^step_decay.
-    # A constant step leaves the string wandering by an amount set by the
-    # step, and its average biased by as much; a step that shrinks as a
-    # power between 1/2 and 1 of the update count removes both (Robbins and
-    # Monro).  It is NOT shrunk before the string is at rest: a string with
-    # a vanishing step looks at rest wherever it is.
+    # Once the string is at rest (the plateau and force tests have passed and
+    # held, tw::record_frame sets n_rest), the step may shrink:
+    # h = h0 (n_rest / n)^step_decay.  A constant step leaves the string
+    # wandering by an amount set by the step, and its average biased by as
+    # much; a step that shrinks as a power between 1/2 and 1 of the update
+    # count removes both (Robbins and Monro).  It is NOT shrunk before the
+    # string is at rest: a string with a vanishing step looks at rest
+    # wherever it is.  If the plateau test later fails, n_rest is cleared and
+    # the step goes back to h0.
     variable h0; variable n_rest; variable nacc
-    if {$P(step_decay) > 0 && $n_rest > 0 && $h0 > 0} { set h [expr {$h0 * pow(double($n_rest) / $nacc, $P(step_decay))}] }
+    if {$P(step_decay) > 0 && $h0 > 0} {
+        if {$n_rest > 0} { set h [expr {$h0 * pow(double($n_rest) / $nacc, $P(step_decay))}] } else { set h $h0 }
+    }
     # the images move on this update's own force; the averaged one is kept
     # for the stopping test only
     if {$P(polyak)} { set moves [tw::inst_move] }
@@ -739,8 +796,13 @@ proc tw::mean_string {fr first last} {
 
 # Add one frame to the history the plateau and force tests read.  Frames are
 # kept as means over chunks of hist_chunk frames; when there are hist_max
-# chunks, neighbours are merged and the chunk length doubles, so the history
-# and the restart file that carries it stay bounded however long the run.
+# chunks (at least 64, so that the plateau test's sixteen half-blocks have
+# two entries each), neighbours are merged and the chunk length doubles, so
+# the history and the restart file that carries it stay bounded however long
+# the run.  With an odd number of entries the newest has no partner: it goes
+# back into the chunk in the making, as the frames it stands for (it used to
+# be dropped).  Merging repeats until the history is under the cap (a
+# restart with a smaller hist_max needs more than one pass).
 # Returns 1 when a chunk was completed.
 proc tw::history_add {zf gf} {
     variable zhist; variable ghist; variable hist_chunk; variable hz_sum; variable hg_sum; variable hz_n; variable h_since
@@ -758,8 +820,22 @@ proc tw::history_add {zf gf} {
     lappend zhist [tw::scale_string $hz_sum [expr {1.0 / $hz_n}]]
     lappend ghist [expr {[llength $hg_sum] ? [tw::scale_string $hg_sum [expr {1.0 / $hz_n}]] : {}}]
     set hz_n 0; set hz_sum {}; set hg_sum {}
-    set cap [expr {$P(hist_max) < 16 ? 16 : $P(hist_max) - $P(hist_max) % 2}]
-    if {[llength $zhist] >= $cap} {
+    set cap [expr {$P(hist_max) < 64 ? 64 : $P(hist_max) - $P(hist_max) % 2}]
+    while {[llength $zhist] >= $cap} {
+        if {[llength $zhist] % 2} {
+            # the newest entry, hist_chunk frames, goes back to the chunk in the making
+            set zl [lindex $zhist end]; set gl [lindex $ghist end]
+            set zhist [lrange $zhist 0 end-1]; set ghist [lrange $ghist 0 end-1]
+            set zs [tw::scale_string $zl $hist_chunk]
+            set gs [expr {[llength $gl] ? [tw::scale_string $gl $hist_chunk] : {}}]
+            if {$hz_n == 0} {
+                set hz_sum $zs; set hg_sum $gs
+            } else {
+                set hz_sum [tw::add_strings $zs $hz_sum]
+                set hg_sum [expr {[llength $gs] && [llength $hg_sum] ? [tw::add_strings $gs $hg_sum] : {}}]
+            }
+            incr hz_n $hist_chunk
+        }
         set nz {}; set ng {}
         for {set i 0} {$i + 1 < [llength $zhist]} {incr i 2} {
             lappend nz [tw::scale_string [tw::add_strings [lindex $zhist $i] [lindex $zhist [expr {$i + 1}]]] 0.5]
@@ -782,48 +858,96 @@ proc tw::scale_string {a f} {
 }
 
 # THE PLATEAU TEST.  A string that moves on a noisy force with a constant
-# step never stands still: it wanders about its resting place, and on the
-# alanine dipeptide strings that wander is 0.06 to 0.07 scaled units (rms
-# over the images) between the means of any two neighbouring stretches of
-# the run, however long the stretches.  A string that is still relaxing, or
-# whose free end is creeping, shows the same number between neighbours, so a
-# test on neighbouring windows cannot tell the two apart.  What does differ
-# is how far apart stretches are that lie FAR from each other in the run.
+# step never stands still: it wanders about its resting place.  The test asks
+# whether, over the last half of the frames recorded since calibration, the
+# string has stayed in one place to within plateau_tol (scaled units), as a
+# curve, image by image.
 #
-# The last half of the frames recorded since calibration is cut into four
-# equal blocks.  For every image, g2 is its squared distance (as a curve,
-# tw::image_curve_sq) between the first block's mean string and the last's,
-# and f2 the same between neighbouring blocks, averaged over the three
-# pairs.  Wander alone gives g2 about equal to f2; steady movement of v per
-# block gives g2 - f2 = 8 v^2.  The test statistic is the largest
-# sqrt(g2 - f2) over the images: the movement over the last half of the run
-# that the string's own wander does not explain.  Slow wander (slower than a
-# block) counts as movement, which errs on the side of running on.
-# Returns {systematic floor}, or {-1 -1} with fewer than 8 x conv_window frames.
+# That half is cut into eight equal blocks.  For every image, P is the
+# LARGEST squared distance (as a curve, tw::image_curve_sq) between the mean
+# strings of any two of the blocks, and e2 the squared distance that the
+# noise alone puts between two block means, measured inside the blocks: half
+# the mean squared distance between the two halves of each block.  The test
+# statistic is the largest sqrt(P - e2) over the images; the wander, also
+# reported, is the largest sqrt(e2).  Both must be below plateau_tol.
+#
+# Why this and not what came before (sqrt of first-block-vs-last-block
+# distance squared less the mean neighbour-block distance squared, over four
+# blocks), which the third review broke in every way it tried:
+#   - out-and-back motion: blocks a b b a read zero; any two blocks, not just
+#     the first and last, now count;
+#   - oscillation slower than a block: the neighbour term grew with it and
+#     cancelled it; the noise is now measured inside blocks, where motion
+#     slower than a block barely shows, and if it does show (motion about as
+#     fast as a block) the wander gate fails instead;
+#   - a slow creep, a random walk, a creeping end: the earliest verdict came
+#     after 8 x conv_window frames, so the span was 80 frames and a creep of
+#     0.0015 a frame read as 0.08.  The span must now also cover
+#     plateau_span updates, which fixes the slowest creep the test can see:
+#     about plateau_tol / plateau_span per update (with the defaults 2e-5
+#     scaled units per update; on alanine dipeptide with a step of 3e-4 that
+#     is the drift a force of 0.07 kcal/mol per scaled unit would cause, a
+#     quarter of force_tol).  Slower creep passes, by construction.
+# A string whose wander is itself near plateau_tol cannot be told from one
+# that moves by that much: it stops only once the blocks are long enough to
+# average the wander down (a resting string whose block means scatter by
+# 0.4 never stops in a short run; that is the test working, not failing).
+# Returns {systematic wander}, or {-1 -1} while the history is too short:
+# fewer than 8 x conv_window frames, a half shorter than plateau_span
+# updates, or fewer than two entries per block.
 proc tw::plateau {} {
     variable zhist; variable P; variable hist_chunk
-    set k [llength $zhist]
-    set L [expr {$k / 8}]
-    if {$L * $hist_chunk < $P(conv_window) || $L < 1} { return {-1.0 -1.0} }
-    set Q {}
-    for {set j 0} {$j < 4} {incr j} {
-        set first [expr {$k - (4 - $j) * $L}]
-        lappend Q [tw::mean_string $zhist $first [expr {$first + $L - 1}]]
+    set k [llength $zhist]; set B 8
+    set L [expr {$k / (2 * $B)}]
+    set kf [expr {$k * $hist_chunk}]
+    if {$L < 2 || $kf < 8 * $P(conv_window) || 0.5 * $kf * $P(frame_updates) < $P(plateau_span)} { return {-1.0 -1.0} }
+    set k0 [expr {$k - $B * $L}]; set hl [expr {$L / 2}]
+    set Q {}; set FQ {}; set e2 {}
+    for {set j 0} {$j < $B} {incr j} {
+        set f [expr {$k0 + $j * $L}]
+        set q [tw::mean_string $zhist $f [expr {$f + $L - 1}]]
+        lappend Q $q; lappend FQ [tw::fine_curve $q]
+        set a [tw::mean_string $zhist $f [expr {$f + $hl - 1}]]
+        set b [tw::mean_string $zhist [expr {$f + $L - $hl}] [expr {$f + $L - 1}]]
+        set d [tw::image_curve_sq_f $a [tw::fine_curve $a] $b [tw::fine_curve $b]]
+        if {$j == 0} { set e2 $d } else { set t {}; foreach x $e2 y $d { lappend t [expr {$x + $y}] }; set e2 $t }
     }
-    set g2 [tw::image_curve_sq [lindex $Q 0] [lindex $Q 3]]
-    set f2 [lrepeat [llength $g2] 0.0]
-    for {set j 0} {$j < 3} {incr j} {
-        set t {}
-        foreach a $f2 b [tw::image_curve_sq [lindex $Q $j] [lindex $Q [expr {$j + 1}]]] { lappend t [expr {$a + $b / 3.0}] }
-        set f2 $t
+    set t {}; foreach x $e2 { lappend t [expr {$x / (2.0 * $B)}] }; set e2 $t
+    set big [lrepeat [llength $e2] 0.0]
+    for {set j 0} {$j < $B} {incr j} {
+        for {set l [expr {$j + 1}]} {$l < $B} {incr l} {
+            set d [tw::image_curve_sq_f [lindex $Q $j] [lindex $FQ $j] [lindex $Q $l] [lindex $FQ $l]]
+            set t {}; foreach x $big y $d { lappend t [expr {$y > $x ? $y : $x}] }; set big $t
+        }
     }
     set worst 0.0; set fl 0.0
-    foreach a $g2 b $f2 {
-        set m [expr {$a > $b ? sqrt($a - $b) : 0.0}]
+    foreach p $big e $e2 {
+        set m [expr {$p > $e ? sqrt($p - $e) : 0.0}]
         if {$m > $worst} { set worst $m }
-        set fl [expr {$fl + $b}]
+        if {sqrt($e) > $fl} { set fl [expr {sqrt($e)}] }
     }
-    return [list $worst [expr {sqrt($fl / [llength $f2])}]]
+    return [list $worst $fl]
+}
+
+# A string's fine curve (as tw::image_curve_sq builds it), and the per-image
+# squared curve distances from two strings and their fine curves, so that a
+# block's curve is built once and not once per pair.
+proc tw::fine_curve {A} {
+    variable P
+    return [tw::reparam $A [expr {([llength $A] - 1) * ($P(spline) ? $P(fine) : 1) + 1}]]
+}
+proc tw::image_curve_sq_f {A fa B fb} {
+    variable P
+    set per [expr {([llength $fa] - 1) / ([llength $A] - 1)}]; set w [expr {$P(curve_reach) * $per}]
+    set out {}; set i 0
+    foreach pa $A pb $B {
+        set c [expr {$i * $per}]
+        set u [tw::point_to_curve $pb $fa [expr {$c - $w}] [expr {$c + $w}]]
+        set v [tw::point_to_curve $pa $fb [expr {$c - $w}] [expr {$c + $w}]]
+        lappend out [expr {($u * $u + $v * $v) / 2.0}]
+        incr i
+    }
+    return $out
 }
 
 # THE FORCE LEFT ACROSS THE STRING, over the same span as the plateau test:
@@ -832,8 +956,9 @@ proc tw::plateau {} {
 # string does not balance (tw::residual_vec, with the normal taken on the
 # span's mean string) is averaged over each block; the mean of the four is
 # the residual and their scatter its noise.  Returns {rms noise clean} over
-# the images and sets tw::f_image to {image clean} pairs; -1s when there is
-# too little history or no forces were recorded.
+# the images and sets tw::f_image to {image clean} pairs (tw::fl_image is
+# the largest of them); -1s when there is too little history or no forces
+# were recorded.  At a free end the whole gradient counts (tw::force_vec).
 #
 # A window of ten or twenty frames is too short for this: on the alanine
 # dipeptide strings the noise-corrected number then swings between 0.2 and
@@ -845,8 +970,8 @@ proc tw::plateau {} {
 # a force left, not one that is still relaxing; why it is left is not
 # established.
 proc tw::long_force {} {
-    variable zhist; variable ghist; variable P; variable D; variable f_image; variable hist_chunk
-    set k [llength $zhist]; set L [expr {$k / 8}]
+    variable zhist; variable ghist; variable P; variable D; variable f_image; variable hist_chunk; variable fl_image
+    set k [llength $zhist]; set L [expr {$k / 8}]; set fl_image -1.0
     if {$L * $hist_chunk < $P(conv_window) || $L < 1 || [llength $ghist] != $k} { return {-1.0 -1.0 -1.0} }
     set k0 [expr {$k - 4 * $L}]
     for {set f $k0} {$f < $k} {incr f} { if {[llength [lindex $ghist $f]] != [llength [lindex $zhist $f]]} { return {-1.0 -1.0 -1.0} } }
@@ -858,7 +983,7 @@ proc tw::long_force {} {
         lassign $e img n
         set sum [lrepeat $D 0.0]; set sq [lrepeat $D 0.0]
         foreach g $gb {
-            set r [tw::residual_vec [lindex $g $img] $n]
+            set r [tw::force_vec $img [lindex $g $img] $n]
             set ns {}; set nq {}
             foreach a $sum b $sq c $r { lappend ns [expr {$a + $c}]; lappend nq [expr {$b + $c * $c}] }
             set sum $ns; set sq $nq
@@ -870,18 +995,21 @@ proc tw::long_force {} {
             set vi [expr {$vi + ($b / 4.0 - $mean * $mean) / 3.0}]
         }
         set tot [expr {$tot + $ti}]; set vtot [expr {$vtot + $vi}]
-        lappend f_image [list $img [expr {$ti > $vi ? sqrt($ti - $vi) : 0.0}]]
+        set fi [expr {$ti > $vi ? sqrt($ti - $vi) : 0.0}]
+        lappend f_image [list $img $fi]
+        if {$fi > $fl_image} { set fl_image $fi }
         incr m
     }
-    if {$m == 0} { return {0.0 0.0 0.0} }
+    if {$m == 0} { set fl_image 0.0; return {0.0 0.0 0.0} }
     set clean [expr {($tot - $vtot) / $m}]
     return [list [expr {sqrt($tot / $m)}] [expr {$vtot > 0 ? sqrt($vtot / $m) : 0.0}] [expr {$clean > 0 ? sqrt($clean) : 0.0}]]
 }
 
 # Convergence needs FOUR things, all for conv_count frames in a row.
 #
-#   drift    over the last half of the run no image has moved, beyond the
-#            string's own wander, by plateau_tol or more (tw::plateau; with
+#   drift    over the last half of the run no image's block means differ,
+#            beyond their own noise, by plateau_tol or more, and that noise
+#            is below plateau_tol too (tw::plateau; with
 #            plateau 0, the older test: the window-averaged string has moved
 #            less than conv_tol between consecutive windows, which on real
 #            runs sits at the wander and passes or fails by chance);
@@ -889,7 +1017,8 @@ proc tw::long_force {} {
 #            (tw::long_force; with plateau 0, over the last window of
 #            frames), rms over the images that follow the force and with
 #            the noise in that number taken out, is below force_tol
-#            (kcal/mol per scaled unit; 0.3 is half of kT at 300 K);
+#            (kcal/mol per scaled unit; 0.3 is half of kT at 300 K), no
+#            image's is above force_image_tol, and it was measured at all;
 #   profile  the free-energy profile from the forces of one window and of
 #            the next agree to within profile_tol (kcal/mol) at every image;
 #   age      both windows lie after the calibration period.
@@ -970,7 +1099,7 @@ proc tw::record_frame {{zf {}} {gf {}}} {
         if {$P(plateau)} { lassign [tw::long_force] fl_res fl_noise fl_clean }
         set evaluated [expr {$d_sys >= 0}]
     }
-    set drift_ok [expr {$P(plateau) ? ($d_sys >= 0 && $d_sys < $P(plateau_tol)) : ($worst < $P(conv_tol))}]
+    set drift_ok [expr {$P(plateau) ? ($d_sys >= 0 && $d_sys < $P(plateau_tol) && $d_floor < $P(plateau_tol)) : ($worst < $P(conv_tol))}]
     # the profile of one window against the next
     variable p_change
     set p_change -1.0; set have 1; set p_sig 0
@@ -1011,10 +1140,20 @@ proc tw::record_frame {{zf {}} {gf {}}} {
         variable f_image; set keep $f_image
         lassign [tw::window_force $w] f_res f_noise f_clean
         set f_image $keep
-        set force_ok [expr {$P(force_tol) <= 0 || $fl_res < 0 || $fl_clean <= $P(force_tol)}]
+        # No measurement is not a pass (it was).  And the rms over the images
+        # let one image carry force_tol x sqrt(images): one image at 1.0 among
+        # twelve stopped.  So no image may exceed force_image_tol either
+        # (default three times force_tol, 0.9: replaying the five converged
+        # alanine runs' recorded forces, with the metric tensor of an earlier
+        # run on the same channel, the largest per-image force over their
+        # last halves was 0.67, and 0.64 at a stop; twice force_tol would have
+        # refused two of the five).
+        variable fl_image
+        set itol [expr {$P(force_image_tol) < 0 ? 3.0 * $P(force_tol) : $P(force_image_tol)}]
+        set force_ok [expr {$P(force_tol) <= 0 || ($fl_res >= 0 && $fl_clean <= $P(force_tol) && ($itol <= 0 || $fl_image <= $itol))}]
     } else {
         lassign [tw::window_force $w] f_res f_noise f_clean
-        set force_ok [expr {$P(force_tol) <= 0 || $f_res < 0 || $f_clean <= $P(force_tol)}]
+        set force_ok [expr {$P(force_tol) <= 0 || ($f_res >= 0 && $f_clean <= $P(force_tol))}]
     }
     set force_ratio [expr {$f_noise > 0 ? $f_res / $f_noise : -1.0}]
     # both windows must lie after the calibration period, when the string stood still
@@ -1029,15 +1168,23 @@ proc tw::record_frame {{zf {}} {gf {}}} {
         # half of the run, so three of them in a row is one verdict, not
         # three: a string still creeping passed that way at its very first
         # evaluations and failed a few thousand updates later.
-        variable k_pass; variable hist_chunk
+        # A stop, and the start of step_decay, happen only on a frame on which
+        # the tests were evaluated (the hold used to complete on a frame up to
+        # plateau_every - 1 frames after the evaluation it rested on): nconv
+        # rises only there, and in between keeps its value unless the
+        # profile test fails.  The
+        # step decays once plateau, force and hold have all passed (not on a
+        # single plateau pass), and goes back to h0 when the plateau fails.
+        variable k_pass; variable hist_chunk; variable n_rest
         set kf [expr {[llength $zhist] * $hist_chunk}]
+        if {!$prof_ok} { set nconv 0 }
         if {$evaluated} {
             if {$drift_ok && $force_ok && $aged} { incr nplat; if {$k_pass < 0} { set k_pass $kf } } else { set nplat 0; set k_pass -1 }
+            set held [expr {$k_pass >= 0 && $kf >= (1.0 + $P(plateau_hold)) * $k_pass}]
+            if {$held && $n_rest < 0} { set n_rest $nacc }
+            if {!$drift_ok && $n_rest >= 0} { set n_rest -1 }
+            set nconv [expr {$prof_ok && $held ? $nplat : 0}]
         }
-        set held [expr {$k_pass >= 0 && $kf >= (1.0 + $P(plateau_hold)) * $k_pass}]
-        variable n_rest
-        if {$evaluated && $drift_ok && $aged && $n_rest < 0} { set n_rest $nacc }
-        set nconv [expr {$prof_ok && $held ? $nplat : 0}]
     } elseif {$drift_ok && $force_ok && $prof_ok && $aged} { incr nconv } else { set nconv 0 }
     return $worst
 }
@@ -1137,17 +1284,14 @@ proc tw::to_force {i mv} {
     return [expr {sqrt($s)}]
 }
 
-# Across-string part of each free image's scaled move, as a vector.
+# Counted part (tw::counted_move) of each free image's scaled move, as a vector.
 proc tw::perp_vectors {moves} {
-    variable z; variable scale
+    variable z
     set out {}; set img -1
     foreach m $moves t [tw::tangents $z] {
         incr img
         if {[tw::held $img]} continue
-        set ms {}; set dot 0.0
-        foreach v $m s $scale tt $t { set u [expr {$v / $s}]; lappend ms $u; set dot [expr {$dot + $u * $tt}] }
-        set pv {}; foreach u $ms tt $t { lappend pv [expr {$u - $dot * $tt}] }
-        lappend out [list $img $pv]
+        lappend out [list $img [tw::counted_move $img $m $t]]
     }
     return $out
 }
@@ -1226,6 +1370,16 @@ proc tw::residual_vec {g n} {
     return $r
 }
 
+# The force that should not be there at image img, scaled units: the residual
+# (tw::residual_vec) inside the string; at a free end the whole gradient,
+# because a free end comes to rest at a minimum, where the gradient vanishes
+# (tw::flow_moves).
+proc tw::force_vec {img g n} {
+    variable scale
+    if {[tw::free_end $img]} { set out {}; foreach v $g s $scale { lappend out [expr {$v * $s}] }; return $out }
+    return [tw::residual_vec $g $n]
+}
+
 # Residual force across the string at each image that follows the force,
 # from the running average of the gradient (kcal/mol per scaled unit).
 proc tw::residual_forces {} {
@@ -1234,7 +1388,7 @@ proc tw::residual_forces {} {
     foreach e [tw::normals $z] {
         lassign $e img n
         set g {}; foreach v [lindex $S_g $img] { lappend g [expr {$v / $W}] }
-        set s 0.0; foreach c [tw::residual_vec $g $n] { set s [expr {$s + $c * $c}] }
+        set s 0.0; foreach c [tw::force_vec $img $g $n] { set s [expr {$s + $c * $c}] }
         lappend out [expr {sqrt($s)}]
     }
     return $out
@@ -1262,7 +1416,7 @@ proc tw::window_force {w} {
         lassign $e img n
         set sum [lrepeat $D 0.0]; set sq [lrepeat $D 0.0]
         foreach g $gs {
-            set r [tw::residual_vec [lindex $g $img] $n]
+            set r [tw::force_vec $img [lindex $g $img] $n]
             set ns {}; set nq {}
             foreach a $sum b $sq c $r { lappend ns [expr {$a + $c}]; lappend nq [expr {$b + $c * $c}] }
             set sum $ns; set sq $nq
@@ -1299,15 +1453,84 @@ proc tw::frame_force {} {
     return [list $n $out]
 }
 
+# The parameters the step is set under.  flow and calibrate change what the
+# step means or when it is set; the others only set its size.
+proc tw::step_params {} {
+    variable P
+    set out {}
+    foreach k {flow calibrate nblocks frame_updates max_move noise_frac conv_tol conv_window polyak stepsize} { lappend out $k $P($k) }
+    return $out
+}
+
 proc tw::dump_state {} {
+    variable h
     set out ""
     foreach v {N D scale periodic z S_g S_M W h nacc frames nconv blk h_signal h_noise noise1 force_ratio F_sum F_n
-               G_now Z_sum Z_n prof f_res f_noise p_change noise_f1 gframes f_clean d_image d_curve
-               zhist d_sys d_floor f_image ghist nplat fl_res fl_noise fl_clean
+               G_now Z_sum Z_n prof f_res f_noise p_change gframes f_clean d_image d_curve
+               zhist d_sys d_floor f_image ghist nplat fl_res fl_noise fl_clean fl_image
                hist_chunk hz_sum hg_sum hz_n h_since h0 n_rest noise_ratio k_pass} {
         append out [list set tw::$v [set tw::$v]] "\n"
     }
     # the memory may have been lengthened at calibration; keep that choice
     append out [list set tw::P(memory) $tw::P(memory)] "\n"
+    # what the step was set under (before calibration ends: what it will be set under)
+    append out [list set tw::saved_P [expr {$h > 0 && [llength $tw::saved_P] ? $tw::saved_P : [tw::step_params]}]] "\n"
     return $out
+}
+
+# Load a state written by tw::dump_state, by this version or an older one.
+# What an older file does not carry is set first: no step record (it ran the
+# metric flow, the only one there was), no rest point, and h0 taken from h
+# (before step_decay existed the step never changed after calibration;
+# without this, step_decay was silently off on such a restart).
+proc tw::load_state {script} {
+    foreach {v x} {saved_P {} h0 -1.0 n_rest -1 k_pass -1 nplat 0 fl_image -1.0 hist_chunk 1 hz_sum {} hg_sum {} hz_n 0 h_since 0
+                   zhist {} ghist {} noise_ratio -1.0 d_sys -1.0 d_floor -1.0 fl_res -1.0 fl_noise -1.0 fl_clean -1.0} {
+        set tw::$v $x
+    }
+    uplevel #0 $script
+    if {$tw::h0 < 0} { set tw::h0 $tw::h }
+    if {[llength $tw::saved_P] == 0 && $tw::h > 0} { set tw::saved_P {flow metric} }
+}
+
+# The flow the loaded state ran (an older state: metric); {} before calibration.
+proc tw::state_flow {} {
+    variable saved_P; variable h
+    if {$h <= 0} { return {} }
+    if {[dict exists $saved_P flow]} { return [dict get $saved_P flow] }
+    return metric
+}
+
+# After a restart, with the config's parameters applied: refuse what would
+# make the calibrated step wrong, and report what no longer matches it.
+#   flow      the two flows' steps differ by up to the spread of M's
+#             eigenvalues (250-fold on alanine); a step calibrated under one
+#             moved strings up to 250 times too far under the other.
+#   calibrate when the step is set and how the noise blocks are cut.
+#   frame_updates  the history's frames and the plateau span are counted in it.
+#   nblocks   (only while still calibrating) how the noise blocks are cut.
+# max_move, noise_frac, conv_tol, conv_window, polyak and stepsize only set
+# the step's size, which is already set: a change has no effect and is
+# reported.  Returns the report ({} when all match).
+proc tw::restart_check {} {
+    variable saved_P; variable P; variable h
+    set warn {}
+    set sf [tw::state_flow]
+    if {$sf ne {} && $sf ne $P(flow)} {
+        error "thalweg: the restart state's step was calibrated under TW(flow) $sf[expr {[dict exists $saved_P flow] ? {} : { (a state file from before TW(flow) existed)}}]; this run asks for TW(flow) $P(flow).  Continue it with TW(flow) $sf, or start a new run."
+    }
+    foreach k {calibrate frame_updates nblocks} {
+        if {$k eq "nblocks" && $h > 0} continue
+        if {[dict exists $saved_P $k] && [dict get $saved_P $k] != $P($k)} {
+            error "thalweg: the restart state was run with TW($k) [dict get $saved_P $k]; this run asks for $P($k).  Continue it with [dict get $saved_P $k], or start a new run."
+        }
+    }
+    if {$h > 0} {
+        foreach k {max_move noise_frac conv_tol conv_window polyak stepsize} {
+            if {[dict exists $saved_P $k] && [dict get $saved_P $k] != $P($k)} {
+                lappend warn "TW($k) is $P($k) but the step was calibrated with [dict get $saved_P $k]; the step stays $h"
+            }
+        }
+    }
+    return [join $warn "; "]
 }

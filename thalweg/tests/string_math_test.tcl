@@ -120,13 +120,16 @@ proc run_string {z0 scale periodic shift maxit} {
     }
     return [list $it $first_perp $stop]
 }
-foreach {k v} {memory 100 calibrate 200 max_move 0.004 conv_window 8 conv_tol 0.06 conv_count 3} { tw::set_param $k $v }
+# (plateau_span: this surface relaxes in a few thousand updates; the default
+#  is for proteins and would hold these runs to the cap)
+foreach {k v} {memory 100 calibrate 200 max_move 0.004 conv_window 8 conv_tol 0.06 conv_count 3 plateau_span 2000} { tw::set_param $k $v }
 set z0 {}; for {set i 0} {$i < 14} {incr i} { set s [expr {$i / 13.0}]; lappend z0 [list [expr {-1 + 2 * $s}] [expr {0.9 * sin($PI * $s) * (1 + 0.3 * sin(9 * $s))}]] }
 lassign [run_string $z0 {1.0 1.0} {0 0} 0.0 20000] it first_perp stop
 check "stopped by its own drift test, not by the iteration cap (after $it updates)" [expr {$stop && $it < 20000}]
 check "step is the smaller of the signal and noise limits" [expr {abs($tw::h - min($tw::h_signal, $tw::h_noise)) < 1e-15 && $tw::h_noise > 0 && $tw::h_signal > 0}]
 check "first move no larger than requested ($first_perp)" [expr {$first_perp <= 0.004 + 1e-12}]
-check "measured force noise per update is about the 4.0 put in ($tw::noise1)" [expr {$tw::noise1 > 2.5 && $tw::noise1 < 6.0}]
+# the worst image's, and at a free end both directions count: 4 sqrt(2) = 5.7
+check "measured force noise per update is about the 4.0 sqrt(2) put in at a free end ($tw::noise1)" [expr {$tw::noise1 > 4.5 && $tw::noise1 < 8.5}]
 set worst 0.0; set top -1e9
 foreach p [lrange [tw::final_string] 1 end-1] { set d [expr {abs(hypot([lindex $p 0], [lindex $p 1]) - 1.0)}]; if {$d > $worst} { set worst $d }; set v [V {*}$p]; if {$v > $top} { set top $v } }
 check "interior images on the ring to within 0.12 (worst $worst)" [expr {$worst < 0.12}]
@@ -154,7 +157,7 @@ set NOISE 25.0
 foreach {k v} {frame_updates 25 force_tol 2.0} { tw::set_param $k $v }
 lassign [run_string $z0 {1.0 1.0} {0 0} 0.0 60000] it3 fp3 stop3
 check "heavy noise: the noise limit set the step ($tw::h_noise < $tw::h_signal)" [expr {$tw::h_noise < $tw::h_signal && abs($tw::h - $tw::h_noise) < 1e-15}]
-check "heavy noise: measured noise is about the 25 put in ($tw::noise1)" [expr {$tw::noise1 > 15 && $tw::noise1 < 38}]
+check "heavy noise: measured noise is about the 25 sqrt(2) put in at a free end ($tw::noise1)" [expr {$tw::noise1 > 28 && $tw::noise1 < 53}]
 check "heavy noise: still stops by its drift test (after $it3 updates)" [expr {$stop3 && $it3 < 60000}]
 set worst 0.0
 foreach p [lrange [tw::final_string] 1 end-1] { set d [expr {abs(hypot([lindex $p 0], [lindex $p 1]) - 1.0)}]; if {$d > $worst} { set worst $d } }
@@ -281,7 +284,7 @@ proc Mat {x} { set ph [expr {0.5 + 0.8 * $x}]; set c [expr {cos($ph)}]; set s [e
     return [list [expr {$c * $c + $A * $s * $s}] [expr {(1 - $A) * $c * $s}] [expr {(1 - $A) * $c * $s}] [expr {$s * $s + $A * $c * $c}]] }
 set z0 {}; for {set i 0} {$i < 16} {incr i} { set xx [expr {-1.0 + 2.0 * $i / 15.0}]; lappend z0 [list $xx [expr {0.6 * (1 - $xx * $xx) + 0.3}]] }
 tw::init $z0 {1.0 1.0} {0 0}
-foreach {k v} {calibrate 20 memory 20 stepsize 0.002 conv_window 4 frame_updates 50 polyak 1 force_tol 0.3 profile_tol 0 conv_count 3} { tw::set_param $k $v }
+foreach {k v} {calibrate 20 memory 20 stepsize 0.002 conv_window 4 frame_updates 50 polyak 1 force_tol 0.3 profile_tol 0 conv_count 3 plateau_span 1000} { tw::set_param $k $v }
 for {set it 0} {$it < 6000} {incr it} {
     set gl {}; set Ml {}
     foreach p $tw::z { lappend gl [gF {*}$p]; lappend Ml [Mat [lindex $p 0]] }
@@ -344,7 +347,7 @@ foreach {k v} {calibrate 200 memory 200 stepsize 0 conv_window 20 conv_count 3 f
 # (an AR(1) wander) and, in the second case, also by a steady creep of the far half of the string
 proc wander_run {creep nfr} {
     tw::init {{0 0} {1 0} {2 0} {3 0} {4 0} {5 0} {6 0} {7 0} {8 0} {9 0} {10 0} {11 0}} {1.0 1.0} {0 0}
-    foreach {k v} {calibrate 0 conv_window 20 conv_count 1 force_tol 0 profile_tol 0 frame_updates 1 plateau 1 plateau_tol 0.2} { tw::set_param $k $v }
+    foreach {k v} {calibrate 0 conv_window 20 conv_count 1 force_tol 0 profile_tol 0 frame_updates 1 plateau 1 plateau_tol 0.2 plateau_span 200} { tw::set_param $k $v }
     set tw::nacc 1000
     set w [lrepeat 12 0.0]; set short {}; set sys {}; set stopped 0
     for {set f 0} {$f < $nfr} {incr f} {
@@ -355,7 +358,8 @@ proc wander_run {creep nfr} {
         }
         set w $nw
         set d [tw::record_frame $fr {}]
-        if {$tw::d_sys >= 0} { lappend short $d; lappend sys $tw::d_sys; if {[tw::converged]} { incr stopped } }
+        # (counts evaluations whose plateau statistic and wander both pass; the stop also needs the hold)
+        if {$tw::d_sys >= 0} { lappend short $d; lappend sys $tw::d_sys; if {$tw::d_sys < 0.2 && $tw::d_floor < 0.2} { incr stopped } }
     }
     set ms 0.0; foreach v $short { set ms [expr {$ms + $v}] }
     set tail [lrange $sys end-49 end]; set my 0.0; foreach v $tail { set my [expr {$my + $v}] }
@@ -416,9 +420,10 @@ proc wander_bounded {creep nfr cap} {
     return [list $tw::d_sys $big $tw::hist_chunk]
 }
 expr {srand(11)}
-lassign [wander_bounded 0.0 1500 32] rest_b big_b chunk_b
-lassign [wander_bounded 0.002 1500 32] creep_b big_c chunk_c
-check "1500 frames kept in at most 32 entries (most $big_b, $chunk_b frames each)" [expr {$big_b <= 32 && $chunk_b >= 32}]
+# (the cap is at least 64 entries now: the plateau test's sixteen half-blocks need two each)
+lassign [wander_bounded 0.0 1500 64] rest_b big_b chunk_b
+lassign [wander_bounded 0.002 1500 64] creep_b big_c chunk_c
+check "1500 frames kept in at most 64 entries (most $big_b, $chunk_b frames each)" [expr {$big_b <= 64 && $chunk_b >= 32}]
 check "bounded history: at rest reads $rest_b, creeping reads $creep_b" [expr {$rest_b < 0.2 && $creep_b > 0.2}]
 foreach {k v} {calibrate 200 conv_window 20 conv_count 3 frame_updates 100 profile_tol 0.5 force_tol 0.3 hist_max 512} { tw::set_param $k $v }
 
@@ -458,6 +463,239 @@ for {set rep 0} {$rep < 200} {incr rep} {
 }
 check "independent samples: longer blocks give the same noise (ratio $r_white)" [expr {abs($r_white - 1.0) < 0.12}]
 check "samples correlated over 30 updates, blocks of 20: longer blocks give more (ratio $r_corr)" [expr {$r_corr > 1.2}]
+
+# ==== 7. review round 3: each test below failed on 2891a69 for the reason named
+set TDIR [file join [file dirname [info script]] .. driver]
+proc reset_defaults {} {
+    foreach {k v} {memory 200 calibrate 200 max_move 0.002 stepsize 0 spline 1 evolve_ends 1 conv_window 20 conv_tol 0.1
+                   conv_count 3 polyak 1 force_tol 0.3 profile_tol 0.5 pin_first {} pin_last {} noise_frac 0.5 drift_curve 1
+                   plateau 1 plateau_tol 0.2 plateau_every 5 hist_max 512 curve_reach 4 flow residual plateau_hold 0.25
+                   step_decay 0.0 frame_updates 100 nblocks 10 plateau_span 10000 force_image_tol -1} { tw::set_param $k $v }
+}
+# a string of 12 images on the x axis, fed frames directly (no forces unless given);
+# mode: all = every image creeps across; end = the last image creeps across;
+# endalong = the last image creeps along; osc = all oscillate; hosc = the far half
+# oscillates; rw = the far half random-walks; noise is AR(1) wander on every image.
+proc hrun {mode rate noise nfr {extra {}} {T 100}} {
+    set z0 {}; for {set i 0} {$i < 12} {incr i} { lappend z0 [list $i.0 0.0] }
+    tw::init $z0 {1.0 1.0} {0 0}
+    reset_defaults
+    foreach {k v} [concat {calibrate 0 conv_window 20 conv_count 3 force_tol 0 profile_tol 0 frame_updates 20} $extra] { tw::set_param $k $v }
+    set tw::nacc 1000
+    set w [lrepeat 12 0.0]; set rw 0.0
+    for {set f 0} {$f < $nfr} {incr f} {
+        if {$mode eq "rw"} { set rw [expr {$rw + $rate * [gauss]}] }
+        set nw {}; set fr {}; set i 0
+        foreach y $w {
+            set y [expr {0.8 * $y + $noise * [gauss]}]; lappend nw $y
+            set x $i.0; set yy $y
+            switch $mode {
+                all { set yy [expr {$y + $rate * $f}] }
+                end { if {$i == 11} { set yy [expr {$y + $rate * $f}] } }
+                endalong { if {$i == 11} { set x [expr {$x + $rate * $f}] } }
+                osc { set yy [expr {$y + $rate * sin(6.283185307179586 * $f / $T)}] }
+                hosc { if {$i >= 6} { set yy [expr {$y + $rate * sin(6.283185307179586 * $f / $T)}] } }
+                rw { if {$i >= 6} { set yy [expr {$y + $rw}] } }
+            }
+            lappend fr [list $x $yy]; incr i
+        }
+        set w $nw
+        tw::record_frame $fr {}
+        if {[tw::converged]} { return $f }
+    }
+    return -1
+}
+
+# ---- 7.1 free ends under the residual flow slide into their basins (finding 1)
+# F = 2 (x^2 - 1)^2 + 5 y^2: minima at x = +-1; the ends start half way up the walls
+proc gEnds {x y} { return [list [expr {8.0 * $x * ($x * $x - 1)}] [expr {10.0 * $y}]] }
+foreach nz {0.0 3.0} {
+    reset_defaults; expr {srand(1)}
+    set z0 {}; for {set i 0} {$i < 8} {incr i} { lappend z0 [list [expr {-0.5 + $i / 7.0}] 0.05] }
+    tw::init $z0 {1 1} {0 0}
+    foreach {k v} {calibrate 2 memory 2 stepsize 0.01} { tw::set_param $k $v }
+    set xa 0.0; set xb 0.0; set nav 0
+    for {set it 0} {$it < 4000} {incr it} {
+        set gl {}; set Ml {}
+        foreach p $tw::z { lassign [gEnds {*}$p] gx gy; lappend gl [list [expr {$gx + $nz * [gauss]}] [expr {$gy + $nz * [gauss]}]]; lappend Ml {1 0 0 1} }
+        tw::accumulate $gl $Ml; tw::advance
+        if {$it >= 2000} { set xa [expr {$xa + [lindex $tw::z 0 0]}]; set xb [expr {$xb + [lindex $tw::z end 0]}]; incr nav }
+    }
+    set xa [expr {$xa / $nav}]; set xb [expr {$xb / $nav}]
+    check "7.1 residual flow, noise $nz: free ends reach the minima at -1 and 1 (mean $xa, $xb)" [expr {abs($xa + 1) < 0.08 && abs($xb - 1) < 0.08}]
+}
+
+# ---- 7.2 a hand-set step needs no measurable force; a free end's move along the path counts (finding 7)
+reset_defaults
+tw::init {{0.0 0.0} {1.0 0.0} {2.0 0.0} {3.0 0.0}} {1.0 1.0} {0 0}
+foreach {k v} {calibrate 2 memory 2 stepsize 0.001} { tw::set_param $k $v }
+set err [catch { for {set it 0} {$it < 4} {incr it} { tw::accumulate [lrepeat 4 {0.0 0.0}] [lrepeat 4 {1 0 0 1}]; tw::advance } } msg]
+check "7.2 stepsize set by hand and zero force: no error ($msg)" [expr {!$err && $tw::h == 0.001}]
+set ps [tw::perp_sizes {{1.0 0.0} {1.0 0.0} {1.0 0.0} {1.0 0.0}}]
+check "7.2 a free end's move along the path counts in the step size ($ps)" [expr {abs([lindex $ps 0] - 1.0) < 1e-12 && abs([lindex $ps end] - 1.0) < 1e-12 && [lindex $ps 1] < 1e-12}]
+
+# ---- 7.3 the restart state carries the flow and the step's parameters; another flow is refused (finding 2)
+reset_defaults
+tw::init {{0.0 0.0} {1.0 0.0} {2.0 0.0} {3.0 0.0} {4.0 0.0}} {1.0 1.0} {0 0}
+foreach {k v} {calibrate 2 memory 2 flow residual} { tw::set_param $k $v }
+for {set it 0} {$it < 3} {incr it} { tw::accumulate [lrepeat 5 {0.0 1.0}] [lrepeat 5 {1 0 0 250}]; tw::advance }
+set sres [tw::dump_state]
+check "7.3 the state records the flow it was calibrated under" [regexp {flow residual} $sres]
+catch {tw::load_state $sres}; tw::set_param flow metric
+set err [catch {tw::restart_check} msg]
+check "7.3 a residual-calibrated state restarted under flow metric is refused ($msg)" [expr {$err && [string match "*flow*residual*" $msg]}]
+tw::set_param flow residual
+set err [catch {tw::restart_check} msg]
+check "7.3 the same flow is accepted ($msg)" [expr {!$err}]
+# a state from before TW(flow) existed ran the metric flow
+set sold {}; foreach line [split $sres \n] { if {![string match "*tw::saved_P*" $line]} { append sold $line \n } }
+catch {tw::load_state $sold}; tw::set_param flow residual
+set err [catch {tw::restart_check} msg]
+check "7.3 an old state (no flow recorded) is taken as metric: residual refused ($msg)" [expr {$err && [string match "*metric*" $msg]}]
+tw::set_param flow metric
+set err [catch {tw::restart_check} msg]
+check "7.3 an old state under flow metric is accepted ($msg)" [expr {!$err}]
+catch {tw::load_state $sres}; tw::set_param flow residual; tw::set_param calibrate 50
+set err [catch {tw::restart_check} msg]
+check "7.3 a different calibrate is refused ($msg)" [expr {$err && [string match "*calibrate*" $msg]}]
+tw::set_param calibrate 2; tw::set_param max_move 0.004
+set err [catch {tw::restart_check} msg]
+check "7.3 a different max_move is reported, not refused ($msg)" [expr {!$err && [string match "*max_move*" $msg]}]
+
+# ---- 7.4 the plateau test (finding 3).  Frames of 20 updates and the default
+# plateau_span, so the test reads at least 10,000 updates (500 frames).
+set f3 {}
+foreach {lab mode rate noise T} {
+    "every image creeping 0.001 per frame"            all 0.001 0.04 100
+    "far half oscillating, amplitude 0.3, period 120" hosc 0.3 0.04 120
+    "all oscillating, amplitude 0.5, period 107"      osc 0.5 0.04 107
+    "far half random-walking, 0.012 per frame"        rw 0.012 0.04 100
+    "end image creeping across, 0.002 per frame"      end 0.002 0.04 100
+    "end image creeping along, 0.003 per frame"       endalong 0.003 0.04 100
+} {
+    set stops {}
+    foreach seed {1 2} { expr {srand($seed)}; lappend stops [hrun $mode $rate $noise 1500 {} $T] }
+    check "7.4 $lab: never stops in 1500 frames (stop frames $stops)" [expr {[lindex $stops 0] < 0 && [lindex $stops 1] < 0}]
+}
+set stops {}
+foreach seed {1 2} { expr {srand($seed)}; lappend stops [hrun all 0.0 0.04 2000] }
+check "7.4 a resting string with wander 0.067 rms still stops (stop frames $stops)" [expr {[lindex $stops 0] > 0 && [lindex $stops 1] > 0}]
+
+# ---- 7.5 the step decays only after the full stop criteria held, and is restored if the string moves on (finding 4)
+proc strline {y} { set fr {}; for {set i 0} {$i < 12} {incr i} { lappend fr [list $i.0 [expr {$i >= 6 ? $y : 0.0}]] }; return $fr }
+reset_defaults
+tw::init [strline 0] {1.0 1.0} {0 0}
+foreach {k v} {calibrate 0 conv_window 20 conv_count 1000 force_tol 0 profile_tol 0 frame_updates 20 step_decay 0.6} { tw::set_param $k $v }
+set tw::nacc 1000; set first_pass -1; set rest_at_first -2
+for {set f 0} {$f < 1600} {incr f} {
+    incr tw::nacc 20; tw::record_frame [strline 0.0] {}
+    if {$tw::nplat == 1 && $first_pass < 0} { set first_pass $f; set rest_at_first $tw::n_rest }
+}
+check "7.5 a single plateau pass does not start the decay (n_rest $rest_at_first at the first pass, frame $first_pass)" [expr {$first_pass > 0 && $rest_at_first < 0}]
+check "7.5 the decay starts once the pass has held (n_rest $tw::n_rest)" [expr {$tw::n_rest > 0}]
+for {set f 0} {$f < 800} {incr f} { incr tw::nacc 20; tw::record_frame [strline [expr {0.01 * $f}]] {} }
+check "7.5 a string that moves again resets it (systematic $tw::d_sys, n_rest $tw::n_rest)" [expr {$tw::d_sys > 0.2 && $tw::n_rest < 0}]
+reset_defaults
+tw::init {{0.0 0.0} {1.0 0.0} {2.0 0.0} {3.0 0.0}} {1.0 1.0} {0 0}
+foreach {k v} {calibrate 2 memory 2 stepsize 0.001 step_decay 0.6} { tw::set_param $k $v }
+for {set it 0} {$it < 3} {incr it} { tw::accumulate [lrepeat 4 {0.0 1.0}] [lrepeat 4 {1 0 0 1}]; tw::advance }
+set tw::h 0.0001; set tw::n_rest -1
+tw::accumulate [lrepeat 4 {0.0 1.0}] [lrepeat 4 {1 0 0 1}]; tw::advance
+check "7.5 with the rest point reset the step is back to h0 ($tw::h, h0 $tw::h0)" [expr {abs($tw::h - $tw::h0) < 1e-15}]
+
+# ---- 7.6 calibration noise is the worst image's, as promised (finding 5)
+expr {srand(4)}; set vecs {}
+for {set b 0} {$b < 10} {incr b} { set v {}; for {set i 0} {$i < 24} {incr i} { set s [expr {$i == 5 ? 10.0 : 1.0}]; lappend v [list [expr {$s * [gauss] / sqrt(20)}]] }; lappend vecs $v }
+set bn [lindex [tw::block_noise $vecs [lrepeat 10 20]] 0]
+check "7.6 one image with ten times the noise sets the noise ($bn; that image's own is about 10)" [expr {$bn > 6.0}]
+check "7.6 the unused noise_f1 is gone" [expr {![info exists tw::noise_f1]}]
+
+# ---- 7.7 the force test: one image may not carry the whole tolerance; no forces is no pass (finding 6)
+proc frun {G nfr} {
+    reset_defaults
+    set z0 {}; for {set i 0} {$i < 12} {incr i} { lappend z0 [list $i.0 0.0] }
+    tw::init $z0 {1.0 1.0} {0 0}
+    foreach {k v} {calibrate 0 conv_window 20 force_tol 0.3 profile_tol 0 frame_updates 20} { tw::set_param $k $v }
+    tw::accumulate [lrepeat 12 {0.0 0.0}] [lrepeat 12 {1.0 0.0 0.0 1.0}]
+    set tw::nacc 1000
+    for {set f 0} {$f < $nfr} {incr f} {
+        set fr {}; set gf {}
+        for {set i 0} {$i < 12} {incr i} { lappend fr [list $i.0 [expr {0.01 * [gauss]}]]; lappend gf [list 0.0 [expr {($i == 5 ? $G : 0.0) + 0.05 * [gauss]}]] }
+        if {$G < 0} { set gf {} }
+        tw::record_frame $fr $gf
+        if {[tw::converged]} { return $f }
+    }
+    return -1
+}
+expr {srand(1)}
+set s1 [frun 1.0 1600]
+check "7.7 one image of 12 with a force of 1.0 across the string does not stop (stop $s1; rms over images $tw::fl_clean)" [expr {$s1 < 0}]
+set s0 [frun 0.5 1600]
+check "7.7 one image with 0.5 still stops (stop $s0)" [expr {$s0 > 0}]
+set sn [frun -1 1600]
+check "7.7 no forces recorded: the force test cannot pass (stop $sn, long residual $tw::fl_res)" [expr {$sn < 0}]
+
+# ---- 7.8 a run stops only on a frame on which the tests were evaluated (finding 8)
+reset_defaults
+tw::init [strline 0] {1.0 1.0} {0 0}
+foreach {k v} {calibrate 0 conv_window 21 conv_count 1 force_tol 0 profile_tol 0 frame_updates 20} { tw::set_param $k $v }
+set tw::nacc 1000; set ok8 -1
+for {set f 0} {$f < 2000} {incr f} {
+    incr tw::nacc 20; tw::record_frame [strline 0.0] {}
+    if {[tw::converged]} { set ok8 [expr {$tw::h_since == 0}]; break }
+}
+check "7.8 the stopping frame was an evaluated one (stopped at $f)" [expr {$ok8 == 1}]
+
+# ---- 7.9 merging the history keeps the newest frames and gets under the cap (finding 9)
+reset_defaults
+tw::init [strline 0] {1.0 1.0} {0 0}
+set tw::zhist {}; set tw::ghist {}
+for {set j 0} {$j < 70} {incr j} { lappend tw::zhist [strline $j]; lappend tw::ghist {} }
+tw::set_param hist_max 64
+tw::history_add [strline 70] {}
+tw::history_add [strline 71] {}
+check "7.9 an odd-length merge keeps the newest frame (last entry [lindex $tw::zhist end end 1], expected 70.5)" [expr {abs([lindex $tw::zhist end end 1] - 70.5) < 1e-9}]
+set tw::zhist {}; set tw::ghist {}; set tw::hist_chunk 1; set tw::hz_n 0
+for {set j 0} {$j < 200} {incr j} { lappend tw::zhist [strline $j]; lappend tw::ghist {} }
+tw::history_add [strline 200] {}
+check "7.9 a history far over the cap is merged until under it ([llength $tw::zhist] entries, cap 64)" [expr {[llength $tw::zhist] < 64}]
+
+# ---- 7.10 the driver's messages (finding 10)
+set fh [open [file join $TDIR string_driver.tcl]]; set drv [read $fh]; close $fh
+check "7.10 the 'converged' history line reports the long-span force, not the short-window one" [regexp {converged,[^\n]*fl_clean} $drv]
+check "7.10 no claim that running longer will not remove the force" [expr {![string match "*will not remove it*" $drv]}]
+
+# ---- 7.11 restarts from older state files and bad settings (finding 11)
+reset_defaults
+tw::init {{0.0 0.0} {1.0 0.0} {2.0 0.0} {3.0 0.0}} {1.0 1.0} {0 0}
+foreach {k v} {calibrate 2 memory 2 stepsize 0.001} { tw::set_param $k $v }
+for {set it 0} {$it < 3} {incr it} { tw::accumulate [lrepeat 4 {0.0 1.0}] [lrepeat 4 {1 0 0 1}]; tw::advance }
+set sold {}; foreach line [split [tw::dump_state] \n] { if {![string match "set tw::h0 *" $line]} { append sold $line \n } }
+set tw::h0 0.0
+catch {tw::load_state $sold}
+check "7.11 a state without h0 takes it from h, so step_decay still works (h0 $tw::h0, h $tw::h)" [expr {$tw::h0 == $tw::h && $tw::h > 0}]
+check "7.11 a non-integer calibrate is refused" [catch {tw::set_param calibrate 200.5}]
+check "7.11 a non-integer curve_reach is refused" [catch {tw::set_param curve_reach 2.5}]
+check "7.11 an unknown flow is refused" [catch {tw::set_param flow metrc}]
+reset_defaults
+tw::set_param frame_updates 50
+set err [catch {tw::check_frame_updates 100} msg]
+check "7.11 TW(frame_updates) different from runs_per_frame is refused ($msg)" [expr {$err && [string match "*runs_per_frame*" $msg]}]
+reset_defaults
+
+# ---- 7.12 the averaged move is not worked out on updates that do not use it (finding 12)
+reset_defaults
+tw::init {{0.0 0.0} {1.0 0.0} {2.0 0.0} {3.0 0.0}} {1.0 1.0} {0 0}
+foreach {k v} {calibrate 2 memory 2} { tw::set_param $k $v }
+rename tw::raw_move tw::raw_move_orig
+set nraw 0
+proc tw::raw_move {} { incr ::nraw; return [tw::raw_move_orig] }
+for {set it 0} {$it < 3} {incr it} { tw::accumulate [lrepeat 4 {0.0 1.0}] [lrepeat 4 {1 0 0 1}]; tw::advance }
+set nraw 0
+for {set it 0} {$it < 10} {incr it} { tw::accumulate [lrepeat 4 {0.0 1.0}] [lrepeat 4 {1 0 0 1}]; tw::advance }
+rename tw::raw_move {}; rename tw::raw_move_orig tw::raw_move
+check "7.12 with polyak on, the averaged move is not computed after calibration ($nraw calls in 10 updates)" [expr {$nraw == 0}]
+reset_defaults
 
 # ---- 6. bad input is refused
 check "too few images refused" [catch {tw::init {{0 0} {1 1}} {1 1} {0 0}}]

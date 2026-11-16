@@ -29,17 +29,25 @@ check "both drifts recorded ($tw::d_curve, $tw::d_image)" [expr {$tw::d_curve >=
 try plateau {set pl [tw::plateau]}
 try long_force {set lf [tw::long_force]}
 check "plateau and long force answer inside NAMD ($pl; $lf)" [expr {[llength $pl] == 2 && [llength $lf] == 3}]
-foreach {k v} {conv_window 1 plateau_every 1} { try "set_param $k" [list tw::set_param $k $v] }
-for {set n 0} {$n < 12} {incr n} { try "record long $n" {tw::record_frame $tw::z [lrepeat 5 {0.1 0.2 0.0 0.0}]} }
+foreach {k v} {conv_window 1 plateau_every 1 plateau_span 10} { try "set_param $k" [list tw::set_param $k $v] }
+for {set n 0} {$n < 40} {incr n} { try "record long $n" {tw::record_frame $tw::z [lrepeat 5 {0.1 0.2 0.0 0.0}]} }
 check "long-span tests give numbers inside NAMD ($tw::d_sys, $tw::fl_clean)" [expr {$tw::d_sys >= 0 && $tw::fl_res >= 0}]
 try flow_residual {tw::set_param flow residual; set mv [tw::inst_move]; tw::set_param flow metric}
 check "the residual flow gives a move for every image inside NAMD" [expr {[llength $mv] == 5 && [llength [lindex $mv 2]] == 4}]
 try block_noise {set bn [tw::block_noise {{{1.0 2.0}} {{1.5 2.5}} {{0.5 1.0}} {{1.2 2.2}} {{0.8 1.9}} {{1.1 2.0}}} {10 10 10 10 10 10}]}
 check "block noise at two block lengths inside NAMD ($bn)" [expr {[llength $bn] == 2 && [lindex $bn 0] > 0 && [lindex $bn 1] > 0}]
 foreach {k v} {hist_max 16} { try "set_param $k" [list tw::set_param $k $v] }
-for {set n 0} {$n < 40} {incr n} { try "record bounded $n" {tw::record_frame $tw::z [lrepeat 5 {0.1 0.2 0.0 0.0}]} }
-check "history bounded inside NAMD ([llength $tw::zhist] entries of $tw::hist_chunk frames)" [expr {[llength $tw::zhist] <= 16 && $tw::hist_chunk > 1}]
+for {set n 0} {$n < 140} {incr n} { try "record bounded $n" {tw::record_frame $tw::z [lrepeat 5 {0.1 0.2 0.0 0.0}]} }
+check "history bounded inside NAMD (at least 64 entries kept; [llength $tw::zhist] entries of $tw::hist_chunk frames)" [expr {[llength $tw::zhist] < 64 && $tw::hist_chunk > 1}]
 try dump {set s [tw::dump_state]}
-try reload {eval $s}
+try reload {tw::load_state $s}
+try state_flow {tw::set_param flow [tw::state_flow]; tw::set_param conv_window 3}
+try restart_check {set rc [tw::restart_check]}
+check "restart check passes on its own state inside NAMD ($rc)" [expr {$rc eq ""}]
+check "restart under the other flow refused inside NAMD" [expr {[tw::set_param flow [expr {$tw::P(flow) eq "metric" ? "residual" : "metric"}]] ne "" && [catch {tw::restart_check}]}]
+check "non-integer calibrate refused inside NAMD" [catch {tw::set_param calibrate 40.5}]
+check "frame_updates against runs_per_frame inside NAMD" [expr {![catch {tw::check_frame_updates 10}] && [catch {tw::check_frame_updates 100}]}]
+try free_end_move {tw::set_param flow residual; set mv [tw::flow_moves [lrepeat 5 {1.0 0.0 0.0 0.0}]]}
+check "a free end moves on its whole gradient inside NAMD ([lindex $mv 0])" [expr {abs([lindex $mv 0 0] + 0.609 * 0.609) < 1e-9}]
 puts "in_namd: $npass passed, $nfail failed"
 exit

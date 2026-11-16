@@ -525,3 +525,42 @@ def test_overlap_is_not_fooled_by_one_outlying_frame():
     a = zz[0] + 0.077 * rng.standard_normal((20000, 2)); b = zz[1] + 0.077 * rng.standard_normal((20000, 2))
     b[:3] = [[40.0, 0.0]] * 3
     assert abs(fp.neighbour_overlap([a, b], zz, per)[0] - 0.317) < 0.03
+
+
+# ------------------------------------------------------------------ follow-up: an honest correlation time
+def _ar1(rng, m, a):
+    from scipy.signal import lfilter
+    return lfilter([1], [1, -a], rng.normal(0, np.sqrt(1 - a * a), m))
+
+
+def test_block_inefficiency_sees_a_slow_weak_tail():
+    """The first-zero-crossing sum stops where noise first takes the
+    autocorrelation below zero: a weak slow component under a strong fast
+    one (as in the alanine runs' forces) is cut off and g reads about 3x low.
+    Fast AR(1) a=0.5 (g 3, variance 1) plus slow a=0.999 (g 1999, variance
+    0.01): g = (3 + 0.01 x 1999) / 1.01 = 22.8."""
+    import fe_profile as fp
+    true = (3.0 + 0.01 * 1999.0) / 1.01
+    old, new = [], []
+    for seed in range(8):
+        rng = np.random.default_rng(seed)
+        x = _ar1(rng, 150000, 0.5) + np.sqrt(0.01) * _ar1(rng, 150000, 0.999)
+        old.append(fp.statistical_inefficiency(x)); new.append(fp.block_inefficiency(x))
+    assert np.median(old) < true / 2                       # the old estimate, for the record
+    assert abs(np.median(new) / true - 1) < 0.3, (np.median(new), true)
+    # a plain AR(1) with g = 19: still within 30%
+    r = [fp.block_inefficiency(_ar1(np.random.default_rng(10 + s), 40000, 0.9)) for s in range(8)]
+    assert abs(np.median(r) / 19.0 - 1) < 0.3, r
+
+
+def test_block_length_gate_uses_the_block_estimate(monkeypatch):
+    """The block-length gate reads g from block_inefficiency.  (Where that
+    gate bites, a correlation time near a hundredth of the run, the two
+    estimates agree; they part on long runs with a weak slow tail.)"""
+    import fe_profile as fp
+    rng = np.random.default_rng(3)
+    z = np.linspace(0, 1, 7)[:, None]
+    smp = [rng.normal(0, 1, (4000, 1)) for _ in range(7)]
+    assert fp.from_force_samples(z, smp, np.ones(1), 10)["blocks_ok"]
+    monkeypatch.setattr(fp, "block_inefficiency", lambda x: 200.0)
+    assert not fp.from_force_samples(z, smp, np.ones(1), 10)["blocks_ok"]

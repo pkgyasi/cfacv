@@ -229,6 +229,33 @@ def statistical_inefficiency(x):
     return max(g, 1.0)
 
 
+def block_inefficiency(x, min_blocks=16):
+    """g from block averaging (after Flyvbjerg and Petersen, J Chem Phys 1989):
+    for block lengths L = 1, 2, 4, ... while there are at least min_blocks
+    blocks, g(L) = L var(block means) / var(x) rises to g and levels off once
+    L is several correlation times.  The largest g(L) is taken (the curve is
+    still rising at the longest blocks a run allows when the correlation is
+    long, so its mean over the last few reads low: 0.7 of g on a weak slow
+    tail, against 0.8 to 1.1 for the largest), and never less than the
+    first-zero-crossing sum.
+
+    That sum (statistical_inefficiency) stops where noise first takes the
+    autocorrelation below zero, and so cuts off a weak slow component under
+    a strong fast one: on the alanine forces it read 1.3 where block
+    averaging gives 3 to 4.5, and on a fast-plus-weak-slow AR(1) test 0.35 of
+    the true g."""
+    x = np.asarray(x, float); n = len(x); v = float(x.var())
+    g = statistical_inefficiency(x)
+    if v <= 0:
+        return g
+    L = 1
+    while n // L >= min_blocks:
+        nb = n // L
+        g = max(g, L * float(x[: nb * L].reshape(nb, L).mean(axis=1).var(ddof=1)) / v)
+        L *= 2
+    return max(g, 1.0)
+
+
 def detect_equilibration(x, grid=20, max_fraction=0.6, floor=0.0, gain=1.5):
     """How much of the start of a series to drop (after Chodera, JCTC 2016):
     the start that leaves the most independent samples, (N - t0) / g(t0).  A
@@ -362,7 +389,7 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5, drift_
     for i, d in enumerate(samples):
         d = np.asarray(d, float)
         tng = z[min(i + 1, n - 1)] - z[max(i - 1, 0)]
-        worst = max(worst, statistical_inefficiency(d @ tng) * nb / len(d))
+        worst = max(worst, block_inefficiency(d @ tng) * nb / len(d))
     res["correlation_to_block_ratio"] = float(worst); res["blocks_ok"] = bool(worst <= 0.2)
     # unequal runs: an image with a fraction of the others' samples sets the error and nobody notices
     lens = np.array([len(s) for s in samples]); res["samples"] = lens
@@ -511,15 +538,6 @@ def window_motion(Z, scale):
     quarters = np.array([c.mean(axis=0) for c in np.array_split(Z, 4)]) - Z.mean(axis=0)
     wander = float(np.sqrt((quarters ** 2).sum(axis=2)).max())
     return net, float(np.abs(slope / se).max()), wander
-
-
-def window_drift(Z, scale):   # kept for callers; from_driver uses window_motion
-    """How far the string moved across a window of frames: the scaled distance
-    between each image's mean position in the first and in the second half,
-    largest over the images."""
-    h = len(Z) // 2
-    d = (Z[:h].mean(axis=0) - Z[len(Z) - h:].mean(axis=0)) / scale
-    return float(np.sqrt((d ** 2).sum(axis=1)).max())
 
 
 def _to_curve(pts, curve):

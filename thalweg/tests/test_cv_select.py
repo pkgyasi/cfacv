@@ -191,5 +191,8 @@ def test_a_pair_that_only_helps_together_is_found_and_separable_outcomes_fail():
     assert set(res["chosen"]) >= {"a", "b"} and res["pass"]
     # outcomes fixed exactly by one CV, with no gap between the classes
     x = rng.normal(0, 1, (300, 1)); y = (x[:, 0] > 0).astype(float)
-    res = cs.select_cvs(x, y, np.zeros(1, bool), ["x"], n_perm=10)
+    res = cs.select_cvs(x, y, np.zeros(1, bool), ["x"], n_perm=20)          # 10 cannot reach p = 0.05
+    assert res["chosen"] == ["x"] and res["separable"] and not res["pass"]
+    with pytest.raises(ValueError, match="permutations"):
+        cs.select_cvs(x, y, np.zeros(1, bool), ["x"], n_perm=10)
     assert res["chosen"] == ["x"] and res["separable"] and not res["pass"]

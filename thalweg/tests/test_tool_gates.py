@@ -78,7 +78,7 @@ def _outcomes_file(tmp_path, rows, ncv=3):
     (tmp_path / "out.json").write_text(json.dumps({"cvs": [f"c{i}" for i in range(ncv)], "rows": rows,
                                                    "counts": {"closed": 1, "open": 1, "U": 0, "missing": 0}}))
     return ["select", "--cv", str(tmp_path / "pool.json"), "--outcomes", str(tmp_path / "out.json"),
-            "--out", str(tmp_path / "sel.json"), "--permutations", "5"]
+            "--out", str(tmp_path / "sel.json"), "--permutations", "19"]
 
 
 def test_select_refuses_rows_without_a_configuration_and_warns_without_blocks(tmp_path, capsys):

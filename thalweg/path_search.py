@@ -465,8 +465,12 @@ def same_route(a, b, scale, tol):
 
 
 # a string between two strings of one channel may rise this far above both
-# (kcal/mol) and they are still one channel
-CHANNEL_DF = 0.6
+# (kcal/mol) and they are still one channel.  Calibration: between strings on
+# one arc of a noisy ring the excess is <= 0; between the two alanine
+# dipeptide routes that the MD strings pr3 and pr1R3 resolve as distinct
+# (1.5 scaled units apart, about one center spacing) it is 0.39, and 0.6
+# merged them.  Two arcs of a ring differ by many kcal/mol.
+CHANNEL_DF = 0.25
 
 
 def same_channel(m, a, b, tol, support=None, dF=CHANNEL_DF, steps=8):

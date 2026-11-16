@@ -10,7 +10,7 @@ Written 2026-11-14.
 | | cfacv `stringmethod.tcl` | this driver |
 |---|---|---|
 | torsions | never wrapped; a string must not cross +/-pi | string kept unwrapped, replicas restrained to the wrapped point |
-| mean force used for an update | the last `steps_per_run` MD steps | the same (this is the on-the-fly string update), with a metric tensor averaged over `TW(memory)` updates |
+| how an image moves | along -M g, g from the last `steps_per_run` MD steps | by default against the part of g that a minimum free-energy path does not balance (`TW(flow) residual`), g from the same few MD steps and the metric tensor averaged over `TW(memory)` updates; `TW(flow) metric` moves along -M g |
 | the result | the string at the last update | the AVERAGE of the string over the last window of frames (iterate averaging): the momentary string fluctuates about the path and never settles, because the step is constant |
 | step size | `SMPARAMS(stepsize)`, chosen by hand | measured: the string stands still for `TW(calibrate)` updates, then the step is the smaller of two limits: the fastest image moves `TW(max_move)` scaled units per update, or the noise alone moves an image less than half the drift tolerance over one test window |
 | when it stops | after `num_runs` updates | when, over the last half of the run, the averaged string has not moved beyond its own wander and no force is left across it, and the profile along it is not demonstrably changing; or at `num_runs` |
@@ -102,19 +102,43 @@ refinement, so it is a first look, not the profile of record.
   0.8 from window to window, and a run could end on a low swing. Over half
   the run it is steady to a few hundredths.
 
-  A string can come to rest with a force still across it. On the second
-  alanine channel that force is 0.4 to 0.5 kcal/mol per scaled unit however
-  long the run, and it sits at a few images, at the path's sharp bends
-  (up to 1.4 at one image), the same in both halves of the run. Such a run
-  goes to its cap; the log then says the string is at rest with a force
-  left, and the history lists the force by image (`residual_by_image`,
-  `above_force_tol`). Running longer does not help, and more images help
-  only so far: 16 images left 0.53 on that channel, 24 left 0.41 and 36
-  left 0.39 (+/- 0.05), still at the same places on the path. What holds
-  it there is not established. The profiles from the 24- and 36-image
-  strings pass all their gates and agree with unbiased dynamics, so a
-  residual of this size has not been seen to spoil a profile; whether to
-  accept it is a judgement, and `TW(force_tol)` is the setting.
+  **Which flow.** With `TW(flow) metric` each image moves along -M g, the
+  update as published. The step then has to suit the directions in which M
+  is largest, and on alanine dipeptide M's eigenvalues differ about
+  250-fold, so the others lag: strings came to rest by the plateau test
+  with 0.3 to 0.5 kcal/mol per scaled unit still across them, the same in
+  both halves of an 80,000-update run, and the dedicated 500 ps runs at an
+  older string's images showed the same (0.53). It is not the restraint
+  (doubling its force constant left 0.49) and not the image count (16, 24
+  and 36 images left 0.53, 0.41 and 0.39). With `TW(flow) residual`, the
+  default, each image moves against g minus its component along
+  n = M^-1 t / |M^-1 t|: the same strings are fixed points, and every
+  direction moves on the same footing. The step came out ten times larger
+  and the force left fell to 0.13 on the lower channel and 0.2 to 0.3 on
+  the second. A lower-channel string started from the path search reached
+  its resting place in about 8,000 updates and stopped itself at 10,200;
+  with the metric flow the same string took 34,200.
+
+  **Holding.** The tests must keep passing while the history grows by
+  `TW(plateau_hold)` (a quarter). Evaluations a few frames apart read
+  nearly the same half of the run; a string that was still creeping passed
+  three of them in a row at its first evaluations and failed a few thousand
+  updates later.
+
+  **A shrinking step.** `TW(step_decay) a` (0 = off) makes the step fall as
+  (update at rest / update)^a once the plateau test has first passed, never
+  before: a string with a vanishing step looks at rest wherever it is. With
+  a = 0.6 on the second channel the wander fell from 0.08 to 0.05, the force
+  left from 0.29 to 0.18, and the run stopped at 54,600 updates.
+
+  **Calibration.** The force noise is measured from blocks of the
+  calibration period and again from blocks twice as long; the larger is
+  used and the ratio is written to the history. Above about 1.3 the blocks
+  are shorter than the force stays correlated: lengthen `TW(calibrate)`.
+
+  **History.** The plateau and force tests read frames since calibration,
+  kept as means over chunks so that there are never more than
+  `TW(hist_max)` of them; restart files stay small however long the run.
   Each history line carries both sets of numbers: `drift`, `image_drift`,
   `residual_force`, `force_noise`, `residual_less_noise` over the short
   window, and `systematic_drift`, `wander`, `long_residual`, `long_noise`,

@@ -32,6 +32,13 @@ check "plateau and long force answer inside NAMD ($pl; $lf)" [expr {[llength $pl
 foreach {k v} {conv_window 1 plateau_every 1} { try "set_param $k" [list tw::set_param $k $v] }
 for {set n 0} {$n < 12} {incr n} { try "record long $n" {tw::record_frame $tw::z [lrepeat 5 {0.1 0.2 0.0 0.0}]} }
 check "long-span tests give numbers inside NAMD ($tw::d_sys, $tw::fl_clean)" [expr {$tw::d_sys >= 0 && $tw::fl_res >= 0}]
+try flow_residual {tw::set_param flow residual; set mv [tw::inst_move]; tw::set_param flow metric}
+check "the residual flow gives a move for every image inside NAMD" [expr {[llength $mv] == 5 && [llength [lindex $mv 2]] == 4}]
+try block_noise {set bn [tw::block_noise {{{1.0 2.0}} {{1.5 2.5}} {{0.5 1.0}} {{1.2 2.2}} {{0.8 1.9}} {{1.1 2.0}}} {10 10 10 10 10 10}]}
+check "block noise at two block lengths inside NAMD ($bn)" [expr {[llength $bn] == 2 && [lindex $bn 0] > 0 && [lindex $bn 1] > 0}]
+foreach {k v} {hist_max 16} { try "set_param $k" [list tw::set_param $k $v] }
+for {set n 0} {$n < 40} {incr n} { try "record bounded $n" {tw::record_frame $tw::z [lrepeat 5 {0.1 0.2 0.0 0.0}]} }
+check "history bounded inside NAMD ([llength $tw::zhist] entries of $tw::hist_chunk frames)" [expr {[llength $tw::zhist] <= 16 && $tw::hist_chunk > 1}]
 try dump {set s [tw::dump_state]}
 try reload {eval $s}
 puts "in_namd: $npass passed, $nfail failed"

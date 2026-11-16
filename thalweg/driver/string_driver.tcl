@@ -50,6 +50,24 @@
 #                      [0 = sharper than 90 degrees]; -2 turns it off
 #     TW(conv_window)  frames per averaging window of the drift test [20]
 #     TW(conv_tol)     drift, in scaled units, below which a frame counts as still [0.1]
+#     TW(flow)         residual = images move against the part of grad F that
+#                      a minimum free-energy path does not balance [residual];
+#                      metric = images move along -M grad F, the string method
+#                      as published.  Both stop at the same strings.  With
+#                      metric the step has to suit the directions in which M
+#                      is largest, and the others lag: on alanine dipeptide
+#                      such runs came to rest with 0.3 to 0.5 kcal/mol per
+#                      scaled unit left across the string, residual runs with
+#                      0.13 to 0.3.
+#     TW(plateau_hold) the stopping tests must keep passing while the history
+#                      grows by this fraction [0.25]
+#     TW(step_decay)   0 = constant step [0]; a > 0 = once the string has
+#                      passed the plateau test the step shrinks as
+#                      (update at rest / update)^a.  Use 0.5 < a <= 1.
+#     TW(hist_max)     most entries kept of the history the plateau and force
+#                      tests read [512]; beyond it neighbours are merged
+#     TW(curve_reach)  images either side within which a curve distance looks
+#                      for the nearest point [4]
 #     TW(plateau)      1 = the drift test is the PLATEAU test: over the last
 #                      half of the run (four blocks) no image has moved by
 #                      TW(plateau_tol) scaled units [0.2] or more beyond the
@@ -257,7 +275,11 @@ while {$i_run < $num_runs && !$stop} {
                 puts $history_file "TW iter $next_run : steps per update $steps_per_run -> [expr {$steps_per_run * $fac}]"
             }
             puts "TW) calibration over at update $next_run: step $tw::h ($which; signal limit $tw::h_signal, noise limit $tw::h_noise, noise per update $tw::noise1); averaging memory $tw::P(memory) updates"
-            puts $history_file "TW iter $next_run : calibrated step $tw::h ($which) signal_limit $tw::h_signal noise_limit $tw::h_noise noise_per_update $tw::noise1 memory $tw::P(memory)"
+            puts $history_file "TW iter $next_run : calibrated step $tw::h ($which) signal_limit $tw::h_signal noise_limit $tw::h_noise noise_per_update $tw::noise1 memory $tw::P(memory) flow $tw::P(flow) noise_ratio_longer_blocks $tw::noise_ratio"
+            if {$tw::noise_ratio > 1.3} {
+                puts "TW) WARNING: blocks twice as long give [format %.2f $tw::noise_ratio] times the force noise: the force stays correlated across a calibration block, the noise is underestimated and the step may be too large. Lengthen TW(calibrate)."
+                puts $history_file "TW iter $next_run : WARNING calibration blocks shorter than the force's correlation time (ratio $tw::noise_ratio)"
+            }
         }
         if {$next_run % $runs_per_frame == 0} {
             # this frame's mean gradients, and the mean positions they were measured at

@@ -219,7 +219,7 @@ proc valley {polyak} {
     set z0 {}; for {set i 0} {$i < 8} {incr i} { lappend z0 [list $i 0.1] }
     tw::init $z0 {1 1} {0 0}
     set ymin 1e9; set stop 0
-    for {set it 0} {$it < 20000 && !$stop} {incr it} {
+    for {set it 0} {$it < 30000 && !$stop} {incr it} {
         set gl {}; set Ml {}
         foreach p $tw::z { lappend gl [list [expr {0.02 * [gauss]}] [expr {[lindex $p 1] + 0.02 * [gauss]}]]; lappend Ml {1 0 0 1} }
         tw::accumulate $gl $Ml; tw::advance
@@ -373,6 +373,91 @@ set tw::nacc 1000
 for {set f 0} {$f < 39} {incr f} { tw::record_frame {{0 0} {1 0} {2 0} {3 0}} {} }
 check "too little history: no verdict and no stop (39 of 40 frames)" [expr {$tw::d_sys < 0 && ![tw::converged]}]
 foreach {k v} {calibrate 200 memory 200 stepsize 0 conv_window 20 conv_count 3 frame_updates 100 profile_tol 0.5 force_tol 0.3 plateau 1 plateau_tol 0.2} { tw::set_param $k $v }
+
+# ---- 5g. the two flows stop at the same string when the metric tensor is far from the identity
+proc run_flow {flow maxit} {
+    global z0 NOISE
+    tw::init $z0 {1.0 1.0} {0 0}
+    foreach {k v} [list flow $flow memory 100 calibrate 200 max_move 0.004 conv_window 8 conv_count 3 force_tol 0 profile_tol 0 frame_updates 25 pin_first {-1.0 0.0} pin_last {1.0 0.0}] { tw::set_param $k $v }
+    set it 0; set stop 0
+    while {$it < $maxit && !$stop} {
+        set gl {}; set Ml {}
+        foreach p [tw::targets] {
+            lassign [gradV {*}$p] gx gy
+            lappend gl [list [expr {$gx + $NOISE * [gauss]}] [expr {$gy + $NOISE * [gauss]}]]
+            lappend Ml {1.0 0.6 0.6 30.0}                       ;# slow along x, fast along y, coupled
+        }
+        tw::accumulate $gl $Ml; tw::advance; incr it
+        if {$it % 25 == 0} { lassign [tw::frame_force] fn fg; tw::record_frame [tw::frame_z] $fg; set stop [tw::converged] }
+    }
+    return [list [tw::final_string] $it $stop $tw::h]
+}
+expr {srand(5)}
+lassign [run_flow metric 30000] s_metric it_m stop_m h_m
+lassign [run_flow residual 30000] s_resid it_r stop_r h_r
+set dflow [tw::curve_distance $s_metric $s_resid]
+check "metric flow and residual flow end on the same string (apart by $dflow; $it_m and $it_r updates)" [expr {$dflow < 0.12}]
+check "both came to rest by the plateau test" [expr {$stop_m && $stop_r}]
+check "the residual flow's step is not held down by the fast direction (step $h_r against $h_m)" [expr {$h_r > 3.0 * $h_m}]
+foreach {k v} {flow metric pin_first {} pin_last {} force_tol 0.3 profile_tol 0.5 frame_updates 100 conv_window 20 max_move 0.002 memory 200} { tw::set_param $k $v }
+
+# ---- 5h. the history stays bounded, and the plateau test reads the same from it
+proc wander_bounded {creep nfr cap} {
+    tw::init {{0 0} {1 0} {2 0} {3 0} {4 0} {5 0} {6 0} {7 0} {8 0} {9 0} {10 0} {11 0}} {1.0 1.0} {0 0}
+    foreach {k v} [list calibrate 0 conv_window 20 conv_count 1 force_tol 0 profile_tol 0 frame_updates 1 plateau 1 plateau_tol 0.2 hist_max $cap] { tw::set_param $k $v }
+    set tw::nacc 1000
+    set w [lrepeat 12 0.0]; set big 0
+    for {set f 0} {$f < $nfr} {incr f} {
+        set nw {}; set fr {}; set i 0
+        foreach y $w { set y [expr {0.8 * $y + 0.04 * [gauss]}]; lappend nw $y; lappend fr [list $i.0 [expr {$y + ($i >= 6 ? $creep * $f : 0.0)}]]; incr i }
+        set w $nw; tw::record_frame $fr {}
+        if {[llength $tw::zhist] > $big} { set big [llength $tw::zhist] }
+    }
+    return [list $tw::d_sys $big $tw::hist_chunk]
+}
+expr {srand(11)}
+lassign [wander_bounded 0.0 1500 32] rest_b big_b chunk_b
+lassign [wander_bounded 0.002 1500 32] creep_b big_c chunk_c
+check "1500 frames kept in at most 32 entries (most $big_b, $chunk_b frames each)" [expr {$big_b <= 32 && $chunk_b >= 32}]
+check "bounded history: at rest reads $rest_b, creeping reads $creep_b" [expr {$rest_b < 0.2 && $creep_b > 0.2}]
+foreach {k v} {calibrate 200 conv_window 20 conv_count 3 frame_updates 100 profile_tol 0.5 force_tol 0.3 hist_max 512} { tw::set_param $k $v }
+
+# ---- 5i. the step shrinks only after the string is at rest
+foreach {k v} {memory 100 calibrate 200 max_move 0.004 conv_window 8 conv_tol 0.06 conv_count 1000000 step_decay 0.6 force_tol 0 profile_tol 0 frame_updates 25} { tw::set_param $k $v }
+expr {srand(3)}
+tw::init $z0 {1.0 1.0} {0 0}
+set h_before -1; set h_first -1
+for {set it 1} {$it <= 12000} {incr it} {
+    set gl {}; set Ml {}
+    foreach p [tw::targets] { lassign [gradV {*}$p] gx gy; lappend gl [list [expr {$gx + 4.0 * [gauss]}] [expr {$gy + 4.0 * [gauss]}]]; lappend Ml {1.0 0.0 0.0 1.0} }
+    tw::accumulate $gl $Ml; tw::advance
+    if {$it == 300} { set h_first $tw::h }
+    if {$tw::n_rest < 0} { set h_before $tw::h }
+    if {$it % 25 == 0} { lassign [tw::frame_force] fn fg; tw::record_frame [tw::frame_z] $fg }
+}
+check "step constant until the string is at rest (rest found at update $tw::n_rest)" [expr {$tw::n_rest > 300 && abs($h_before - $h_first) < 1e-15}]
+check "and smaller afterwards ($tw::h against $tw::h0)" [expr {$tw::h < 0.9 * $tw::h0 && abs($tw::h - $tw::h0 * pow(double($tw::n_rest) / $tw::nacc, 0.6)) < 1e-12}]
+foreach {k v} {memory 200 calibrate 200 max_move 0.002 conv_window 20 conv_tol 0.1 conv_count 3 step_decay 0.0 force_tol 0.3 profile_tol 0.5 frame_updates 100} { tw::set_param $k $v }
+
+# ---- 5j. calibration noise from blocks that are too short is seen to be too small
+expr {srand(9)}
+proc blocks_of {phi nblk blen} {
+    # a series with correlation phi between neighbours, variance 1, cut into block means
+    set x 0.0; set out {}
+    for {set b 0} {$b < $nblk} {incr b} {
+        set sum 0.0
+        for {set i 0} {$i < $blen} {incr i} { set x [expr {$phi * $x + sqrt(1 - $phi * $phi) * [gauss]}]; set sum [expr {$sum + $x}] }
+        lappend out [list [list [expr {$sum / $blen}]]]
+    }
+    return $out
+}
+set r_white 0.0; set r_corr 0.0
+for {set rep 0} {$rep < 200} {incr rep} {
+    lassign [tw::block_noise [blocks_of 0.0 10 20] [lrepeat 10 20]] a b; set r_white [expr {$r_white + $b / $a / 200.0}]
+    lassign [tw::block_noise [blocks_of 0.97 10 20] [lrepeat 10 20]] a b; set r_corr [expr {$r_corr + $b / $a / 200.0}]
+}
+check "independent samples: longer blocks give the same noise (ratio $r_white)" [expr {abs($r_white - 1.0) < 0.12}]
+check "samples correlated over 30 updates, blocks of 20: longer blocks give more (ratio $r_corr)" [expr {$r_corr > 1.2}]
 
 # ---- 6. bad input is refused
 check "too few images refused" [catch {tw::init {{0 0} {1 1}} {1 1} {0 0}}]

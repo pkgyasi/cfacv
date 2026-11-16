@@ -150,7 +150,7 @@ def test_fit_refuses_all_zero_forces(tmp_path):
     p = write_case(tmp_path, "zero", z, 0 * f)
     with pytest.raises(SystemExit) as e:
         fesmap.main(["fit", "--forces", p, "--scales", str(tmp_path / "s.json"), "--out", str(tmp_path / "m.json")])
-    assert isinstance(e.value.code, str) and "zero" in e.value.code, e.value.code
+    assert isinstance(e.value.code, str) and "force is zero" in e.value.code, e.value.code
 
 
 # --------------------------------------------------------------------------

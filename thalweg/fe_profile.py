@@ -323,6 +323,7 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5):
     # unequal runs: an image with a fraction of the others' samples sets the error and nobody notices
     lens = np.array([len(s) for s in samples]); res["samples"] = lens
     res["short_image"] = int(lens.argmin()) if lens.min() < 0.5 * np.median(lens) else None
+    res["samples_ok"] = res["short_image"] is None
     # is the top where it seems?  with another image within the error of the
     # top the barrier's position is not determined, and picking the highest
     # of several noisy values biases the barrier upward
@@ -334,9 +335,8 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5):
     # every image: what the coarser string predicts where the images were
     # dropped.  (Until 2026-11-15 the top and start images were kept, so a
     # feature between them could not show, and the limit used the barrier's
-    # own error: the difference of two profiles from the same data is far
-    # better determined than either, so it is tested against its own error,
-    # block by block.)
+    # own error, which is not the error of the difference of two profiles
+    # from the same data; that is now taken block by block.)
     sp = path_parameter(z, scale)
     idx = np.arange(0, n, 2)
     if idx[-1] != n - 1:
@@ -379,12 +379,15 @@ def print_gates(res):
         print(f"     {label:10s} halves {res[name + '_first_half']:6.2f} and {res[name + '_second_half']:6.2f} (differ by {d:+.2f} +/- "
               f"{res[name + '_halves_se']:.2f}); change over the run {res[name + '_trend']:+.2f} +/- {res[name + '_trend_se']:.2f}  "
               f"{'ok' if res['stable_' + name] else 'NOT STABLE'}; a steady drift under {res[name + '_detectable']:.2f} would not show")
+    print(f"GATE block length: {'PASS' if res['blocks_ok'] else 'FAIL'} (the force stays correlated for "
+          f"{res['correlation_to_block_ratio']:.0%} of a block at worst; limit 20%)")
     if not res["blocks_ok"]:
-        print(f"WARNING: the force stays correlated for {res['correlation_to_block_ratio']:.0%} of a block at some image. Blocks have "
-              "to be several correlation times long; as it is, every error here is too small. Run longer.")
+        print("     blocks have to be several correlation times long; as it is, every error here is too small. Run longer.")
     if res["short_image"] is not None:
-        print(f"WARNING: image {res['short_image']} has {int(res['samples'].min())} samples against a median of "
-              f"{int(np.median(res['samples']))}; its error dominates. Finish that run.")
+        print(f"GATE equal runs: FAIL (image {res['short_image']} has {int(res['samples'].min())} samples against a median of "
+              f"{int(np.median(res['samples']))}; its error dominates and its run may not have relaxed. Finish that run.)")
+    else:
+        print("GATE equal runs: PASS (no image has under half the median number of samples)")
     if res["top_ambiguous_with"]:
         print(f"note: images {res['top_ambiguous_with']} are as high as the top (image {res['top_image']}) within the error: where "
               "the barrier is, is not settled, and the highest of several noisy values overstates it")
@@ -556,12 +559,13 @@ def from_driver(paths, scale, last=None, nblocks=6, max_drift=0.2):
     zbar = Z[use].mean(axis=0)
     res = from_force_samples(zbar, [-G[use, i, :] for i in range(Z.shape[1])], scale, nblocks)
     res.update({"frames_used": nf, "frames_total": len(Z), "first_update": int(upd[first]), "last_update": int(upd[-1]),
-                "updates_per_frame": int(nup[-1]), "drift_in_window": net, "drift_t": t, "wander_in_window": wander,
+                "updates_per_frame": int(nup[-1]), "updates_used": int(nup[use].sum()), "drift_in_window": net, "drift_t": t, "wander_in_window": wander,
                 "systematic_in_window": systematic, "stationary": ok})
     return res
 
 
-def compute(z, theta, k, periodic, scale, nblocks=10, min_overlap=0.05, discard="auto", resolution_tol=0.5, floor=0.1):
+def compute(z, theta, k, periodic, scale, nblocks=10, min_overlap=0.05, discard="auto", resolution_tol=0.5, floor=0.1,
+            kT=0.0019872041 * 300.0):
     """z: (n, D) images.  theta: list of (samples, D) CV series, one per image,
     whole (nothing discarded yet).  discard: a fraction, or "auto" to find
     each image's own equilibration time from its force along the string."""
@@ -586,7 +590,8 @@ def compute(z, theta, k, periodic, scale, nblocks=10, min_overlap=0.05, discard=
     res["overlap_ok"] = bool(ov.min() >= min_overlap)
     # the restraint's own width against each CV's length scale: what the runs
     # measure is the free energy smoothed over that width (see reference_smoothed)
-    res["restraint_width"] = np.sqrt(0.596 / np.maximum(k, 1e-12)) / np.asarray(scale, float)
+    res["restraint_width"] = np.sqrt(kT / np.maximum(k, 1e-12)) / np.asarray(scale, float)
+    res["kT"] = float(kT)
     return res
 
 
@@ -648,6 +653,7 @@ def main(argv=None):
     p.add_argument("--refine", type=int, default=0,
                    help="write anchors with this many images added where the mean force changes fastest "
                         "(default: as many as the string has segments, when the resolution check fails)")
+    p.add_argument("--temperature", type=float, default=300.0, help="of the restrained runs, for the restraint's width [300]")
     p.add_argument("--out", default="profile")
     p = sub.add_parser("driver", help="profile from the forces a thalweg driver run recorded: no extra MD")
     p.add_argument("--forces", nargs="+", required=True, help="the run's .forces files, one per leg, in order")
@@ -658,6 +664,7 @@ def main(argv=None):
                    help="largest scaled distance any image may have moved across the frames used, beyond the "
                         "string's own wander between neighbouring quarters of them (the driver's plateau test) [0.2]")
     p.add_argument("--blocks", type=int, default=6)
+    p.add_argument("--min-updates", type=int, default=20000, help="updates per image the profile must rest on [20000]")
     p.add_argument("--out", default="profile_driver")
     p = sub.add_parser("reference", help="what a profile should be, from unbiased trajectories (see reference_smoothed)")
     p.add_argument("--profile", required=True, help="a profile JSON from 'compute' or 'driver' (its images are used)")
@@ -741,10 +748,13 @@ def main(argv=None):
               f"{res['updates_per_frame']} updates each); across them one image moved {res['systematic_in_window']:.3f} "
               f"scaled units beyond the string's own wander of {res['wander_in_window']:.3f}")
         print(f"GATE stationary string: {'PASS' if res['stationary'] else 'FAIL'} (limit {a.max_drift} scaled units)")
-        if res["frames_used"] * res["updates_per_frame"] < 20000:
-            print(f"NOTE: only {res['frames_used'] * res['updates_per_frame']} updates per image went into this profile. On alanine dipeptide a "
-                  "profile from 5,400 updates passed its gates and was 0.3 kcal/mol low at the barrier and 0.7 off end to end: "
-                  "with so few, blocks are shorter than the force stays correlated and the errors are too small.")
+        res["updates_ok"] = bool(res["updates_used"] >= a.min_updates)
+        print(f"GATE updates: {'PASS' if res['updates_ok'] else 'FAIL'} ({res['updates_used']} updates per image went into this "
+              f"profile; limit {a.min_updates})")
+        if not res["updates_ok"]:
+            print("     on alanine dipeptide a driver profile from 5,500 updates passed every other gate and was well off the "
+                  "unbiased reference at the barrier and end to end: with so few, blocks are shorter than the force stays "
+                  "correlated and the errors are too small.")
         print(f"{'image':>5s} {'arc':>7s} {'F':>8s} {'+/-':>6s}")
         for i in range(len(z)):
             print(f"{i:5d} {res['arc'][i]:7.2f} {res['F'][i]:8.2f} {res['F_se'][i]:6.2f}")
@@ -757,7 +767,8 @@ def main(argv=None):
                    fmt=["%d", "%.4f", "%.4f", "%.4f"], header="image  scaled_arc  F(kcal/mol)  standard_error")
         save_json(a.out + ".json", res)
         print(f"wrote {a.out}.dat and {a.out}.json")
-        return 0 if (res["stationary"] and res["stable"] and res["resolved"]) else 1
+        return 0 if (res["stationary"] and res["stable"] and res["resolved"] and res["blocks_ok"] and res["samples_ok"]
+                      and res["updates_ok"]) else 1
 
     s = load_json(os.path.join(a.dir, "setup.json"))
     z = np.array(s["points"])
@@ -777,7 +788,8 @@ def main(argv=None):
         sys.exit(f"scales are for {sc['cvs']}, the runs are for {s['cvs']}")
     discard = a.discard if a.discard == "auto" else float(a.discard)
     try:
-        res = compute(z, theta, s["k"], periodic, scale, a.blocks, a.min_overlap, discard, a.resolution_tol, a.floor)
+        res = compute(z, theta, s["k"], periodic, scale, a.blocks, a.min_overlap, discard, a.resolution_tol, a.floor,
+                      kT=0.0019872041 * a.temperature)
     except ValueError as e:
         sys.exit(str(e))
     dr = res["discarded_fraction"]
@@ -811,7 +823,7 @@ def main(argv=None):
               "Prepare them with init_string.py or meanforce.py and recompute.")
     save_json(a.out + ".json", res)
     print(f"wrote {a.out}.dat and {a.out}.json")
-    return 0 if (res["overlap_ok"] and res["stable"] and res["resolved"]) else 1
+    return 0 if (res["overlap_ok"] and res["stable"] and res["resolved"] and res["blocks_ok"] and res["samples_ok"]) else 1
 
 
 if __name__ == "__main__":

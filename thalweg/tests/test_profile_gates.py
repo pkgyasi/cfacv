@@ -122,3 +122,110 @@ def test_resolution_drops_every_other_image_even_at_the_top():
     smp = [np.full((200, 1), -dFdz[i]) + rng.normal(0, 0.05, (200, 1)) for i in range(n)]
     r = fp.from_force_samples(z, smp, np.ones(1), 10)
     assert not r["resolved"]
+
+
+# ------------------------------------------------------------------ helpers for the command line
+def _write_compute_dir(d, z, theta, k, types):
+    """A directory as 'meanforce.py setup' leaves it, filled with runs."""
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "setup.json"), "w") as fh:
+        json.dump({"cvs": [f"c{j}" for j in range(z.shape[1])], "types": types, "k": list(map(float, k)),
+                   "points": z.tolist()}, fh)
+    for i, th in enumerate(theta):
+        with open(os.path.join(d, f"pt{i:05d}.cvout"), "w") as fh:
+            for st, v in enumerate(th):
+                fh.write(f"CFACV/C) Th {st * 10} " + " ".join(f"{x:.6f}" for x in v) + "\n")
+    sc = os.path.join(d, "scales.json")
+    with open(sc, "w") as fh:
+        json.dump({"scale": [1.0] * z.shape[1]}, fh)
+    return sc
+
+
+def _main(args):
+    import fe_profile as fp
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try:
+            rc = fp.main(args)
+        except SystemExit as e:
+            rc = e.code if isinstance(e.code, int) else 1
+            print(e.code)
+    return rc, buf.getvalue()
+
+
+def _ramp_runs(rng, n=9, m=4000, k=100.0, noise=None):
+    """Restrained runs along one distance CV, F = 2 sin^2(pi s): overlapping ensembles."""
+    z = np.linspace(0.0, 1.0, n)[:, None]
+    dFdz = 2 * np.pi * np.sin(2 * np.pi * z[:, 0])
+    sd = np.sqrt(0.596 / k)
+    theta = []
+    for i in range(n):
+        e = rng.normal(0, sd, (m, 1)) if noise is None else noise(i, m) * sd
+        theta.append(z[i] - dFdz[i] / k + e)
+    return z, theta, k
+
+
+# ------------------------------------------------------------------ finding 3: warnings that must be gates
+def test_compute_fails_when_blocks_are_not_longer_than_the_correlation(tmp_path):
+    """Finding 3. With the force correlated over a whole block, every error is
+    too small; that was a WARNING and the exit code ignored it."""
+    from scipy.signal import lfilter
+    rng = np.random.default_rng(4)
+
+    def ar(i, m):
+        a = 0.998
+        return lfilter([1], [1, -a], rng.normal(0, np.sqrt(1 - a * a), (m, 1)), axis=0)
+    z, theta, k = _ramp_runs(rng, noise=ar)
+    sc = _write_compute_dir(str(tmp_path / "r"), z, theta, [k], ["BOND"])
+    rc, out = _main(["compute", "--dir", str(tmp_path / "r"), "--scales", sc, "--discard", "0", "--out", str(tmp_path / "p")])
+    assert "GATE overlap: PASS" in out and "GATE stability: PASS" in out and "GATE resolution: PASS" in out, out
+    assert rc == 1, out
+
+
+def test_compute_fails_when_one_run_was_cut_short(tmp_path):
+    """Finding 3. One image with 2% of the others' samples: a WARNING only."""
+    rng = np.random.default_rng(5)
+    z, theta, k = _ramp_runs(rng)
+    theta[4] = theta[4][:80]
+    sc = _write_compute_dir(str(tmp_path / "r"), z, theta, [k], ["BOND"])
+    rc, out = _main(["compute", "--dir", str(tmp_path / "r"), "--scales", sc, "--discard", "0", "--out", str(tmp_path / "p")])
+    assert "GATE overlap: PASS" in out and "GATE resolution: PASS" in out, out
+    assert rc == 1, out
+
+
+def _driver_lines(rng, nfr, nup, n=11, sd=0.3):
+    lines = ["# update image n_updates z dF/dz"]
+    for fr in range(nfr):
+        for i in range(n):
+            x = i / (n - 1.0)
+            g = np.array([3 * np.pi / 2 * np.sin(np.pi * x), 0.0]) + rng.normal(0, sd, 2)
+            lines.append(f"{(fr + 1) * nup} {i} {nup} {x} 0.0 {g[0]} {g[1]}")
+    return lines
+
+
+def test_driver_fails_on_too_few_updates(tmp_path):
+    """Finding 3 and 12. Under 20,000 updates per image was a NOTE (with stale
+    numbers in it); the exit code ignored it."""
+    rng = np.random.default_rng(6)
+    f = tmp_path / "few.forces"; f.write_text("\n".join(_driver_lines(rng, 60, 100)) + "\n")
+    sc = tmp_path / "s.json"; sc.write_text(json.dumps({"scale": [1.0, 1.0]}))
+    rc, out = _main(["driver", "--forces", str(f), "--scales", str(sc), "--out", str(tmp_path / "o")])
+    assert "GATE stationary string: PASS" in out and "GATE stability: PASS" in out and "GATE resolution: PASS" in out, out
+    assert "0.3 kcal/mol low" not in out
+    assert rc == 1, out
+    # the same run with 1000 updates a frame is long enough
+    f.write_text("\n".join(_driver_lines(np.random.default_rng(6), 60, 1000)) + "\n")
+    rc, out = _main(["driver", "--forces", str(f), "--scales", str(sc), "--out", str(tmp_path / "o")])
+    assert rc == 0, out
+
+
+# ------------------------------------------------------------------ finding 11
+def test_restraint_width_uses_the_temperature(tmp_path):
+    """Finding 11. kT was 0.596 whatever the temperature."""
+    rng = np.random.default_rng(7)
+    z, theta, k = _ramp_runs(rng)
+    sc = _write_compute_dir(str(tmp_path / "r"), z, theta, [k], ["BOND"])
+    rc, out = _main(["compute", "--dir", str(tmp_path / "r"), "--scales", sc, "--discard", "0", "--temperature", "600",
+                     "--out", str(tmp_path / "p")])
+    P = json.load(open(str(tmp_path / "p") + ".json"))
+    assert abs(P["restraint_width"][0] - np.sqrt(0.0019872041 * 600 / k)) < 1e-6, P.get("restraint_width")

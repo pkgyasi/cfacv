@@ -91,6 +91,83 @@ def cv_values_from_points(cvtype, pts):
     raise ValueError(cvtype)
 
 
+_PSF_CHECKED = {}
+
+
+def check_psf(path):
+    """Refuse a PSF whose residue-number field is not an integer.
+
+    A residue with an insertion code ("1A") is read by MDAnalysis as residue
+    1, merged with the real residue 1: a selection such as 'resid 1 and name
+    CA' then names two atoms and silently becomes their centre of mass, while
+    cfacv and VMD keep them apart.  Renumber such residues before use."""
+    import os
+    path = str(path)
+    if not path.lower().endswith(".psf"):
+        return
+    try:
+        key = (os.path.abspath(path), os.path.getmtime(path))
+    except OSError:
+        return
+    if key in _PSF_CHECKED:
+        return
+    bad = []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if "!NATOM" in line:
+                n = int(line.split()[0])
+                for _ in range(n):
+                    f = fh.readline().split()
+                    if len(f) > 2 and not re.fullmatch(r"-?\d+", f[2]):
+                        bad.append(f"atom {f[0]} (segment {f[1]}, residue '{f[2]}')")
+                break
+    if bad:
+        raise ValueError(f"{path}: {len(bad)} atom(s) have a residue number that is not an integer, e.g. {bad[0]}. "
+                         "MDAnalysis merges an inserted residue such as 1A into residue 1, and a selection by number "
+                         "would then name atoms of both. Renumber those residues (or give them their own segment).")
+    _PSF_CHECKED[key] = True
+
+
+def read_xsc(path):
+    """Cell of a NAMD .xsc as MDAnalysis dimensions [a, b, c, alpha, beta,
+    gamma], triclinic cells included."""
+    rows = [l.split() for l in open(path) if l.strip() and not l.startswith("#")]
+    if not rows or len(rows[-1]) < 10:
+        raise ValueError(f"{path}: no cell vectors")
+    v = np.array([float(x) for x in rows[-1][1:10]]).reshape(3, 3)
+    from MDAnalysis.lib.mdamath import triclinic_box
+    box = np.asarray(triclinic_box(*v), float)
+    if not np.all(box[:3] > 0):
+        raise ValueError(f"{path}: cell vectors {v.tolist()} do not make a cell")
+    return box
+
+
+def load_namdbin(psf, coor, xsc=None):
+    """A Universe on a NAMD binary coordinate file, with the cell from the
+    .xsc beside it (or the one given) when there is one.  Coordinates NAMD
+    wrote with wrapAll on are only right with their cell."""
+    import os
+    import MDAnalysis as mda
+    check_psf(psf)
+    u = mda.Universe(psf, coor, format="NAMDBIN")
+    xsc = xsc or (coor[:-5] + ".xsc" if str(coor).endswith(".coor") else None)
+    if xsc and os.path.exists(xsc):
+        u.dimensions = read_xsc(xsc)
+    return u
+
+
+_SEL_END = r"(?=\s+and\b|\s*\)|\s*$)"
+
+
+def _single_atom_pick(sel):
+    """Is a selection written to name ONE atom: one atom name in one residue
+    number, or one atom serial/index?"""
+    s = sel.strip()
+    if re.search(r"\b(bynum|index)\s+\d+" + _SEL_END, s):
+        return True
+    return bool(re.search(r"\bname\s+\S+" + _SEL_END, s) and re.search(r"\bresid\s+-?\d+" + _SEL_END, s))
+
+
 class CVCalculator:
     """Evaluates a CVSet on an MDAnalysis Universe.
 
@@ -98,12 +175,16 @@ class CVCalculator:
     first atom) before its centre of mass is taken, and the groups of one CV
     are then brought to the image nearest the first group, so a CV is right
     even when the trajectory was written with wrapping on and a group
-    straddles the box edge.
+    straddles the box edge.  A group wider than about half the box cannot be
+    made whole this way, and is refused.
     """
 
     def __init__(self, cvset, universe):
         self.cvset = cvset
         self.u = universe
+        top = getattr(universe, "filename", None)
+        if top:
+            check_psf(top)
         self.groups = []
         for c in cvset.cvs:
             gs = []
@@ -111,6 +192,10 @@ class CVCalculator:
                 g = universe.select_atoms(sel)
                 if g.n_atoms == 0:
                     raise ValueError(f"CV {c['name']}: selection '{sel}' matches no atoms")
+                if g.n_atoms > 1 and _single_atom_pick(sel):
+                    raise ValueError(f"CV {c['name']}: selection '{sel}' names one atom but matches {g.n_atoms} atoms "
+                                     f"(e.g. in segments {sorted(set(g.segids))[:4]}); add the segment, or the centre of "
+                                     "mass of all of them is used silently")
                 gs.append(g)
             self.groups.append(gs)
 
@@ -130,6 +215,14 @@ class CVCalculator:
             # any group smaller than half the box.
             p0 = g.positions[0].astype(float)
             d = minimize_vectors((g.positions - g.positions[0]).astype(np.float32), box).astype(float)
+            # an atom more than half a box from the first is put in the wrong
+            # image; a minimum-image extent near half the box means that may
+            # have happened, and the centre would be wrong without a sign
+            ext = d.max(axis=0) - d.min(axis=0)
+            if np.any(ext > 0.45 * box[:3]):
+                raise ValueError(f"a group of {g.n_atoms} atoms (first index {g.indices[0]}) spans {ext.max():.1f} A in a "
+                                 f"{box[:3].min():.1f} A box: more than 0.45 of the box, so its centre cannot be found by "
+                                 "the minimum image. Use a smaller group, or unwrapped coordinates without a cell.")
             m = g.masses
             return p0 + (d * m[:, None]).sum(axis=0) / m.sum() if m.sum() > 0 else p0 + d.mean(axis=0)
         pts = [centre(g) for g in gs]

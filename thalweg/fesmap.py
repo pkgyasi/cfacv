@@ -145,54 +145,126 @@ class FESMap:
                    d.get("metric"), d.get("M"))
 
 
-def cross_validate(z, f, sigma, scale, periodic, folds=5, seed=0, ridge=1e-8):
-    """Left-out force error: fit without each fold, predict the fold."""
-    n = len(z)
-    order = np.random.default_rng(seed).permutation(n)
-    num = den = 0.0
-    for k in range(folds):
-        test = order[k::folds]
-        train = np.setdiff1d(order, test)
-        m = FESMap.fit(z[train], f[train], sigma, scale, periodic, ridge)
-        pred = -m.gradient(z[test]) * scale
-        ref = f[test] * scale
-        num += np.sum((pred - ref) ** 2)
-        den += np.sum(ref ** 2)
-    return float(np.sqrt(num / den))
-
-
-def fit_with_sigma_scan(z, f, scale, periodic, sigmas=None, folds=5, ridge=1e-8, types=None):
-    """Scan sigma, keep the one with the smallest left-out force error."""
-    if sigmas is None:
-        # nearest-neighbour spacing sets the natural range
-        du = diff(z[:, None, :], z[None, :, :], periodic) / scale
-        d = np.sqrt(np.sum(du ** 2, axis=2))
-        np.fill_diagonal(d, np.inf)
-        nn = np.median(d.min(axis=1))
-        sigmas = nn * np.array([0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-    scan = [(float(s), cross_validate(z, f, s, scale, periodic, folds, ridge=ridge)) for s in sigmas]
-    best = min(scan, key=lambda t: t[1])
-    return FESMap.fit(z, f, best[0], scale, periodic, ridge, types), scan, best[1]
-
-
-def fit_anisotropic(z, f, scale, periodic, factors=(0.5, 0.7, 1.0, 1.4, 2.0, 3.0), passes=2, folds=5,
-                    ridge=1e-8, types=None, sigmas=None):
-    """Choose a Gaussian width PER CV by cross-validation.
-
-    The basin widths in `scale` are the right ruler for distances along a
-    path, and the wrong shape for the Gaussians: the free energy is smooth
-    along a stiff, nearly harmonic CV (wide Gaussian wanted, narrow basin) and
-    can be sharp along a soft one.  On alanine dipeptide in four torsions,
-    Gaussians shaped by the basin widths left 0.72 of the left-out force
-    unexplained; shaping them per CV brought that to 0.2.
-
-    Starts from the best single width, then tries each factor on each CV in
-    turn, keeping a change when it lowers the left-out force error.
-    Returns (map, record, left-out error); the map keeps `scale` as its
-    distance metric."""
+def check_inputs(z, f, scale, periodic, folds):
+    """Refuse, with a message, the inputs a fit cannot mean anything on."""
+    z, f = np.asarray(z, float), np.asarray(f, float)
     scale = np.asarray(scale, float)
-    m0, scan, err = fit_with_sigma_scan(z, f, scale, periodic, sigmas, folds, ridge, types)
-    width = scale * m0.sigma
+    if not (np.all(np.isfinite(scale)) and np.all(scale > 0)):
+        raise ValueError(f"every scale must be a finite positive length, got {scale.tolist()}")
+    if not (np.all(np.isfinite(z)) and np.all(np.isfinite(f))):
+        bad = np.where(~(np.isfinite(z).all(axis=1) & np.isfinite(f).all(axis=1)))[0]
+        raise ValueError(f"centers or forces are not finite on {len(bad)} rows (first: row {bad[0]})")
+    if not np.any(f != 0):
+        raise ValueError("every mean force is zero: there is no surface to fit")
+    if int(folds) < 2:
+        raise ValueError(f"--folds {folds}: a left-out error needs at least 2 folds")
+    if len(z) < 2 * int(folds):
+        raise ValueError(f"{len(z)} distinct centers: too few for {folds}-fold cross-validation inside "
+                         f"{folds}-fold cross-validation (at least {2 * int(folds)} wanted)")
+
+
+def merge_duplicates(z, f, metric, periodic, tol=1e-6):
+    """Centers closer than `tol` metric units are one center: their forces
+    are averaged.  (A center listed twice, by a dual system or an appended
+    rerun, makes the fit singular, sets the default width to zero, and in
+    cross-validation lets a center predict its own copy.)
+    Returns (z, f, number of rows merged away)."""
+    z, f = np.asarray(z, float), np.asarray(f, float)
+    lab = _groups(z, metric, periodic, tol)
+    if lab.max() + 1 == len(z):
+        return z, f, 0
+    k = lab.max() + 1
+    first = np.array([np.where(lab == g)[0][0] for g in range(k)])
+    fz = np.array([f[lab == g].mean(axis=0) for g in range(k)])
+    return z[first], fz, len(z) - k
+
+
+def _groups(z, metric, periodic, tol):
+    """Label centers joined by chains of distances below `tol` (metric units)."""
+    du = diff(z[:, None, :], z[None, :, :], periodic) / metric
+    near = np.sqrt(np.sum(du ** 2, axis=2)) < tol
+    lab = -np.ones(len(z), int); k = 0
+    for i in range(len(z)):
+        if lab[i] >= 0:
+            continue
+        stack = [i]; lab[i] = k
+        while stack:
+            j = stack.pop()
+            for q in np.where(near[j] & (lab < 0))[0]:
+                lab[q] = k; stack.append(q)
+        k += 1
+    return lab
+
+
+# centers this close (metric units) always fall in the same fold
+TIE = 0.05
+
+
+def fold_split(z, metric, periodic, folds, seed):
+    """Fold of every center.  Centers within TIE metric units of each other go
+    to the same fold, so that a near-copy of a center (a rerun a hair away)
+    cannot predict it."""
+    lab = _groups(np.asarray(z, float), np.asarray(metric, float), periodic, TIE)
+    order = np.random.default_rng(seed).permutation(lab.max() + 1)
+    rank = np.empty_like(order); rank[order] = np.arange(len(order))
+    return rank[lab] % folds
+
+
+def cross_validate(z, f, sigma, scale, periodic, folds=5, seed=0, ridge=1e-8, metric=None, residuals=False):
+    """Left-out force error: fit without each fold, predict the fold.
+
+    The Gaussians are shaped by `scale` (times sigma); the error is measured
+    in `metric` units (default: `scale`), the units paths are measured in.
+    The two must not be confused: measured in a candidate's own widths, the
+    error of a CV is weighted by that CV's trial width, and narrowing the
+    Gaussian of a badly predicted CV lowers the error without predicting
+    anything better.  With residuals=True, also returns the left-out
+    residual (predicted - measured) force at every center, in raw units."""
+    z, f = np.asarray(z, float), np.asarray(f, float)
+    scale = np.asarray(scale, float)
+    metric = scale if metric is None else np.asarray(metric, float)
+    fold = fold_split(z, metric, periodic, folds, seed)
+    res = np.zeros_like(f)
+    for k in range(folds):
+        test = np.where(fold == k)[0]
+        train = np.where(fold != k)[0]
+        if len(test) == 0:
+            continue
+        if len(train) < 2:
+            raise ValueError(f"{len(z)} centers: too few for {folds}-fold cross-validation")
+        m = FESMap.fit(z[train], f[train], sigma, scale, periodic, ridge)
+        res[test] = -m.gradient(z[test]) - f[test]
+    den = np.sum((f * metric) ** 2)
+    err = float(np.sqrt(np.sum((res * metric) ** 2) / den)) if den > 0 else np.inf
+    if not np.isfinite(err):
+        err = np.inf
+    return (err, res) if residuals else err
+
+
+def default_sigmas(z, scale, periodic):
+    """Scaled widths to scan: multiples of the median nearest-neighbour spacing
+    of the DISTINCT centers (a duplicated center is at distance 0 from its copy)."""
+    du = diff(z[:, None, :], z[None, :, :], periodic) / scale
+    d = np.sqrt(np.sum(du ** 2, axis=2))
+    d[d < 1e-9] = np.inf
+    nn = d.min(axis=1)
+    nn = nn[np.isfinite(nn)]
+    if len(nn) == 0:
+        raise ValueError("all centers coincide")
+    return float(np.median(nn)) * np.array([0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+
+def _select_isotropic(z, f, scale, periodic, sigmas, folds, ridge, metric, seed=0):
+    if sigmas is None:
+        sigmas = default_sigmas(z, scale, periodic)
+    scan = [(float(s), cross_validate(z, f, s, scale, periodic, folds, seed, ridge, metric)) for s in sigmas]
+    best = min(scan, key=lambda t: t[1])
+    return best[0], scan, best[1]
+
+
+def _select_anisotropic(z, f, scale, periodic, factors, passes, folds, ridge, metric, sigmas, seed=0):
+    sigma, scan, err = _select_isotropic(z, f, scale, periodic, sigmas, folds, ridge, metric, seed)
+    width = scale * sigma
     record = [("isotropic", width.tolist(), err)]
     for _ in range(passes):
         changed = False
@@ -202,7 +274,7 @@ def fit_anisotropic(z, f, scale, periodic, factors=(0.5, 0.7, 1.0, 1.4, 2.0, 3.0
                 if fac == 1.0:
                     continue
                 w = width.copy(); w[j] *= fac
-                e = cross_validate(z, f, 1.0, w, periodic, folds, ridge=ridge)
+                e = cross_validate(z, f, 1.0, w, periodic, folds, seed, ridge, metric)
                 if e < best[1]:
                     best = (fac, e)
             if best[0] != 1.0:
@@ -210,6 +282,82 @@ def fit_anisotropic(z, f, scale, periodic, factors=(0.5, 0.7, 1.0, 1.4, 2.0, 3.0
                 record.append((f"cv {j} x {best[0]}", width.tolist(), err))
         if not changed:
             break
+    return width, record, err
+
+
+def nested_error(z, f, periodic, folds, metric, select, ridge=1e-8, seed=1):
+    """Left-out force error of the whole procedure, width selection included
+    (nested cross-validation): the widths are chosen again without each
+    outer fold, by `select(z_train, f_train)` -> per-CV widths, and the
+    resulting map is asked for the forces of that fold.  The best of many
+    widths scored on one set of folds is an optimistic number for any of
+    them; this one is not.  Measured in `metric` units."""
+    fold = fold_split(z, metric, periodic, folds, seed)
+    res = np.zeros_like(f)
+    for k in range(folds):
+        test = np.where(fold == k)[0]; train = np.where(fold != k)[0]
+        if len(test) == 0:
+            continue
+        w = select(z[train], f[train])
+        m = FESMap.fit(z[train], f[train], 1.0, w, periodic, ridge)
+        res[test] = -m.gradient(z[test]) - f[test]
+    err = float(np.sqrt(np.sum((res * metric) ** 2) / np.sum((f * metric) ** 2)))
+    return err if np.isfinite(err) else np.inf
+
+
+def _prepare(z, f, scale, periodic, folds):
+    z, f = np.asarray(z, float), np.asarray(f, float)
+    scale = np.asarray(scale, float)
+    check_inputs(z, f, scale, periodic, folds)
+    z, f, merged = merge_duplicates(z, f, scale, periodic)
+    check_inputs(z, f, scale, periodic, folds)
+    return z, f, scale, merged
+
+
+def fit_with_sigma_scan(z, f, scale, periodic, sigmas=None, folds=5, ridge=1e-8, types=None):
+    """Scan sigma, keep the one with the smallest left-out force error.
+    Returns (map, scan, gate error); the gate error is the nested left-out
+    error of the scan (see `nested_error`), not the scan's minimum.
+    Duplicated centers are merged first (fit_with_sigma_scan.merged)."""
+    z, f, scale, merged = _prepare(z, f, scale, periodic, folds)
+    fit_with_sigma_scan.merged = merged
+    sigma, scan, _ = _select_isotropic(z, f, scale, periodic, sigmas, folds, ridge, scale)
+    err = nested_error(z, f, periodic, folds, scale,
+                       lambda zt, ft: scale * _select_isotropic(zt, ft, scale, periodic, sigmas, folds, ridge, scale)[0],
+                       ridge)
+    return FESMap.fit(z, f, sigma, scale, periodic, ridge, types), scan, err
+
+
+def fit_anisotropic(z, f, scale, periodic, factors=(0.5, 0.7, 1.0, 1.4, 2.0, 3.0), passes=2, folds=5,
+                    ridge=1e-8, types=None, sigmas=None):
+    """Choose a Gaussian width PER CV by cross-validation.
+
+    The basin widths in `scale` are the right ruler for distances along a
+    path, and the wrong shape for the Gaussians: the free energy is smooth
+    along a stiff, nearly harmonic CV (wide Gaussian wanted, narrow basin) and
+    can be sharp along a soft one.
+
+    Starts from the best single width, then tries each factor on each CV in
+    turn, keeping a change when it lowers the left-out force error.  That
+    error is ALWAYS measured in `scale` units, whatever the trial widths.
+    (Measured in the trial widths, as this did at first, narrowing a badly
+    predicted CV's Gaussian down-weighted its error: on alanine dipeptide in
+    four torsions it reported 0.23 for a map whose left-out error in path
+    units is 0.36, and 0.21 for the mixed-CV map whose error is 0.50.)
+
+    Returns (map, record, gate error); the map keeps `scale` as its distance
+    metric.  The gate error is the nested left-out error of the whole
+    selection (see `nested_error`): the last entry of `record` is the
+    selection's own, optimistic, minimum.  Duplicated centers are merged
+    first (fit_anisotropic.merged)."""
+    z, f, scale, merged = _prepare(z, f, scale, periodic, folds)
+    fit_anisotropic.merged = merged
+
+    def select(zt, ft):
+        return _select_anisotropic(zt, ft, scale, periodic, factors, passes, folds, ridge, scale, sigmas)
+
+    width, record, _ = select(z, f)
+    err = nested_error(z, f, periodic, folds, scale, lambda zt, ft: select(zt, ft)[0], ridge)
     return FESMap.fit(z, f, 1.0, width, periodic, ridge, types, metric=scale), record, err
 
 
@@ -240,17 +388,31 @@ def main(argv=None):
             sys.exit(f"{len(scale)} scales for a {z.shape[1]}-dimensional CV space")
         periodic = np.array([t in PERIODIC_TYPES for t in types])
         sig = np.array(a.sigmas) if a.sigmas else None
+        fitter = fit_with_sigma_scan if a.isotropic else fit_anisotropic
+        try:
+            if a.isotropic:
+                m, scan, err = fit_with_sigma_scan(z, f, scale, periodic, sig, a.folds, types=types)
+            else:
+                m, scan, err = fit_anisotropic(z, f, scale, periodic, folds=a.folds, types=types, sigmas=sig)
+        except (ValueError, np.linalg.LinAlgError) as e:
+            sys.exit(f"{a.forces}: {e}")
+        if fitter.merged:
+            print(f"{fitter.merged} centers duplicated others (within 1e-6 scaled units) and were merged into them, "
+                  "forces averaged")
+        z = m.centers
         if a.isotropic:
-            m, scan, err = fit_with_sigma_scan(z, f, scale, periodic, sig, a.folds, types=types)
             m.metric = scale.copy()
-            print("sigma (scaled)   left-out force error")
+            print("sigma (scaled)   left-out force error (selection folds)")
             for s, e in scan:
                 print(f"  {s:10.4f}   {e:8.4f}{'   <- chosen' if s == m.sigma else ''}")
         else:
-            m, scan, err = fit_anisotropic(z, f, scale, periodic, folds=a.folds, types=types, sigmas=sig)
-            print("Gaussian width per CV (raw units)             left-out force error")
+            print("Gaussian width per CV (raw units)             left-out force error (selection folds)")
             for what, w, e in scan:
                 print("  " + " ".join(f"{v:8.3f}" for v in w) + f"   {e:8.4f}   {what}")
+        print(f"left-out force error of the whole fit, width choice included (nested {a.folds}-fold), "
+              f"in path units: {err:.3f}")
+        if not np.isfinite(err):
+            sys.exit(f"{a.forces}: the left-out force error is not finite: no map")
         F = m.value(z)
         print(f"{len(z)} centers, F at centers spans {F.min():.2f} to {F.max():.2f} kcal/mol")
         ok = err <= a.max_error

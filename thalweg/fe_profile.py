@@ -238,7 +238,7 @@ def detect_equilibration(x, grid=20, max_fraction=0.6, floor=0.0, gain=1.5):
     return best if best[2] >= gain * base[2] else base
 
 
-def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5):
+def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5, drift_blocks=20, drift_alpha=0.01):
     """Profile and its checks from per-image samples of the mean force.
 
     z: (n, D) images.  samples: list of (m_i, D) arrays, each row one sample
@@ -310,6 +310,32 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5):
         ok = ok and res["trend_ok_" + name]
         # the smallest steady drift over the run this gate would have caught half the time
         res[name + "_detectable"] = t99s * se_s * (nb - 1)
+    # ... and every image on its own.  One image's force drifting moves the
+    # profile from that image on, but in the two aggregate numbers it is
+    # diluted by every other image's noise: on feR0r a 0.05 rad drift of psi
+    # at one image moved the barrier from 3.35 to 3.76 and passed both.  So
+    # each image's force along the string (times the length of string it
+    # stands for: a contribution to F) gets a trend test through drift_blocks
+    # blocks of its run, at a family-wise level drift_alpha over the images
+    # (Bonferroni).  The blocks' own scatter is the error, so correlation
+    # shorter than a block does not matter; the first-zero-crossing
+    # inefficiency underestimates slow tails 2-3x on the alanine runs, which
+    # made a sample-level test fail every real string.
+    nbt = int(max(6, min(drift_blocks, short // 2)))
+    xt = np.arange(nbt) - (nbt - 1) / 2.0; sxx = float(np.dot(xt, xt))
+    tv, chg = np.zeros(n), np.zeros(n)
+    for i, d in enumerate(samples):
+        tng = 0.5 * (z[min(i + 1, n - 1)] - z[max(i - 1, 0)])
+        bm = np.array([c.mean() for c in np.array_split(np.asarray(d, float) @ tng, nbt)])
+        sl = float(np.dot(xt, bm - bm.mean()) / sxx); r = bm - bm.mean() - sl * xt
+        se_sl = float(np.sqrt(max(np.dot(r, r), 1e-300) / (nbt - 2) / sxx))
+        tv[i], chg[i] = sl / se_sl, sl * (nbt - 1)
+    crit = float(student.isf(drift_alpha / 2.0 / n, nbt - 2))
+    res["image_trend_t"] = tv; res["image_trend_change"] = chg; res["image_trend_limit"] = crit
+    res["image_trend_blocks"] = nbt; res["drift_alpha"] = float(drift_alpha)
+    res["drifting_images"] = [int(i) for i in np.flatnonzero(np.abs(tv) > crit)]
+    res["images_stationary"] = not res["drifting_images"]
+    ok = ok and res["images_stationary"]
     res["stable"] = bool(ok); res["stability_limit_t"] = t99h
     # BLOCKS MUST BE LONGER THAN THE CORRELATION TIME, or every error above is
     # too small (with a correlation time of a fifth of the run the quoted
@@ -379,6 +405,11 @@ def print_gates(res):
         print(f"     {label:10s} halves {res[name + '_first_half']:6.2f} and {res[name + '_second_half']:6.2f} (differ by {d:+.2f} +/- "
               f"{res[name + '_halves_se']:.2f}); change over the run {res[name + '_trend']:+.2f} +/- {res[name + '_trend_se']:.2f}  "
               f"{'ok' if res['stable_' + name] else 'NOT STABLE'}; a steady drift under {res[name + '_detectable']:.2f} would not show")
+    tv = np.abs(res["image_trend_t"]); w = int(tv.argmax())
+    print(f"     per image  trend of each image's force through {res['image_trend_blocks']} blocks: largest {tv[w]:.1f} standard "
+          f"errors (image {w}, its contribution to F changed by {res['image_trend_change'][w]:+.2f}); limit {res['image_trend_limit']:.1f} "
+          f"(family-wise {res['drift_alpha']:g} over {len(tv)} images)  "
+          + ("ok" if res["images_stationary"] else f"DRIFTING at images {res['drifting_images']}"))
     print(f"GATE block length: {'PASS' if res['blocks_ok'] else 'FAIL'} (the force stays correlated for "
           f"{res['correlation_to_block_ratio']:.0%} of a block at worst; limit 20%)")
     if not res["blocks_ok"]:

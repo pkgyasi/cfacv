@@ -229,3 +229,52 @@ def test_restraint_width_uses_the_temperature(tmp_path):
                      "--out", str(tmp_path / "p")])
     P = json.load(open(str(tmp_path / "p") + ".json"))
     assert abs(P["restraint_width"][0] - np.sqrt(0.0019872041 * 600 / k)) < 1e-6, P.get("restraint_width")
+
+
+# ------------------------------------------------------------------ finding 4: one image drifting
+def _drift_runs(seed, D, n=31, m=4000, at=12):
+    rng = np.random.default_rng(seed)
+    z, theta, k = _ramp_runs(rng, n=n, m=m)
+    theta[at][:, 0] -= D / k * np.linspace(-0.5, 0.5, m)       # this image's force drifts by D over its run
+    return z, theta, k
+
+
+def test_stability_sees_one_image_drifting():
+    """Finding 4. One image's force drifting by 3 kcal/mol/unit over its run
+    (31 images) passed both aggregate stability tests; the image's own trend
+    is 7 to 10 standard errors."""
+    import fe_profile as fp
+    for seed in range(4):
+        z, theta, k = _drift_runs(seed, 3.0)
+        r = fp.compute(z, theta, [k], np.zeros(1, bool), np.ones(1), discard=0.0)
+        assert not r["stable"], seed
+        assert r["drifting_images"] == [12], r["drifting_images"]
+
+
+def test_per_image_drift_test_is_quiet_on_stationary_runs():
+    import fe_profile as fp
+    from scipy.signal import lfilter
+    fails = 0
+    for seed in range(12):
+        rng = np.random.default_rng(100 + seed)
+
+        def ar(i, m):
+            a = 0.9
+            return lfilter([1], [1, -a], rng.normal(0, np.sqrt(1 - a * a), (m, 1)), axis=0)
+        z, theta, k = _ramp_runs(rng, n=31, noise=ar)
+        r = fp.compute(z, theta, [k], np.zeros(1, bool), np.ones(1), discard=0.0)
+        fails += bool(r["drifting_images"])
+    assert fails <= 1, fails
+
+
+G5 = "/home/DREXEL/pg565/fep/fusion_peptide/6cm3_9d9d0_equilibration_results/t4l_paper/thalweg_review3/break/g5"
+
+
+@pytest.mark.skipif(not os.path.isdir(G5 + "/drift16_0.05"), reason="the reviewer's mutated alanine runs are not here")
+def test_stability_sees_the_reviewers_psi_drift(tmp_path):
+    """Finding 4, on the reviewer's copy of feR0r with psi at image 16 drifted
+    by 0.05 rad over its run: the barrier moved 3.35 -> 3.76 and every gate passed."""
+    sc = G5 + "/../../../validation_alad4d/scales.json"
+    rc, out = _main(["compute", "--dir", G5 + "/drift16_0.05", "--scales", sc, "--out", str(tmp_path / "p")])
+    assert "GATE stability: FAIL" in out, out
+    assert rc == 1

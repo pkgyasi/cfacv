@@ -3,11 +3,15 @@
 
 Restrained MD is run at every image (set it up with meanforce.py, pointing
 --points at the final string).  From each run this takes the mean force
-f = k <theta - z> = -dF/dz and integrates it along the string:
+f = k <theta - z> = -dF/dz and integrates it along the string,
 
-    F_i = - sum_{j<i} 1/2 (f_j + f_j+1) . (z_j+1 - z_j)
+    F(s) = - int_0^s f(s') . z'(s') ds',
 
-in RAW CV units: a line integral does not depend on how the CVs are scaled.
+with z(s) a cubic spline through the images and f(s) a local cubic Hermite
+interpolant of the forces, s the arc length in scaled CV units (see
+`integrate` for why this rule and not the trapezoid rule or a spline through
+the forces).  The line integral itself does not depend on how the CVs are
+scaled; only the curve drawn between the images does.
 
 It reports, for the Stage 6 gates:
   * the profile and its standard error: each run is cut into blocks, every
@@ -51,57 +55,95 @@ def integrate_trapezoid(z, f):
     return np.concatenate([[0.0], np.cumsum(steps)])
 
 
-def integrate(z, f, fine=24):
+def path_parameter(z, scale=None):
+    """Arc length along the images in the CVs' scaled units (the units the rest
+    of thalweg measures distance in).  Without scales, in the CVs' own units.
+
+    (Until 2026-11-15 each CV's steps were divided by the range that CV
+    covers along the string.  A CV that hardly moves then sets the parameter
+    from its noise: on feR0r zeta, spanning 0.044 rad, carried 54% of it.)"""
+    z = np.asarray(z, float)
+    sc = np.ones(z.shape[1]) if scale is None else np.asarray(scale, float) * np.ones(z.shape[1])
+    return np.concatenate([[0.0], np.cumsum(np.sqrt(((np.diff(z, axis=0) / sc) ** 2).sum(axis=1)) + 1e-12)])
+
+
+def _node_slopes(s, f):
+    """dF/ds at the nodes from the three-point (non-uniform) difference, one-sided
+    at the ends.  Linear in f and local: one image's noise reaches two segments."""
+    h = np.diff(s); d = np.empty_like(f)
+    h0, h1 = h[:-1, None], h[1:, None]
+    d[1:-1] = (-h1 / (h0 * (h0 + h1)) * f[:-2] + (h1 - h0) / (h0 * h1) * f[1:-1] + h0 / (h1 * (h0 + h1)) * f[2:])
+    d[0] = (f[1] - f[0]) / h[0]; d[-1] = (f[-1] - f[-2]) / h[-1]
+    return d
+
+
+def integrate(z, f, scale=None, s=None, at=None):
     """Profile from mean forces (f = -dF/dz) at the images z (continuous).
 
-    The path and the force along it are each carried by a cubic spline
-    through the images, and F = -int f . dz is taken along that curve.  The
-    trapezoid rule, the usual choice, treats the path as straight between
-    images and the force as linear: on a 16-image alanine dipeptide string
-    it gave a barrier of 3.18 kcal/mol (3.00 with every other image) where
-    this gives 3.28 (3.25), against 3.43 +/- 0.07 from unbiased dynamics.
-    The result is still linear in the forces.  With fewer than four images
-    it falls back to the trapezoid rule."""
+    F = -int f . dz along a curve through the images.  The path is a cubic
+    spline z(s) through the images, s the scaled arc length (path_parameter).
+    The force is a LOCAL cubic Hermite interpolant of each component, with
+    the slope at an image from it and its two neighbours, so the integrand
+    f(s) . z'(s) is a polynomial of degree five on each segment and is
+    integrated exactly (Gauss-Legendre, 3 points).  The result is linear in
+    the forces, so block profiles average to the profile of the mean force.
+
+    Why not the alternatives (numbers from the review cases, 2026-11-15):
+      * trapezoid rule (path straight, force linear between images): on
+        16-image alanine strings 0.2 kcal/mol low at the barrier; over eight
+        real strings the rms difference from the unbiased reference is 0.25
+        kcal/mol against 0.20 here;
+      * a global cubic spline through the force (the rule until 2026-11-15):
+        rms 0.22, but it overshoots where the force changes sign (feR1f image
+        20: 4.82, here 4.75, trapezoid 4.69, reference 4.56) and spreads one
+        image's noise over its neighbours: 1.5 to 2.2 times the trapezoid's
+        noise on refined spacing, against at most 1.15 here;
+      * the force projected on the spline's tangent at each image, then
+        integrated: fails on a path whose images are not on a smooth curve
+        (0.4 kcal/mol off at 0.05 of jitter, here 0.02);
+      * PCHIP or Akima interpolation of the force: as accurate as this, but
+        not linear in the forces.
+    With fewer than four images it falls back to the trapezoid rule.
+
+    s: the images' parameter values, if not path_parameter(z, scale) (the
+    resolution check passes the full string's values for a subset of its
+    images).  at: parameter values to return F at, instead of the images'
+    (F is then read off the same curve between images)."""
     z = np.asarray(z, float); f = np.asarray(f, float)
-    if len(z) < 4:
+    if len(z) < 4 and at is None:
         return integrate_trapezoid(z, f)
-    from scipy.interpolate import CubicSpline
-    # a parameter along the path that does not depend on the CVs' units: each
-    # CV's steps divided by the range it covers along the string
-    span = np.ptp(z, axis=0); span[span <= 0] = 1.0
-    s = np.concatenate([[0.0], np.cumsum(np.sqrt(((np.diff(z, axis=0) / span) ** 2).sum(axis=1)) + 1e-12)])
-    zs, fs = CubicSpline(s, z), CubicSpline(s, f)
-    out = [0.0]
-    for a, b in zip(s[:-1], s[1:]):
-        x = np.linspace(a, b, fine + 1)
-        y = (fs(x) * zs(x, 1)).sum(axis=1)
-        out.append(out[-1] - float(((y[:-1] + y[1:]) * 0.5 * np.diff(x)).sum()))
-    return np.array(out)
+    s = path_parameter(z, scale) if s is None else np.asarray(s, float)
+    n = len(s); h = np.diff(s)
+    if n < 4:                                                  # straight segments, force linear along them
+        def dz(x):
+            k = np.clip(np.searchsorted(s, x, "right") - 1, 0, n - 2)
+            return (z[k + 1] - z[k]) / h[k, None]
+        df = None
+    else:
+        from scipy.interpolate import CubicSpline
+        dz = CubicSpline(s, z).derivative(); df = _node_slopes(s, f)
+    x, w = np.polynomial.legendre.leggauss(3)
 
-
-def integration_weights(z):
-    """W with F = W . f(flattened): F_i is linear in the mean forces, so the
-    variance of F_i is sum_j W_ij^2 var(f_j) for independent images."""
-    n, d = z.shape
-    dz = np.diff(z, axis=0)
-    W = np.zeros((n, n, d))
-    for i in range(1, n):
-        W[i] = W[i - 1]
-        W[i, i - 1] += -0.5 * dz[i - 1]
-        W[i, i] += -0.5 * dz[i - 1]
-    return W
-
-
-def profile_with_error(z, f, se):
-    F = integrate(z, f)
-    W = integration_weights(z)
-    var = np.einsum("ijd,jd->i", W ** 2, se ** 2)
-    return F, np.sqrt(var), W
-
-
-def difference_error(W, se, i, j):
-    """Standard error of F_i - F_j."""
-    return float(np.sqrt(np.sum((W[i] - W[j]) ** 2 * se ** 2)))
+    def piece(k, t):
+        """-int f . dz from s[k] to s[k] + t h[k], for arrays k and t in [0, 1]."""
+        out = np.zeros(len(k)); hk = h[k]
+        for xi, wi in zip(x, w):
+            u = 0.5 * t * (xi + 1.0)
+            if df is None:
+                fu = (1 - u)[:, None] * f[k] + u[:, None] * f[k + 1]
+            else:
+                h00, h10, h01, h11 = 2 * u ** 3 - 3 * u ** 2 + 1, u ** 3 - 2 * u ** 2 + u, -2 * u ** 3 + 3 * u ** 2, u ** 3 - u ** 2
+                fu = (h00[:, None] * f[k] + (h10 * hk)[:, None] * df[k] + h01[:, None] * f[k + 1]
+                      + (h11 * hk)[:, None] * df[k + 1])
+            out -= 0.5 * wi * t * hk * (fu * dz(s[k] + u * hk)).sum(axis=1)
+        return out
+    seg = np.arange(n - 1)
+    nodes = np.concatenate([[0.0], np.cumsum(piece(seg, np.ones(n - 1)))])
+    if at is None:
+        return nodes
+    at = np.atleast_1d(np.asarray(at, float))
+    k = np.clip(np.searchsorted(s, at, "right") - 1, 0, n - 2)
+    return nodes[k] + piece(k, (at - s[k]) / h[k])
 
 
 def neighbour_overlap(theta, z, periodic, bins=40):
@@ -230,8 +272,8 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5):
         for b, chunk in enumerate(np.array_split(np.asarray(d, float), nb)):
             fb[b, i] = chunk.mean(axis=0)
     f = np.array([np.asarray(d, float).mean(axis=0) for d in samples])
-    Fb = np.array([integrate(z, fb[b]) for b in range(nb)])           # one profile per block
-    F = integrate(z, f)
+    Fb = np.array([integrate(z, fb[b], scale) for b in range(nb)])           # one profile per block
+    F = integrate(z, f, scale)
     top = int(F.argmax()); start = int(F[: top + 1].argmin())
 
     def err(q, rows=slice(None)):                                      # standard error of a quantity over the blocks
@@ -288,16 +330,32 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5):
     near = [int(i) for i in range(n) if i != top and abs(i - top) > 1
             and abs(Ftop[i]) <= t95 * err(Fb[:, i] - Fb[:, top])]
     res["top_ambiguous_with"] = near
-    # every other image, keeping the ones the two numbers are read at
-    idx = np.unique(np.concatenate([np.arange(0, n, 2), [top, start, n - 1]]))
-    Fc = integrate(z[idx], f[idx]); pos = {int(j): k for k, j in enumerate(idx)}
-    res["barrier_half_images"] = float(Fc[pos[top]] - Fc[pos[start]])
+    # every other image (and the last), the profile read off THEIR curve at
+    # every image: what the coarser string predicts where the images were
+    # dropped.  (Until 2026-11-15 the top and start images were kept, so a
+    # feature between them could not show, and the limit used the barrier's
+    # own error: the difference of two profiles from the same data is far
+    # better determined than either, so it is tested against its own error,
+    # block by block.)
+    sp = path_parameter(z, scale)
+    idx = np.arange(0, n, 2)
+    if idx[-1] != n - 1:
+        idx = np.append(idx, n - 1)
+    Fc = integrate(z[idx], f[idx], s=sp[idx], at=sp)
+    Fcb = np.array([integrate(z[idx], fb[b][idx], s=sp[idx], at=sp) for b in range(nb)])
+    res["barrier_half_images"] = float(Fc[top] - Fc[start])
     res["delta_F_half_images"] = float(Fc[-1] - Fc[0])
-    res["resolved_barrier"] = bool(abs(res["barrier"] - res["barrier_half_images"]) <= t95 * res["barrier_se"] + resolution_tol)
-    res["resolved_delta_F"] = bool(abs(res["delta_F"] - res["delta_F_half_images"]) <= t95 * res["delta_F_se"] + resolution_tol)
+    for name, q, qc in (("barrier", q_bar, Fcb[:, top] - Fcb[:, start]), ("delta_F", q_dF, Fcb[:, -1] - Fcb[:, 0])):
+        d = res[name] - res[name + "_half_images"]; se_d = err(q - qc)
+        res[name + "_resolution_se"] = se_d
+        # beyond the noise, 0.5 kcal/mol: with an error that falls at least
+        # four-fold when the spacing halves, the full string's own spacing
+        # error is under a third of that, 0.17 kcal/mol (0.3 kT)
+        res["resolved_" + name] = bool(abs(d) <= t95 * se_d + resolution_tol)
+    res["resolution_tol"] = float(resolution_tol)
     res["resolved"] = bool(res["resolved_barrier"] and res["resolved_delta_F"])
     # a rule whose error falls four-fold when the spacing halves leaves a
-    # third of (all - half) with all the images.  The spline rule does better
+    # third of (all - half) with all the images.  The Hermite rule does better
     # than that on a smooth profile, so this is on the safe side.
     res["barrier_discretisation"] = abs(res["barrier"] - res["barrier_half_images"]) / 3.0
     res["delta_F_discretisation"] = abs(res["delta_F"] - res["delta_F_half_images"]) / 3.0
@@ -330,10 +388,13 @@ def print_gates(res):
     if res["top_ambiguous_with"]:
         print(f"note: images {res['top_ambiguous_with']} are as high as the top (image {res['top_image']}) within the error: where "
               "the barrier is, is not settled, and the highest of several noisy values overstates it")
-    print(f"GATE resolution: {'PASS' if res['resolved'] else 'FAIL'} (every other image against all of them)")
+    print(f"GATE resolution: {'PASS' if res['resolved'] else 'FAIL'} (every other image against all of them, the "
+          "difference against its own error)")
     for name, label in (("barrier", "barrier"), ("delta_F", "end-to-end")):
-        print(f"     {label:10s} {res[name]:7.2f} with all images, {res[name + '_half_images']:7.2f} with half  "
-              f"{'ok' if res['resolved_' + name] else 'NOT RESOLVED'}; estimated error from the spacing {res[name + '_discretisation']:.2f}")
+        print(f"     {label:10s} {res[name]:7.2f} with all images, {res[name + '_half_images']:7.2f} with half (difference "
+              f"{res[name] - res[name + '_half_images']:+.2f} +/- {res[name + '_resolution_se']:.2f}, limit {res['t95']:.1f} errors + "
+              f"{res['resolution_tol']:g})  {'ok' if res['resolved_' + name] else 'NOT RESOLVED'}; estimated error from the spacing "
+              f"{res[name + '_discretisation']:.2f}")
 
 
 def read_driver_forces(paths):

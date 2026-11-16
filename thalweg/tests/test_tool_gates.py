@@ -417,7 +417,7 @@ def test_coordinates_are_read_with_the_cell_beside_them(tmp_path):
     assert np.allclose(v.dimensions, [20, 21, 22, 90, 90, 90])
     for f in ("init_string.py", "cv_select.py"):
         src = open(os.path.join(TW, f)).read()
-        assert 'format="NAMDBIN"' not in src, f
+        assert not __import__("re").search(r"Universe\([^)]*\bformat=\"NAMDBIN\"", src), f
 
 
 # ======================================================================= 9

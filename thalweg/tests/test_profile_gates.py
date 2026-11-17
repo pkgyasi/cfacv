@@ -177,7 +177,11 @@ def test_compute_fails_when_blocks_are_not_longer_than_the_correlation(tmp_path)
         return lfilter([1], [1, -a], rng.normal(0, np.sqrt(1 - a * a), (m, 1)), axis=0)
     z, theta, k = _ramp_runs(rng, noise=ar)
     sc = _write_compute_dir(str(tmp_path / "r"), z, theta, [k], ["BOND"])
-    rc, out = _main(["compute", "--dir", str(tmp_path / "r"), "--scales", sc, "--discard", "0", "--out", str(tmp_path / "p")])
+    # --local-tol 5: errors this correlated are too small for EVERY gate that
+    # judges a difference against them, the local resolution check included
+    # (2026-11-16); this test isolates the block-length gate.
+    rc, out = _main(["compute", "--dir", str(tmp_path / "r"), "--scales", sc, "--discard", "0", "--local-tol", "5",
+                     "--out", str(tmp_path / "p")])
     assert "GATE overlap: PASS" in out and "GATE stability: PASS" in out and "GATE resolution: PASS" in out, out
     assert rc == 1, out
 
@@ -598,3 +602,41 @@ def test_block_length_gate_uses_the_block_estimate(monkeypatch):
     assert fp.from_force_samples(z, smp, np.ones(1), 10)["blocks_ok"]
     monkeypatch.setattr(fp, "block_inefficiency", lambda x: 200.0)
     assert not fp.from_force_samples(z, smp, np.ones(1), 10)["blocks_ok"]
+
+
+# ------------------------------------------------------------------ local resolution (2026-11-16)
+def _firstlook(name, seed=0, m=200):
+    """Per-image force samples around a real first look's mean forces, with
+    that run's own standard errors (m samples per image)."""
+    d = json.load(open(os.path.join(os.path.dirname(__file__), "data", "firstlook_cases.json")))
+    c = d[name]; rng = np.random.default_rng(seed)
+    z = np.array(c["z"]); f = np.array(c["mean_force"]); se = np.array(c["mean_force_se"])
+    smp = [f[i] + se[i] * np.sqrt(m) * rng.standard_normal((m, f.shape[1])) for i in range(len(z))]
+    return z, smp, np.array(d["scale"])
+
+
+def test_every_other_image_passes_an_under_resolved_first_look_and_local_resolution_fails_it():
+    """The 16-image first look of a live alanine run (pr0S) is 0.37 kcal/mol
+    below unbiased dynamics at the barrier, 0.25 of it from the image count
+    alone.  Dropping every other image changes its barrier by 0.48, inside
+    t95 x error + 0.5, so the old gate passed it.  Dropping single images
+    shows the spacing: the profile moves by over 0.6 at the second image."""
+    import fe_profile as fp
+    for seed in range(3):
+        z, smp, sc = _firstlook("pr0S", seed)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = fp.from_force_samples(z, smp, sc, 6)
+        assert r["resolved_barrier"] and r["resolved_delta_F"], "the every-other-image check should pass it (that is the defect)"
+        assert not r["resolved_local"], (r["local_worst_image"], r["local_worst_change"], r["local_worst_se"])
+        assert not r["resolved"]
+
+
+def test_local_resolution_passes_a_first_look_with_enough_images():
+    """The 31-image first look (lv0F31) matches unbiased dynamics, 3.33 vs
+    3.45; the local check must not refuse it."""
+    import fe_profile as fp
+    for seed in range(3):
+        z, smp, sc = _firstlook("lv0F31", seed)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = fp.from_force_samples(z, smp, sc, 6)
+        assert r["resolved_local"], (r["local_worst_image"], r["local_worst_change"], r["local_worst_se"])

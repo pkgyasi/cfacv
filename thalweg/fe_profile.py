@@ -287,7 +287,7 @@ def detect_equilibration(x, grid=20, max_fraction=0.6, floor=0.0, gain=1.5):
     return best if best[2] >= gain * base[2] else base
 
 
-def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5, drift_blocks=20, drift_alpha=0.01):
+def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5, drift_blocks=20, drift_alpha=0.01, local_tol=0.3):
     """Profile and its checks from per-image samples of the mean force.
 
     z: (n, D) images.  samples: list of (m_i, D) arrays, each row one sample
@@ -306,7 +306,8 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5, drift_
     them within their combined error, each from the blocks of its own half:
     a drift cannot hide in an error bar it inflated itself.
 
-    RESOLUTION.  The same two numbers from every other image."""
+    RESOLUTION.  The same two numbers from every other image, and the
+    profile with each interior image dropped alone (local resolution)."""
     from scipy.stats import t as student
     z = np.asarray(z, float); n = len(z)
     nb = int(nblocks)
@@ -428,7 +429,39 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5, drift_
         # error is under a third of that, 0.17 kcal/mol (0.3 kT)
         res["resolved_" + name] = bool(abs(d) <= t95 * se_d + resolution_tol)
     res["resolution_tol"] = float(resolution_tol)
-    res["resolved"] = bool(res["resolved_barrier"] and res["resolved_delta_F"])
+    # LOCAL RESOLUTION (2026-11-16).  The every-other-image check above can
+    # pass a profile that is badly under-resolved: when half the images are
+    # themselves too few, the difference measures the COARSE profile's error,
+    # not the full one's, and the two can be of either size.  On exact
+    # reference gradients for two alanine strings at 13 to 97 images
+    # (t4l_paper/thalweg_review3/firstlook/bench_eval.py) it read 0.27 where
+    # the barrier was 0.65 off and 0.37 where an image was 0.84 off.  Instead
+    # each interior image is dropped ALONE and the profile read off the rest
+    # at every image: the largest change was above the true worst-image error
+    # in all 18 cases (1.3x on the coarsest strings, more on fine ones), so a
+    # limit on it is close to a sufficient condition there (not always: on a
+    # pinned-end 16-image string it read 0.39 where the first segment was
+    # 0.44 off).  On real profiles the change beyond its noise allowance is
+    # <= 0.24 for every profile known to match unbiased dynamics (31-, 49-,
+    # 61-image dedicated runs, mixed units, a 31-image first look) and >= 0.31
+    # for every one known to be under-resolved (four 16- and 24-image first
+    # looks, two 16- and 24-image dedicated sets).  local_tol 0.3 (half of kT
+    # at 300 K, the reference gate's tolerance) separates them; the gap is
+    # narrow.  The change is judged against its own block error, as above.
+    loo_d, loo_se = np.zeros(n), np.zeros(n)
+    for i in range(1, n - 1):
+        keep = np.delete(np.arange(n), i)
+        Fl = integrate(z[keep], f[keep], s=sp[keep], at=sp)
+        j = int(np.abs(F - Fl).argmax())
+        Flb = np.array([integrate(z[keep], fb[b][keep], s=sp[keep], at=sp)[j] for b in range(nb)])
+        loo_d[i], loo_se[i] = float(F[j] - Fl[j]), err(Fb[:, j] - Flb)
+    excess = np.abs(loo_d) - t95 * loo_se
+    worst = int(excess.argmax()) if n > 2 else 0
+    res["local_change"] = loo_d; res["local_change_se"] = loo_se
+    res["local_worst_image"] = worst; res["local_worst_change"] = float(loo_d[worst])
+    res["local_worst_se"] = float(loo_se[worst]); res["local_tol"] = float(local_tol)
+    res["resolved_local"] = bool(n <= 2 or excess.max() <= local_tol)
+    res["resolved"] = bool(res["resolved_barrier"] and res["resolved_delta_F"] and res["resolved_local"])
     # a rule whose error falls four-fold when the spacing halves leaves a
     # third of (all - half) with all the images.  The Hermite rule does better
     # than that on a smooth profile, so this is on the safe side.
@@ -478,6 +511,11 @@ def print_gates(res):
               f"{res[name] - res[name + '_half_images']:+.2f} +/- {res[name + '_resolution_se']:.2f}, limit {res['t95']:.1f} errors + "
               f"{res['resolution_tol']:g})  {'ok' if res['resolved_' + name] else 'NOT RESOLVED'}; estimated error from the spacing "
               f"{res[name + '_discretisation']:.2f}")
+    if "resolved_local" in res:
+        w = res["local_worst_image"]
+        print(f"     local      dropping image {w} alone changes the profile by {res['local_worst_change']:+.2f} +/- "
+              f"{res['local_worst_se']:.2f} (limit {res['t95']:.1f} errors + {res['local_tol']:g})  "
+              f"{'ok' if res['resolved_local'] else 'NOT RESOLVED: too few images there; refine'}")
 
 
 def read_driver_forces(paths):
@@ -742,7 +780,7 @@ def from_driver(paths, scale, last=None, nblocks=6, rest_tol=0.05, move_max=1.0,
 
 
 def compute(z, theta, k, periodic, scale, nblocks=10, min_overlap=0.05, discard="auto", resolution_tol=0.5, floor=0.1,
-            kT=0.0019872041 * 300.0):
+            kT=0.0019872041 * 300.0, local_tol=0.3):
     """z: (n, D) images.  theta: list of (samples, D) CV series, one per image,
     whole (nothing discarded yet).  discard: a fraction, or "auto" to find
     each image's own equilibration time from its force along the string."""
@@ -760,7 +798,7 @@ def compute(z, theta, k, periodic, scale, nblocks=10, min_overlap=0.05, discard=
         dropped.append(t0 / m)
         forces[i] = forces[i][t0:]
     theta = [np.asarray(th)[len(th) - len(f):] for th, f in zip(theta, forces)]     # the caller's list is left alone
-    res = from_force_samples(z, forces, scale, nblocks, resolution_tol)
+    res = from_force_samples(z, forces, scale, nblocks, resolution_tol, local_tol=local_tol)
     res["discarded_fraction"] = np.array(dropped)
     ov = neighbour_overlap(theta, z, periodic)
     res["overlap"] = ov; res["min_overlap"] = float(ov.min())
@@ -836,6 +874,8 @@ def main(argv=None):
     p.add_argument("--blocks", type=int, default=10)
     p.add_argument("--resolution-tol", type=float, default=0.5,
                    help="allowed change, beyond the error, when half the images are dropped (kcal/mol) [0.5]")
+    p.add_argument("--local-tol", type=float, default=0.3,
+                   help="allowed change, beyond the error, when any one interior image is dropped alone (kcal/mol) [0.3, half of kT at 300 K]")
     p.add_argument("--min-overlap", type=float, default=0.05)
     p.add_argument("--refine", type=int, default=0,
                    help="write anchors with this many images added where the mean force changes fastest "
@@ -1026,7 +1066,7 @@ def main(argv=None):
     discard = a.discard if a.discard == "auto" else float(a.discard)
     try:
         res = compute(z, theta, s["k"], periodic, scale, a.blocks, a.min_overlap, discard, a.resolution_tol, a.floor,
-                      kT=0.0019872041 * a.temperature)
+                      kT=0.0019872041 * a.temperature, local_tol=a.local_tol)
     except ValueError as e:
         sys.exit(str(e))
     res["types"] = list(s["types"]); res["cvs"] = list(s.get("cvs", []))      # 'reference' needs to know which CVs are periodic

@@ -325,12 +325,14 @@ def test_profile_from_driver_forces(tmp_path):
     f1, f2 = tmp_path / "a.forces", tmp_path / "b.forces"       # two legs
     cut = 1 + 20 * n
     f1.write_text("\n".join(lines[:cut]) + "\n"); f2.write_text(lines[0] + "\n" + "\n".join(lines[cut:]) + "\n")
-    res = fp.from_driver([str(f1), str(f2)], np.ones(2))
+    res = fp.from_driver([str(f1), str(f2)], np.ones(2), step=1e-4)
     assert 30 < res["frames_used"] < nfr                     # the moving frames were dropped
     assert abs(res["barrier"] - 3.0) < 0.15 and res["top_image"] == 10
     assert res["stable"] and res["resolved"]
     with pytest.raises(ValueError):
-        fp.from_driver([str(f1)], np.ones(2), max_drift=1e-6)
+        fp.from_driver([str(f1)], np.ones(2), rest_tol=1e-9, step=1e-4)
+    with pytest.raises(ValueError, match="step"):             # without h the rest test cannot be read in free energy
+        fp.from_driver([str(f1), str(f2)], np.ones(2))
 
 
 def test_metric_tensor_against_closed_forms():
@@ -455,37 +457,48 @@ def test_driver_profile_refuses_a_drifting_string_and_one_moving_image(tmp_path)
     rng = np.random.default_rng(8)
     # one image out of eleven drifts steadily the whole time: an average over images would hide it
     f = tmp_path / "drift.forces"; f.write_text("\n".join(_force_frames(0.01 * np.arange(200), rng)) + "\n")
-    with pytest.raises(ValueError, match="not at rest"):
-        fp.from_driver([str(f)], np.ones(2))
+    with pytest.raises(ValueError, match="not shown at rest"):
+        fp.from_driver([str(f)], np.ones(2), step=1e-4)
     # the same string, stopped for its last 120 frames: the last half of the run is at rest, so a profile comes
     # (stopped for only its last 80, the last half is not: refused since 2026-11-15)
     f.write_text("\n".join(_force_frames(np.concatenate([0.01 * np.arange(80), np.full(120, 0.8)]), rng)) + "\n")
-    res = fp.from_driver([str(f)], np.ones(2))
-    # the last half of the run at least; the tail of the creep that fits within the limit comes with it
-    # (151 frames here; 175 before the window's first half had to pass as well)
-    assert 100 <= res["frames_used"] <= 155 and res["systematic_in_window"] <= 0.2 and res["stationary"]
+    res = fp.from_driver([str(f)], np.ones(2), step=1e-4)
+    # the last half of the run at least; the window may reach back into the tail of the creep only as far as that
+    # tail is worth at most rest_tol (143 frames here: the last 23 of the creep, 0.23 of movement over h W = 1.43)
+    assert 100 <= res["frames_used"] <= 150 and res["rest_cost"] <= 0.05 and res["stationary"]
+    assert abs(res["barrier"] - 3.0) < 0.3                   # and the profile is still the right one
 
 
-def test_plateau_tells_a_resting_string_from_a_creeping_one(tmp_path):
-    """Both strings wander alike between neighbouring stretches; only one goes anywhere."""
+def test_rest_test_tells_a_resting_string_from_a_creeping_one(tmp_path):
+    """Both strings wander alike between neighbouring stretches; only one goes
+    anywhere.  At h = 1e-4 and 100 updates a frame, a creep of 0.004 a frame
+    is driven by 0.4 kcal/mol per scaled unit and over 400 frames is worth
+    (1.6 + bound)^2 / (h W) ~ 0.7 kcal/mol; the wander, t^2 sigma^2 / (h W),
+    a few thousandths."""
     import fe_profile as fp
     rng = np.random.default_rng(21)
     n, nfr = 12, 800
     base = np.column_stack([np.arange(n, dtype=float), np.zeros(n)])
-    w = np.zeros((nfr, n)); 
+    w = np.zeros((nfr, n))
     for f in range(1, nfr):
         w[f] = 0.8 * w[f - 1] + rng.normal(0, 0.04, n)        # slow wander across the string
     rest = np.repeat(base[None], nfr, axis=0); rest[:, :, 1] += w
-    creep = rest.copy(); creep[:, 6:, 1] += 0.001 * np.arange(nfr)[:, None]   # the far half creeps 0.8 over the run
-    s_rest, f_rest = fp.plateau_motion(rest[nfr // 2:], np.ones(2))
-    s_creep, f_creep = fp.plateau_motion(creep[nfr // 2:], np.ones(2))
-    assert s_rest < 0.1 and 0.22 < s_creep < 0.36             # 0.1 per block: sqrt(8) x 0.1 = 0.28
-    assert f_rest < 0.1 and f_creep < 0.1                     # a limit of 0.1 on neighbouring stretches passes both
-    assert fp.stationary(rest[nfr // 2:], np.ones(2), 0.2)[0] and not fp.stationary(creep[nfr // 2:], np.ones(2), 0.2)[0]
+    creep = rest.copy(); creep[:, 6:, 1] += 0.004 * np.arange(nfr)[:, None]   # the far half creeps
+    W = 100 * (nfr // 2)
+    ok_r, r_rest = fp.at_rest(rest[nfr // 2:], np.ones(2), 1e-4, W, free=(0, n - 1))
+    ok_c, r_creep = fp.at_rest(creep[nfr // 2:], np.ones(2), 1e-4, W, free=(0, n - 1))
+    assert ok_r and r_rest["rest_cost"] < 0.05 and r_rest["rest_precision"] < 0.01
+    assert not ok_c and r_creep["rest_cost"] > 0.3 and r_creep["worst_image"] >= 6
+    # the bound covers the measured movement: 1.6 across the window for the far half
+    assert np.all(r_creep["U"][7:] >= 1.6 * 0.95)          # (image 6 sits at the kink: its tangent leans into the creep)
     # sliding along the path is not movement: the same string with its images respaced
     slid = base.copy(); slid[1:-1, 0] += 0.3
     Z = np.concatenate([np.repeat(base[None], 40, axis=0), np.repeat(slid[None], 40, axis=0)])
-    assert fp.plateau_motion(Z, np.ones(2))[0] < 1e-6
+    assert fp.rest_motion(Z, np.ones(2), 1e-4, 8000, free=(0, n - 1))["rest_move"] < 1e-9
+    # a free end that moves along the path does count
+    end = base.copy(); end[-1, 0] += 0.3
+    Z = np.concatenate([np.repeat(base[None], 40, axis=0), np.repeat(end[None], 40, axis=0)])
+    assert fp.rest_motion(Z, np.ones(2), 1e-4, 8000, free=(0, n - 1))["worst_image"] == n - 1
 
 
 def test_driver_force_legs_overlap_and_cut_frames(tmp_path):

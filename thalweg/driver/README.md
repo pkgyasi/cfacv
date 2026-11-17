@@ -13,7 +13,7 @@ Written 2026-11-14.
 | how an image moves | along -M g, g from the last `steps_per_run` MD steps | by default against the part of g that a minimum free-energy path does not balance (`TW(flow) residual`), g from the same few MD steps and the metric tensor averaged over `TW(memory)` updates; `TW(flow) metric` moves along -M g |
 | the result | the string at the last update | the AVERAGE of the string over the last window of frames (iterate averaging): the momentary string fluctuates about the path and never settles, because the step is constant |
 | step size | `SMPARAMS(stepsize)`, chosen by hand | measured: the string stands still for `TW(calibrate)` updates, then the step is the smaller of two limits: the fastest image moves `TW(max_move)` scaled units per update, or the noise alone moves an image less than half the drift tolerance over one test window |
-| when it stops | after `num_runs` updates | when, over the last half of the run, the averaged string has not moved beyond its own wander and no force is left across it, and the profile along it is not demonstrably changing; or at `num_runs` |
+| when it stops | after `num_runs` updates | when, over the last half of the run, the movement of the averaged string and its uncertainty are each worth at most `rest_tol` (0.05 kcal/mol) of free energy, no force is left across it, and the profile along it is not demonstrably changing; or at `num_runs` |
 | end images | move with the force | move with the force, or are pinned (`TW(pin_first)`, `TW(pin_last)`); an image next to an end that doubles back is dropped |
 | respacing | straight segments between images | a cubic spline through the images |
 | two systems per image | needed for independent force and metric estimates | optional (`TW(dual)`); the running averages make it unnecessary |
@@ -46,7 +46,7 @@ frames, and the monitor then shortens its window). Each frame's string is
 the MEAN over that frame's updates, unwrapped (a torsion may lie beyond
 pi). The `SM FINALiter` block at the end is the result: the string averaged
 over the last window and respaced. Lines starting `TW iter` carry the step,
-the largest across-string move, the short-window drift (as a curve, and per image), the plateau statistic and the wander, the residual force, its noise,
+the largest across-string move, the short-window drift (as a curve, and per image), the rest test's costs (`rest_cost`, `rest_precision`), movement bound and worst image, the residual force, its noise,
 the residual with the noise taken out, and the profile change.
 
 Next to it, `<output_root>.job<N>.0.forces` holds one line per image per
@@ -68,72 +68,106 @@ refinement, so it is a first look, not the profile of record.
   evaluations in a row and holding (below), and only once the last half of
   the history since calibration covers at least `TW(plateau_span)` updates
   (10,000) and 8 x `TW(conv_window)` frames. A stop happens only on a frame
-  on which the tests were evaluated (every `TW(plateau_every)` frames).
-  1. *Plateau.* The last half of the frames since calibration is cut into
-     eight blocks. For each image, the largest distance (as a curve) between
-     the mean strings of ANY two blocks is taken, less the distance the noise
-     alone puts between two block means, which is measured inside the blocks
-     (from the two halves of each). The largest of these over the images
-     must be below `TW(plateau_tol)` (0.2 scaled units), and so must the
-     noise term itself (reported as `wander`, worst image).
+  on which the tests were evaluated (every `TW(plateau_every)` frames). The
+  rest and profile tests were rebuilt on 2026-11-16 (below); the force test
+  is unchanged.
+  1. *Rest* (`tw::rest`). The last half of the history is cut into eight
+     blocks. For every image that moves, d is its displacement from the
+     half's mean string, across that string (the part along its tangent
+     removed), or all of it at a free end, in scaled units. A straight line
+     through the eight block means of d gives the movement across the half
+     and, from the scatter of the block means about the line, its error
+     (batch means). U is the upper 95% bound on how far the image moved
+     (Student t, 6 dof). Two costs, in kcal/mol, must be at most
+     `TW(rest_tol)` (0.05, about kT/12) at every image:
+     - `rest_cost` = U^2 / (h W), W the half's updates. With the residual
+       flow a movement M over W updates is driven by a mean force M / (h W),
+       which does M^2 / (h W) of work on the way: what the movement is worth.
+     - `rest_precision` = t^2 sigma^2 / (h W), sigma^2 the image's mean
+       squared d: what not knowing where the averaged string sits is worth,
+       1/2 kappa MCSE^2. For a constant step in a well of curvature kappa the
+       correlation time is about 2 / (h kappa), so it cancels and need not be
+       estimated (the estimate is what fooled the plateau test).
+     And no image's U may exceed `TW(rest_move_max)` (1.0 scaled unit, one
+     basin width), a geometric cap. h is the smaller of the current and the
+     calibrated step. Reported as `rest_cost`, `rest_precision`,
+     `rest_move`, `rest_worst_image`.
   2. *Force.* Over the same span, the force left across the string, rms over
      the images that follow the force and with its noise (from four blocks)
      taken out, is below `TW(force_tol)` (0.3 kcal/mol per scaled unit, half
      of kT at 300 K); no single image's is above `TW(force_image_tol)`
      (default -1 = three times `force_tol`, 0.9; 0 turns the per-image cap
-     off); and the force must have been measured (a run that recorded no
-     forces does not pass, which it used to). At a free end the whole
+     off); and the force must have been measured. At a free end the whole
      gradient counts, not only its part across the string.
-  3. *Profile.* The free-energy profile from one window's forces and from
-     the next's is not demonstrably changing by more than `TW(profile_tol)`
-     (0.5 kcal/mol).
+  3. *Profile* (`tw::long_profile`). Each block's mean gradients are
+     integrated along that block's mean string; a straight line through the
+     eight barriers and the eight end-to-end differences. The stop is
+     blocked only when the LOWER 95% bound of the change across the half
+     exceeds `TW(profile_tol)` (0.5 kcal/mol): the profile is demonstrably
+     still changing. The driver's profiles are noisy first looks; the
+     dedicated runs settle the profile.
 
-  **What the plateau test can and cannot see.** Creep slower than about
-  `plateau_tol / plateau_span` per update (2e-5 scaled units with the
-  defaults) passes by construction; that is the choice `plateau_span`
-  makes. With a residual-flow step h a force F drives the string at h F per
-  update, so on alanine dipeptide (h about 3e-4) the default lets through
-  only what a force of about 0.07 kcal/mol per scaled unit would cause, a
-  quarter of `force_tol`. Faster creep, out-and-back excursions, slow
-  oscillations, random walks and an end creeping across or along the path
-  all fail it. A string whose block means scatter by about `plateau_tol` or
-  more cannot be told from one that moves that much and does not stop until
-  its blocks are long enough to average the scatter down. Measured on a
-  12-image test string fed frames directly (`frame_updates 20`, so the
-  default span is 500 frames; AR(1) wander of 0.067 rms per image; 10 seeds;
-  1500 frames, 2500 for the resting rows):
+  **Why the rest test replaced the plateau test.** The plateau test (the
+  largest distance between the mean strings of any two of the eight blocks,
+  less the noise inside the blocks, against 0.2 scaled units) stopped no
+  alanine run in 120,000 updates. Replaying the three runs
+  (`t4l_paper/thalweg_review3/stopping/` in the project) showed why:
+  - the images stay correlated over 10,000 to 20,000 updates, longer than
+    half a block, so the noise inside a block undercounted the noise between
+    blocks; a synthetic string AT REST with each image's measured wander and
+    correlation passed 0.2 in 16% (pr0P) and 26% (pr1F) of trials, while the
+    coherent drift pr1F does have (images 5 to 15, t of -2 to -3.4) did not
+    stand out;
+  - that correlation time is the physics, not a fault: the CVs are scaled by
+    their basin widths, so the curvature across the path is about kT per
+    scaled unit squared, and a constant step relaxes such a direction in
+    about 2 / (h kappa) ~ 15,000 updates;
+  - 0.2 over 60,000 updates is the movement a force of 0.015 kcal/mol per
+    scaled unit causes, twenty times below `force_tol`;
+  - against unbiased dynamics (the restraint-smoothed free energy from 240
+    ns), the barrier along each run's averaged string did not change after
+    10,000 updates: pr0F 3.59-3.60, pr0P 3.56-3.57, pr1F 4.87-4.91 kcal/mol
+    (errors 0.15-0.2).
+  The two-window profile test it sat beside compared twenty frames with
+  twenty and took them as independent; its error was five to ten times too
+  small and it blocked nearly every stop on noise.
 
-  | frames fed (per frame) | before: stopped | after: stopped |
+  **What the new tests do.** The same frames fed through the driver code
+  (history merging and the hold included; the force verdict as logged):
+
+  | run | stops at update | barrier at the stop vs at 120,000 (unbiased reference) |
   |---|---|---|
-  | resting, wander 0.067 rms | 10/10 at 199 | 10/10 at 1255 |
-  | resting, wander 0.17 rms | 10/10 at 218-549 | 4/10 by 2500 (2023-2423) |
-  | resting, wander 0.67 rms | 0/10 | 0/10 |
-  | all creeping 0.0001 / 0.0002 | 10/10 at 199 | 10/10 at 1255-1375 (accepted: under 2e-5 per update) |
-  | all creeping 0.0003 / 0.0004 | 10/10 at 199 | 0/10 |
-  | all creeping 0.0005 / 0.001 / 0.0015 | 10/10 at 199-281 | 0/10 |
-  | all creeping 0.002 / 0.003 | 1/10, 0/10 | 0/10 |
-  | all oscillating, amplitude 0.5, period 107 / 400 | 10/10 / 10/10 | 0/10 / 0/10 |
-  | all oscillating, amplitude 1.0, period 53 | 10/10 | 0/10 |
-  | far half oscillating, amplitude 0.3, period 120 / 300 | 10/10 / 10/10 | 0/10 / 0/10 |
-  | far half random walk, 0.012 a frame | 10/10 | 0/10 |
-  | end image creeping across, 0.002 | 10/10 | 0/10 |
-  | end image creeping along, 0.003 | 10/10 | 0/10 |
+  | pr0F (lower channel, free ends) | 98,400 | 3.59 vs 3.59 |
+  | pr0P (lower channel, pinned ends) | 67,200 | 3.56 vs 3.56 |
+  | pr1F (second channel, free ends) | 74,400 | 4.87 vs 4.88 |
+  | pr1b (known to creep, metric flow) | no stop: rest cost 0.24 to 0.73 | |
 
-  The previous test (first block against last, less neighbouring blocks,
-  from 8 x `conv_window` frames on) is the "before" column. It stopped
-  nearly everything at the earliest frame it could. The plateau test is
-  costlier (36 curve comparisons per evaluation); it runs every
-  `plateau_every` frames.
+  On a model string with a known free energy (an Ornstein-Uhlenbeck string
+  under the residual flow, alanine-like h 1.5e-4 and noise; Tcl tests 5f and
+  7.4, `stopping/model_check.py`): strings at rest and strings relaxing from
+  1.5 and 3 scaled units away (curvatures kT and 2kT) stopped between 55,000
+  and 105,000 updates in the Python model (four seeds each; in the Tcl
+  tests one seed of two needed more than 120,000, so they allow 200,000),
+  with 0.003 to 0.010 kcal/mol still to be gained; a
+  string pushed along a flat direction by 0.3 or 0.1 kcal/mol per scaled
+  unit, one end pushed by 0.3, and a string following a minimum that goes
+  0.6 out and back never stopped. The Tcl and Python versions of the rest
+  test give the same numbers on the same frames (to 1e-6).
 
-  **What this means for the alanine runs.** Replayed through the new test,
-  the five alanine strings that stopped themselves (pr0D, pr0D2, pr0D3,
-  pr1D1, pr1D2) would not have stopped by the plateau test within their
-  lengths: over the last half of each, the images next to the pinned ends
-  (and one or two more) made out-and-back excursions of 0.2 to 0.45 scaled
-  units between blocks of 2,300 to 3,400 updates, while the noise inside a
-  block was about 0.1. The old statistic cancelled these against the
-  neighbouring-block term. Whether those excursions matter for the profile
-  is a separate question; the stopping rule no longer hides them.
+  **What the rest test lets through, and what it cannot see.** A creep
+  driven by a force below sqrt(`rest_tol` / (h W)) passes by construction
+  (0.06 to 0.08 kcal/mol per scaled unit on the alanine runs); in a flat
+  direction that can move an image 0.7 scaled units over a window, which is
+  where the free energy does not care. A direction whose correlation time is
+  longer than the half cannot be shown at rest, and the run goes on (on the
+  model, curvature kT/10: no stop in 120,000 updates); that is the safe way
+  to be wrong, and the shortest alanine run (pr0D3, a 19,200-update half) is
+  refused that way at 0.055. The costs assume the residual flow; with
+  `TW(flow) metric` the alanine mobilities are all at least 1 in scaled
+  units, so they are overestimated. The string written at the end is still
+  the average over the last `conv_window` frames, which carries the
+  string's own wander, worth about h q / 4 per image (a few thousandths of
+  a kcal/mol on alanine).
 
   **Which flow.** With `TW(flow) metric` each image moves along -M g, the
   update as published. The step then has to suit the directions in which M
@@ -161,7 +195,7 @@ refinement, so it is a first look, not the profile of record.
   **A shrinking step.** `TW(step_decay) a` (0 = off) makes the step fall as
   (update at rest / update)^a once the plateau and force tests have passed
   AND held, never before: a string with a vanishing step looks at rest
-  wherever it is. If the plateau test fails later, the rest point is cleared
+  wherever it is. If the rest test fails later, the rest point is cleared
   and the step goes back to its calibrated value. Since a run normally stops
   as soon as the tests hold, the decay only acts when something keeps the
   run going (`TW(min_runs)`, the profile test, a large `TW(conv_count)`).

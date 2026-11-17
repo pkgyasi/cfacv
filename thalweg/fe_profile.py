@@ -561,109 +561,183 @@ def _fine(x, per_segment=12):
     return CubicSpline(s, x, bc_type="natural")(np.linspace(0.0, s[-1], (len(x) - 1) * per_segment + 1))
 
 
-def plateau_motion(Z, scale):
-    """The driver's plateau test (tw::plateau), on these frames.
+# t quantile, one-sided 95%, for the trend through B = 8 block means (6 dof).
+REST_BLOCKS = 8
+REST_T = 1.9431802803927816
 
-    The frames are cut into four equal blocks.  For every image, g2 is its
-    squared distance, as a curve, between the first block's mean string and
-    the last's, and f2 the same between neighbouring blocks (mean of the
-    three pairs).  Returns
-      systematic  the largest sqrt(g2 - f2) over the images: the movement
-                  across these frames that the string's own wander between
-                  neighbouring blocks does not account for;
-      wander      the rms of sqrt(f2) over the images."""
+
+def _rest_tangents(zs):
+    """Unit tangents of a (scaled) string: central differences, one-sided at the ends."""
+    t = np.empty_like(zs)
+    t[1:-1] = zs[2:] - zs[:-2]; t[0] = zs[1] - zs[0]; t[-1] = zs[-1] - zs[-2]
+    n = np.sqrt((t * t).sum(axis=1, keepdims=True))
+    return t / np.where(n > 0, n, 1.0)
+
+
+def _trend(v):
+    """Straight line through B block values v (B, ...): (slope per block, its se), per component."""
+    B = len(v); tb = np.arange(B) - (B - 1) / 2.0; sxx = float(tb @ tb)
+    slope = np.tensordot(tb, v, axes=(0, 0)) / sxx
+    r = v - v.mean(axis=0) - np.multiply.outer(tb, slope)
+    return slope, np.sqrt((r * r).sum(axis=0) / (B - 2) / sxx)
+
+
+def rest_motion(Z, scale, h, updates, held=(), free=()):
+    """The driver's rest test (tw::rest), on these frames: is the string at rest,
+    measured by what its motion is worth in free energy?
+
+    Z (frames, images, D), continuous (unwrapped) raw CVs; h the step (scaled
+    units^2 per kcal/mol per update, the residual flow's); updates the number
+    of updates the frames span.  The last B = 8 x L frames are cut into eight
+    blocks.  For every image that moves (not in `held`), d(t) is its
+    displacement from the window's mean string, across the string (the part
+    along the mean string's tangent removed), or the whole displacement at a
+    free end (in `free`).  A straight line through the eight block means of
+    d gives a slope b per block and its standard error s per component
+    (scatter of the block means about the line: batch means, so correlation
+    shorter than a block does not fool it).
+
+      U     = (|b| + t sqrt(sum s^2)) x 8   upper (95%) bound on how far the
+              image moved across the window, scaled units;
+      cost  = U^2 / (h W)    the free energy a mean force driving that movement
+              dissipates over it: with the residual flow a movement M over W
+              updates is driven by a force M / (h W);
+      prec  = t^2 sigma^2 / (h W)  sigma^2 the mean squared displacement: the
+              cost of not knowing where the averaged string is, 1/2 kappa
+              MCSE^2, with kappa ~ 2/(h tau) for a constant-step update in a
+              well of curvature kappa, so the correlation time tau cancels.
+
+    Returns a dict with per-image arrays and the worst values.  Cost and
+    precision are in kcal/mol; they assume the residual flow (TW(flow)
+    residual, the default).  With the metric flow the mobilities on
+    alanine dipeptide are all at least 1 in scaled units, so these
+    overestimate."""
     Z = np.asarray(Z, float) / scale
-    L = len(Z) // 4
+    B = REST_BLOCKS; L = len(Z) // B
     if L < 1:
-        raise ValueError("need at least 4 frames")
-    Q = [Z[len(Z) - (4 - j) * L: len(Z) - (3 - j) * L].mean(axis=0) for j in range(4)]
-
-    def sq(A, B):
-        return (_to_curve(B, _fine(A)) ** 2 + _to_curve(A, _fine(B)) ** 2) / 2.0
-    g2 = sq(Q[0], Q[3]); f2 = (sq(Q[0], Q[1]) + sq(Q[1], Q[2]) + sq(Q[2], Q[3])) / 3.0
-    return float(np.sqrt(np.clip(g2 - f2, 0.0, None)).max()), float(np.sqrt(f2.mean()))
-
-
-def stationary(Z, scale, max_drift, max_wander=0.15):
-    """Has the string come to rest over these frames?  The driver's plateau
-    statistic (plateau_motion), read as a creep, and a limit on the wander.
-
-      creep   sqrt(2) x the plateau statistic: a steady creep of D across the
-              frames gives a plateau statistic of D / sqrt(2), so this is D.
-              (Until 2026-11-15 the statistic itself was held to max_drift, so
-              a creep of 0.28 passed a limit of 0.2.)
-      wander  the rms over the images of the distance between neighbouring
-              quarters' mean strings.  An excursion out and back leaves the
-              first and last quarters together and the plateau statistic at
-              0; it shows here.  A string at rest on the alanine runs wanders
-              by 0.05 to 0.10 (0.06-0.07 typical, driver README); the limit,
-              0.15, is twice the typical value.  It does not catch an
-              excursion of one image alone smaller than about 0.3.
-    Returns (ok, net, t, wander, creep); net and t are the straight-line fit
-    of window_motion, kept for the report (along-path sliding counts in them,
-    so they are not tested)."""
-    net, t, _ = window_motion(Z, scale)
-    systematic, wander = plateau_motion(Z, scale)
-    creep = float(np.sqrt(2.0) * systematic)
-    return bool(creep <= max_drift and wander <= max_wander), net, t, wander, creep
+        raise ValueError(f"need at least {B} frames")
+    Z = Z[len(Z) - B * L:]
+    zbar = Z.mean(axis=0); T = _rest_tangents(zbar)
+    X = Z - zbar
+    along = (X * T).sum(axis=2, keepdims=True)
+    free_mask = np.isin(np.arange(Z.shape[1]), list(free))[None, :, None]
+    Dn = np.where(free_mask, X, X - along * T)
+    bm = Dn.reshape(B, L, *Dn.shape[1:]).mean(axis=1)           # (B, images, D)
+    slope, se = _trend(bm)
+    U = (np.sqrt((slope ** 2).sum(axis=1)) + REST_T * np.sqrt((se ** 2).sum(axis=1))) * B
+    sig2 = (Dn ** 2).sum(axis=2).mean(axis=0)
+    hW = float(h) * float(updates)
+    cost = U ** 2 / hW; prec = REST_T ** 2 * sig2 / hW
+    moving = np.array([i not in held for i in range(Z.shape[1])])
+    for a in (U, cost, prec):
+        a[~moving] = 0.0
+    w = int(np.argmax(np.maximum(cost, prec)))
+    return {"U": U, "cost": cost, "precision": prec, "sigma": np.sqrt(sig2) * moving,
+            "rest_cost": float(cost.max()), "rest_precision": float(prec.max()), "rest_move": float(U.max()),
+            "worst_image": w, "hW": hW}
 
 
-def from_driver(paths, scale, last=None, nblocks=6, max_drift=0.2, max_wander=0.15, min_frames=40):
+def at_rest(Z, scale, h, updates, rest_tol=0.05, move_max=1.0, held=(), free=()):
+    """rest_motion, judged: cost and precision at every image <= rest_tol
+    (kcal/mol) and no image's movement bound above move_max (scaled units,
+    one basin width by default).  Returns (ok, the rest_motion dict)."""
+    r = rest_motion(Z, scale, h, updates, held, free)
+    ok = r["rest_cost"] <= rest_tol and r["rest_precision"] <= rest_tol and r["rest_move"] <= move_max
+    return bool(ok), r
+
+
+def driver_step(paths):
+    """The step h of a driver run: from a '# step h' line in a .forces file, or
+    the 'calibrated step' in the .history file beside it.  None if neither."""
+    import re
+    for p in reversed(list(paths)):
+        found = None
+        with open(p, errors="replace") as fh:
+            for line in fh:                                   # the driver writes it at calibration and after a restart
+                if line.startswith("#"):
+                    m = re.match(r"#\s*step\s+(\S+)", line)
+                    if m:
+                        found = float(m.group(1))
+        if found is not None:
+            return found
+        hist = re.sub(r"\.forces$", ".history", p)
+        if hist != p and os.path.isfile(hist):
+            with open(hist, errors="replace") as fh:
+                for line in fh:
+                    m = re.search(r"calibrated step (\S+)", line)
+                    if m:
+                        return float(m.group(1))
+    return None
+
+
+def held_images(Z, tol=1e-9):
+    """Images that never moved (pinned ends) and the free ends among the rest."""
+    still = [i for i in range(Z.shape[1]) if np.asarray(Z)[:, i].std(axis=0).max() < tol]
+    free = [i for i in (0, Z.shape[1] - 1) if i not in still]
+    return still, free
+
+
+def from_driver(paths, scale, last=None, nblocks=6, rest_tol=0.05, move_max=1.0, min_frames=40, step=None):
     """Free-energy profile from the forces a thalweg driver run recorded.
 
     Each frame holds every image's mean gradient over that frame's updates
     and the mean position they were measured at.  The string must be at rest
-    (`stationary`) over the LAST HALF of the run, whatever frames are then
-    used: a creeping string always has some short final stretch over which
-    it moved less than any limit, and half the run is what the driver tests
-    too.  Otherwise this refuses (ValueError).  The frames used are then the
-    longest final run that also passes, or the last `last` frames, which must
-    pass as well.  Fewer than min_frames frames are refused: each quarter of
-    the plateau test is then a handful of frames.
-
-    The window is the longest whose frames pass and whose first half passes
-    too (a fast move early in a long window reads as wander to the plateau
-    statistic).  Being the longest that passes, its creep still sits near the
-    limit by construction; what that creep does to the profile is seen by the
-    per-image force trend test in from_force_samples."""
+    (`at_rest`, the driver's own rest test) over the LAST HALF of the run,
+    whatever frames are then used: a creeping string always has some short
+    final stretch over which it moved less than any limit, and half the run
+    is what the driver tests too.  Otherwise this refuses (ValueError).  The
+    frames used are then the longest final run that also passes, or the last
+    `last` frames, which must pass as well.  Fewer than min_frames frames are
+    refused.  The step h comes from `step`, the .forces header, or the
+    .history beside it; without it the rest test cannot be read in free
+    energy and this refuses."""
     upd, Z, G, nup = read_driver_forces(paths)
+    h = step if step is not None else driver_step(paths)
+    if h is None or h <= 0:
+        raise ValueError("the driver's step h is not known (no '# step' line in the .forces files and no .history beside "
+                         "them): give it with --step (the 'calibrated step' of the run's history)")
     n = len(Z); h0 = n // 2
-    need = max(int(min_frames), 2 * nblocks)
+    need = max(int(min_frames), 2 * nblocks, 2 * REST_BLOCKS)
     if n - h0 < 2 * nblocks or n < need:
         raise ValueError(f"{n} frames recorded; the profile needs at least {need}, and the string has to be shown at rest "
                          f"over the last half of the run")
+    held, free = held_images(Z)
 
-    def refuse(W, what):
-        _, net, t, wander, creep = stationary(W, scale, max_drift, max_wander)
-        raise ValueError(f"the string is not at rest over {what} ({len(W)} frames): one image crept {creep:.3f} scaled units "
-                         f"beyond the string's own wander (limit {max_drift}), and the string wandered {wander:.3f} between "
-                         f"neighbouring quarters (limit {max_wander}). Run it longer, or pin its ends if one is creeping.")
-    if not stationary(Z[h0:], scale, max_drift, max_wander)[0]:
-        refuse(Z[h0:], "the last half of the run")
+    def test(sl):
+        W = int(nup[sl].sum())
+        return at_rest(Z[sl], scale, h, W, rest_tol, move_max, held, free)
+
+    def refuse(sl, what):
+        _, r = test(sl)
+        raise ValueError(f"the string is not shown at rest over {what} ({len(Z[sl])} frames): its movement there is worth up to "
+                         f"{r['rest_cost']:.3f} kcal/mol at image {r['worst_image']} (limit {rest_tol}), not knowing where "
+                         f"it sits {r['rest_precision']:.3f} (limit {rest_tol}), and an image may have moved "
+                         f"{r['rest_move']:.2f} scaled units (limit {move_max}). Run it longer, or pin its ends if one is creeping.")
+    if not test(slice(h0, n))[0]:
+        refuse(slice(h0, n), "the last half of the run")
     if last is None:
         first = h0
         for f in range(0, h0):
-            # the window AND its own first half: the plateau statistic reads
-            # a fast move early in a long window as wander, and the longest
-            # passing window would take it in
-            if (stationary(Z[f:], scale, max_drift, max_wander)[0]
-                    and stationary(Z[f:f + (n - f) // 2], scale, max_drift, max_wander)[0]):
+            # the window AND its own first half: a fast move early in a long
+            # window must not hide in it
+            if test(slice(f, n))[0] and test(slice(f, f + (n - f) // 2))[0]:
                 first = f; break
     else:
         first = max(0, n - int(last))
-        if not stationary(Z[first:], scale, max_drift, max_wander)[0]:
-            refuse(Z[first:], f"the last {n - first} frames asked for")
+        if not test(slice(first, n))[0]:
+            refuse(slice(first, n), f"the last {n - first} frames asked for")
     nf = n - first
     if nf < need:
         raise ValueError(f"{nf} frames would be used; need at least {need}")
     use = slice(first, n)
-    ok, net, t, wander, creep = stationary(Z[use], scale, max_drift, max_wander)
+    ok, r = test(use)
     zbar = Z[use].mean(axis=0)
     res = from_force_samples(zbar, [-G[use, i, :] for i in range(Z.shape[1])], scale, nblocks)
     res.update({"frames_used": nf, "frames_total": n, "first_update": int(upd[first]), "last_update": int(upd[-1]),
-                "updates_per_frame": int(nup[-1]), "updates_used": int(nup[use].sum()), "drift_in_window": net, "drift_t": t,
-                "wander_in_window": wander, "systematic_in_window": creep, "creep_in_window": creep, "stationary": ok,
-                "max_drift": float(max_drift), "max_wander": float(max_wander)})
+                "updates_per_frame": int(nup[-1]), "updates_used": int(nup[use].sum()), "stationary": ok, "step": float(h),
+                "rest_cost": r["rest_cost"], "rest_precision": r["rest_precision"], "rest_move": r["rest_move"],
+                "rest_worst_image": r["worst_image"], "rest_tol": float(rest_tol), "move_max": float(move_max),
+                "held_images": list(held), "free_ends": list(free)})
     return res
 
 
@@ -774,11 +848,13 @@ def main(argv=None):
     p.add_argument("--last", type=int, help="use this many final frames (default: the longest final run over which the "
                                            "string did not move); they are tested the same way, and the last half of "
                                            "the run must pass whatever this is")
-    p.add_argument("--max-drift", type=float, default=0.2,
-                   help="largest creep (scaled distance) any image may show across the frames, beyond the string's "
-                        "own wander between neighbouring quarters of them: sqrt(2) x the driver's plateau statistic [0.2]")
-    p.add_argument("--max-wander", type=float, default=0.15,
-                   help="largest rms distance between neighbouring quarters' mean strings [0.15]")
+    p.add_argument("--rest-tol", type=float, default=0.05,
+                   help="the driver's rest test: largest free energy (kcal/mol) the string's movement over the frames, "
+                        "and not knowing where it sits, may be worth at any image [0.05]")
+    p.add_argument("--move-max", type=float, default=1.0,
+                   help="largest movement bound (scaled units) any image may show across the frames [1.0]")
+    p.add_argument("--step", type=float, help="the driver's step h, when the .forces files carry no '# step' line and "
+                                              "no .history is beside them")
     p.add_argument("--min-frames", type=int, default=40, help="fewest frames a profile may rest on [40]")
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--min-updates", type=int, default=20000, help="updates per image the profile must rest on [20000]")
@@ -899,15 +975,16 @@ def main(argv=None):
     if a.cmd == "driver":
         scale = np.array(load_json(a.scales)["scale"])
         try:
-            res = from_driver(a.forces, scale, a.last, a.blocks, a.max_drift, a.max_wander, a.min_frames)
+            res = from_driver(a.forces, scale, a.last, a.blocks, a.rest_tol, a.move_max, a.min_frames, a.step)
         except ValueError as e:
             sys.exit(str(e))
         z = res["z"]
         print(f"{res['frames_used']} of {res['frames_total']} frames used (updates {res['first_update']} to {res['last_update']}, "
-              f"{res['updates_per_frame']} updates each); across them one image crept {res['creep_in_window']:.3f} "
-              f"scaled units beyond the string's own wander of {res['wander_in_window']:.3f}")
-        print(f"GATE stationary string: {'PASS' if res['stationary'] else 'FAIL'} (over the last half of the run and the frames "
-              f"used: creep under {a.max_drift}, wander under {a.max_wander} scaled units)")
+              f"{res['updates_per_frame']} updates each; step {res['step']:.3g})")
+        print(f"GATE string at rest: {'PASS' if res['stationary'] else 'FAIL'} (over the last half of the run and the frames used: "
+              f"its movement is worth up to {res['rest_cost']:.3f} kcal/mol and its position {res['rest_precision']:.3f} "
+              f"(limit {a.rest_tol}) at image {res['rest_worst_image']}; movement bound {res['rest_move']:.2f} "
+              f"scaled units (limit {a.move_max}))")
         res["updates_ok"] = bool(res["updates_used"] >= a.min_updates)
         print(f"GATE updates: {'PASS' if res['updates_ok'] else 'FAIL'} ({res['updates_used']} updates per image went into this "
               f"profile; limit {a.min_updates})")

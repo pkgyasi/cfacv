@@ -209,13 +209,13 @@ def test_driver_fails_on_too_few_updates(tmp_path):
     rng = np.random.default_rng(6)
     f = tmp_path / "few.forces"; f.write_text("\n".join(_driver_lines(rng, 60, 100)) + "\n")
     sc = tmp_path / "s.json"; sc.write_text(json.dumps({"scale": [1.0, 1.0]}))
-    rc, out = _main(["driver", "--forces", str(f), "--scales", str(sc), "--out", str(tmp_path / "o")])
-    assert "GATE stationary string: PASS" in out and "GATE stability: PASS" in out and "GATE resolution: PASS" in out, out
+    rc, out = _main(["driver", "--forces", str(f), "--scales", str(sc), "--out", str(tmp_path / "o"), "--step", "1e-4"])
+    assert "GATE string at rest: PASS" in out and "GATE stability: PASS" in out and "GATE resolution: PASS" in out, out
     assert "0.3 kcal/mol low" not in out
     assert rc == 1, out
     # the same run with 1000 updates a frame is long enough
     f.write_text("\n".join(_driver_lines(np.random.default_rng(6), 60, 1000)) + "\n")
-    rc, out = _main(["driver", "--forces", str(f), "--scales", str(sc), "--out", str(tmp_path / "o")])
+    rc, out = _main(["driver", "--forces", str(f), "--scales", str(sc), "--out", str(tmp_path / "o"), "--step", "1e-4"])
     assert rc == 0, out
 
 
@@ -451,23 +451,29 @@ def _frames(shift_fn, rng, L=400, nimg=12, noise=0.03):
 
 def test_an_excursion_out_and_back_is_not_rest():
     """Finding 8. Every image goes 0.6 out and comes back: the first and last
-    quarters agree, so the plateau statistic is 0 and it passed."""
+    quarters agree, so the old plateau statistic was 0 and it passed.  The
+    rest test reads the scatter of the block means about the line: refused.
+    (400 frames of 100 updates at h = 1e-4.)"""
     import fe_profile as fp
     rng = np.random.default_rng(7)
     Z = _frames(lambda t: 0.6 * np.sin(np.pi * t) * np.array([0.0, 1.0]), rng)
-    assert not fp.stationary(Z, np.ones(2), 0.2)[0]
-    assert fp.stationary(_frames(lambda t: 0.0 * t, rng), np.ones(2), 0.2)[0]
+    assert not fp.at_rest(Z, np.ones(2), 1e-4, 40000)[0]
+    assert fp.at_rest(_frames(lambda t: 0.0 * t, rng), np.ones(2), 1e-4, 40000)[0]
 
 
-def test_a_creep_of_a_quarter_unit_is_not_rest():
-    """Finding 8. A steady creep of D gives a plateau statistic of D/sqrt(2):
-    0.25 across the window passed a limit of 0.2."""
+def test_a_creep_is_judged_by_what_it_is_worth():
+    """Finding 8, restated on 2026-11-16.  The old test held a creep to 0.2
+    scaled units across the window whatever drove it.  The rest test holds it
+    to what the force driving it dissipates: a creep M over W updates at step
+    h costs M^2 / (h W).  At h W = 4, 0.25 across the window (0.016 kcal/mol)
+    is rest and 0.8 (0.16) is not; at h W = 0.4 even 0.25 (0.16) is not."""
     import fe_profile as fp
     rng = np.random.default_rng(7)
     Z = _frames(lambda t: 0.25 * t * np.array([0.0, 1.0]), rng)
-    assert not fp.stationary(Z, np.ones(2), 0.2)[0]
-    Z = _frames(lambda t: 0.1 * t * np.array([0.0, 1.0]), rng)
-    assert fp.stationary(Z, np.ones(2), 0.2)[0]
+    assert fp.at_rest(Z, np.ones(2), 1e-4, 40000)[0]
+    assert not fp.at_rest(Z, np.ones(2), 1e-5, 40000)[0]
+    Z = _frames(lambda t: 0.8 * t * np.array([0.0, 1.0]), rng)
+    assert not fp.at_rest(Z, np.ones(2), 1e-4, 40000)[0]
 
 
 def _creep_file(path, nfr, rate, rng, nup=100, n=11):
@@ -487,10 +493,10 @@ def test_last_does_not_skip_the_half_run_test(tmp_path):
     import fe_profile as fp
     f = tmp_path / "creep.forces"; _creep_file(f, 400, 0.002, np.random.default_rng(1))
     with pytest.raises(ValueError):
-        fp.from_driver([str(f)], np.ones(2))
+        fp.from_driver([str(f)], np.ones(2), step=1e-4)
     for last in (40, 100):
         with pytest.raises(ValueError):
-            fp.from_driver([str(f)], np.ones(2), last=last)
+            fp.from_driver([str(f)], np.ones(2), last=last, step=1e-4)
 
 
 def test_a_short_run_is_refused(tmp_path):
@@ -500,7 +506,7 @@ def test_a_short_run_is_refused(tmp_path):
     for nfr in (16, 30):
         f = tmp_path / f"s{nfr}.forces"; f.write_text("\n".join(_driver_lines(rng, nfr, 100)) + "\n")
         with pytest.raises(ValueError):
-            fp.from_driver([str(f)], np.ones(2))
+            fp.from_driver([str(f)], np.ones(2), step=1e-4)
 
 
 def test_legs_in_the_wrong_order_are_refused(tmp_path):
@@ -527,9 +533,14 @@ def test_the_known_creeping_run_is_refused_in_every_mode_and_the_resting_ones_ar
     for last in (None, 40, 100, 200):
         with pytest.raises(ValueError):
             fp.from_driver([FINAL + "/pr1b.forces"], scale, last=last)
-    for name in ("pr0D2", "pr0D3", "pr1D1", "pr0R"):
+    for name in ("pr0D2", "pr1D1", "pr0R"):
         r = fp.from_driver([f"{FINAL}/{name}.forces"], scale)
         assert r["stationary"], name
+    # pr0D3 is the shortest (a 19,200-update half): since 2026-11-16 its movement bound is worth 0.055 kcal/mol,
+    # just over rest_tol, and it is refused as not yet SHOWN at rest (its barrier against unbiased dynamics was
+    # flat, 3.56-3.57: the safe way to be wrong).  It must be refused for that reason and no other.
+    with pytest.raises(ValueError, match="worth up to 0.05"):
+        fp.from_driver([f"{FINAL}/pr0D3.forces"], scale)
 
 
 # ------------------------------------------------------------------ finding 9: overlap

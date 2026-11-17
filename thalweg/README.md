@@ -25,7 +25,7 @@ Written 2026-11-14 as `stringtools`; renamed thalweg the same day. Fork-local: n
 | 4 | `path_search.py` | lowest-barrier routes on the map: graph search, alternatives, zero-temperature strings between the two basins' minima on the map, and random-start strings, whose routes join the table when the graph search could not return them. With `--forces` it refits the map on subsets of the centers, resampling the force noise (from `forces.dat.se`, or else the map's left-out residual), and says how firm the ranking is; a refit whose string jumps channel or does not converge counts against the ranking, not for it. Two routes are one channel when every blend of them stays on the data and within 0.25 kcal/mol of both tops. A string with an image held back by the support guard is reported as not converged. On the alanine map: 7 channels, the lowest (2.71 kcal/mol) firmly below three of them and only likely below the other three (81 to 94% of refits). `--central-finish` adds a central-tangent finishing pass (opt-in: it converged on 5 of 8 channels and brought none closer to MD). A string through a side minimum is reported as such. When the map carries a metric tensor (`fesmap.py fit --metric-tensor`, opt-in) strings relax to where M grad F lies along them, the condition that defines a minimum free-energy path. They are moved against the part of grad F the path does not balance, with M^-1 as preconditioner and upwind tangents, after a first relaxation without the tensor; the tensor is a smooth average over nearby centers. On alanine dipeptide these strings lie 0.17 to 0.28 scaled units from the MD strings of three routes, the tensor-free ones 0.37 to 0.63; barriers and their order are the same, since both kinds of path cross the same saddles |
 | 4 | `init_string.py` | image anchors -> the files the cfacv string driver starts from; warm-ups; the initiation gate |
 | 5 | `string_monitor.py` | convergence of a string from its history file (for a thalweg-driver history the gate needs the driver's own stop; a run that reached its cap fails; fewer than two windows of frames is refused); merged-or-distinct for two strings; warns when the string doubles back on itself |
-| 6 | `fe_profile.py` | profile along a string. Errors from block profiles (each block of every run integrated into a whole profile), with Student-t limits; gates on overlap (fixed bins in robust-spread units), stability (halves and trend for the barrier and the end-to-end difference, and a trend test on every image's force), resolution (every other image, the difference against its own error), block length (correlation from block averaging) and equal runs. `--refine` adds images where the force curves. `driver` gives a first profile from the forces the thalweg driver recorded, only when the last half of the run is at rest (creep and wander gates, in every mode including `--last`) and at least 20,000 updates per image went in; legs must be given in order. `reference` gates a profile against unbiased trajectories. `compare` is the path-independence check |
+| 6 | `fe_profile.py` | profile along a string. Errors from block profiles (each block of every run integrated into a whole profile), with Student-t limits; gates on overlap (fixed bins in robust-spread units), stability (halves and trend for the barrier and the end-to-end difference, and a trend test on every image's force), resolution (every other image, the difference against its own error), block length (correlation from block averaging) and equal runs. `--refine` adds images where the force curves. `driver` gives a first profile from the forces the thalweg driver recorded, only when the last half of the run is at rest (the driver's rest test, in every mode including `--last`; needs the step h from the run's `.forces` or `.history`, or `--step`) and at least 20,000 updates per image went in; legs must be given in order. `reference` gates a profile against unbiased trajectories. `compare` is the path-independence check |
 | 7 | `committor.py`, `committor_shot.tcl` | unbiased shots that stop on basin entry; the transition-state gate: at least 100 committed shots, at least 5 configurations of 10 holding at least 75% of them, configurations alike (chi-square), and an equivalence test: the 95% interval of the pooled committor, with an error that includes the spread between configurations, inside 0.5 +/- `--equiv` (0.1), with the uncommitted shots bracketed both ways inside the same window. With 200 shots a true 0.5 passes only about 57% of the time; plan on 1,000 |
 | 5 | `driver/` | a string driver of its own: wrapped torsions, a measured step, images that move on each update's force with the AVERAGED string as the result, free ends that slide to their basins or pinned ends, a stopping test (movement over the last half beyond the noise, wander, force left across the string as rms and per image, profile change), spline respacing, restart. See `driver/README.md`. cfacv's driver is unchanged and still usable |
 | 1 | `make_cfacv_inputs.py` | writes cfacv's label PDB and CV file from the CV definition JSON |
@@ -148,12 +148,15 @@ with a Gaussian width per CV; the 0.23 stored before the third review was in the
 refinement with cfacv's driver and with the thalweg driver, profiles from
 dedicated restrained runs, the committor shots, CV selection through
 `thalweg_run.py`, and the profile from the driver's own forces.
-Under the stopping rule of 2026-11-15 (before the third review) the driver
-stopped five pinned-end alanine runs by its own tests. That rule was fooled
-by out-and-back motion and by slow creep, and was replaced. Under the
-present rule no alanine run has stopped itself: three 120,000-update runs
-(lower channel with free and with pinned ends, second channel with free
-ends) all reached their cap, the closest at 0.202 against 0.2. The whole workflow has also been run once on
+Under the plateau test (2026-11-15 to 2026-11-16) no alanine run stopped
+itself: three 120,000-update runs reached their cap. That test read a
+resting string's slow wander as movement; it was replaced on 2026-11-16 by
+the rest test, which judges movement by the free energy it is worth (see
+`driver/README.md`). Replayed through the new tests, the three runs stop at
+67,200 to 98,400 updates with the barrier against unbiased dynamics
+unchanged (within 0.01 kcal/mol of its value at 120,000), and the run known
+to creep is refused. No live run has yet stopped under the new tests.
+The whole workflow has also been run once on
 the same molecule in mixed units (two torsions in radians and a distance
 between two-atom groups in angstrom): see the paper's validation section.
 
@@ -218,15 +221,19 @@ tested: see `tests/` for which have.
   it fluctuates about the path, and the AVERAGED string is the result, with
   a bias of the order of the step.
 - The driver's stopping tests read the last half of the run (at least
-  `TW(plateau_span)` updates): no movement between any two of eight blocks
-  beyond the noise, small wander, and no force left across the string, rms
-  or at any one image. With the residual flow the force left on alanine
-  strings is 0.05 to 0.25 kcal/mol per scaled unit. The images next to
-  pinned ends swing 0.2 to 0.45 scaled units over a few thousand updates,
-  and the test reads that as movement, so in practice the runs reach their
-  cap. The profile tool's own stationarity check on the same runs finds a
-  creep of about 0.12; the two disagree, which is open. See
-  `driver/README.md`.
+  `TW(plateau_span)` updates). The rest test asks what the string's
+  movement, and the uncertainty in where the averaged string sits, are
+  worth in free energy (at most 0.05 kcal/mol at every image), from a line
+  through eight block means with a correlation-robust error; the force test
+  asks that no force is left across the string; the profile test blocks a
+  stop only on a change demonstrated beyond 0.5 kcal/mol. A creep driven by
+  less than sqrt(0.05 / (h W)) kcal/mol per scaled unit (0.06 to 0.08 on
+  the alanine runs) passes by construction; a direction that relaxes more
+  slowly than half the run cannot be shown at rest, and the run goes on.
+  With the residual flow the force left on alanine strings is 0.05 to 0.25
+  kcal/mol per scaled unit. `fe_profile.py driver` uses the same rest test
+  (the same numbers on the same frames), so the driver and the profile tool
+  no longer disagree. See `driver/README.md`.
 - Shots for CV selection need configurations BETWEEN the basins. Evenly
   spaced targeted-MD frames mostly start inside one (alanine dipeptide: 38
   usable configurations of 180, 6 with shots going both ways). Frames from

@@ -69,19 +69,25 @@
 #                      tests read [512]; beyond it neighbours are merged
 #     TW(curve_reach)  images either side within which a curve distance looks
 #                      for the nearest point [4]
-#     TW(plateau)      1 = the drift test is the PLATEAU test: over the last
-#                      half of the run (eight blocks) no image's mean
-#                      position differs between ANY two blocks by
-#                      TW(plateau_tol) scaled units [0.2] or more beyond the
-#                      noise measured inside the blocks, and that noise is
-#                      itself below plateau_tol.  It needs 8 x conv_window
-#                      frames after calibration and a half of at least
-#                      TW(plateau_span) updates [10000]: creep slower than
-#                      plateau_tol / plateau_span per update passes.  0 =
-#                      the older test on two neighbouring windows against
-#                      conv_tol, which cannot tell a creeping string from a
-#                      resting one [1].  conv_tol still sets the step.  The
-#                      statistic is recomputed every TW(plateau_every) frames [5].
+#     TW(plateau)      1 = the long-span tests (the default) [1]: over the
+#                      last half of the run (eight blocks), the REST test:
+#                      for every image, an upper (95%) bound U on how far it
+#                      moved across the string, from a line through the
+#                      block means; the free energy that movement is worth,
+#                      U^2 / (h W), and what not knowing the averaged
+#                      string's position is worth, t^2 sigma^2 / (h W), are
+#                      both at most TW(rest_tol) kcal/mol [0.05], and U is
+#                      at most TW(rest_move_max) scaled units [1.0]; the
+#                      long-span force test; and the profile test, which
+#                      blocks only a change across the half demonstrated
+#                      beyond TW(profile_tol) [0.5].  It needs 8 x
+#                      conv_window frames after calibration and a half of at
+#                      least TW(plateau_span) updates [10000].  Recomputed
+#                      every TW(plateau_every) frames [5].  See tw::rest.
+#                      0 = the older test on two neighbouring windows
+#                      against conv_tol, which cannot tell a creeping string
+#                      from a resting one.  conv_tol still sets the step.
+#                      TW(plateau_tol) is no longer read.
 #     TW(drift_curve)  1 = the neighbouring-window drift (reported, and the
 #                      test when plateau is 0) is the distance between the two windows'
 #                      strings as CURVES, so images that only slide along the
@@ -190,6 +196,7 @@ if {$tw_me == 0} {
     if {[info exists tw_state]} {
         if {[catch {tw::load_state $tw_state} err]} { tw_fail "cannot load the restart state: $err" }
         if {$tw::N != $nimg} { tw_fail "the restart holds $tw::N images, this run has $nimg" }
+        if {$tw::h0 > 0} { puts $force_file "# step $tw::h0" }
         # a config that does not name a flow continues with the state's
         if {![info exists TW(flow)] && [tw::state_flow] ne {}} { set TW(flow) [tw::state_flow] }
         # the step was set in an earlier leg; do not announce a calibration again
@@ -251,7 +258,7 @@ if {$tw_me == 0} {
         if {$n && $n != $tw::D} { tw_fail "TW($k) has $n values, the string has $tw::D CVs" }
     }
     puts "TW) $tw::N images in $tw::D CVs; length scales $tw::scale; periodic $tw::periodic"
-    puts "TW) memory $tw::P(memory), calibrate $tw::P(calibrate), max_move $tw::P(max_move), spline $tw::P(spline), stopping tests: [expr {$tw::P(plateau) ? "plateau < $tw::P(plateau_tol) over the last half of the run (at least $tw::P(plateau_span) updates), force < $tw::P(force_tol) (rms) and per image < [expr {$tw::P(force_image_tol) < 0 ? 3.0 * $tw::P(force_tol) : $tw::P(force_image_tol)}]" : "drift over $tw::P(conv_window) frames < $tw::P(conv_tol)"}], x $tw::P(conv_count)"
+    puts "TW) memory $tw::P(memory), calibrate $tw::P(calibrate), max_move $tw::P(max_move), spline $tw::P(spline), stopping tests: [expr {$tw::P(plateau) ? "rest (movement and position worth <= $tw::P(rest_tol) kcal/mol, movement <= $tw::P(rest_move_max)) over the last half of the run (at least $tw::P(plateau_span) updates), profile not demonstrably changing by > $tw::P(profile_tol), force < $tw::P(force_tol) (rms) and per image < [expr {$tw::P(force_image_tol) < 0 ? 3.0 * $tw::P(force_tol) : $tw::P(force_image_tol)}]" : "drift over $tw::P(conv_window) frames < $tw::P(conv_tol)"}], x $tw::P(conv_count)"
     set tg [tw::targets]
     for {set i 1} {$i < $nr} {incr i} { replicaSend [list 0 [lindex $tg [expr {$i % $nimg}]]] $i }
     set z [lindex $tg 0]
@@ -300,6 +307,7 @@ while {$i_run < $num_runs && !$stop} {
                 puts $history_file "TW iter $next_run : steps per update $steps_per_run -> [expr {$steps_per_run * $fac}]"
             }
             puts "TW) calibration over at update $next_run: step $tw::h ($which; signal limit $tw::h_signal, noise limit $tw::h_noise, noise per update $tw::noise1); averaging memory $tw::P(memory) updates"
+            puts $force_file "# step $tw::h"
             puts $history_file "TW iter $next_run : calibrated step $tw::h ($which) signal_limit $tw::h_signal noise_limit $tw::h_noise noise_per_update $tw::noise1 memory $tw::P(memory) flow $tw::P(flow) noise_ratio_longer_blocks $tw::noise_ratio"
             if {$tw::noise_ratio > 1.3} {
                 puts "TW) WARNING: blocks twice as long give [format %.2f $tw::noise_ratio] times the force noise: the force stays correlated across a calibration block, the noise is underestimated and the step may be too large. Lengthen TW(calibrate)."
@@ -316,11 +324,11 @@ while {$i_run < $num_runs && !$stop} {
             set drift [tw::record_frame $fz $fg]
             # the string that is reported is the frame's average, not the momentary one
             for {set i 0} {$i < $nimg} {incr i} { puts $history_file "SM iter $next_run replica $i : reparam z [lindex $fz $i]" }
-            puts $history_file "TW iter $next_run : step [dict get $info h] across-string move [dict get $info perp] force/noise $tw::force_ratio drift $drift image_drift $tw::d_image systematic_drift $tw::d_sys wander $tw::d_floor residual_force $tw::f_res force_noise $tw::f_noise residual_less_noise $tw::f_clean profile_change $tw::p_change long_residual $tw::fl_res long_noise $tw::fl_noise long_residual_less_noise $tw::fl_clean long_residual_worst_image $tw::fl_image"
+            puts $history_file "TW iter $next_run : step [dict get $info h] across-string move [dict get $info perp] force/noise $tw::force_ratio drift $drift image_drift $tw::d_image rest_cost $tw::d_sys rest_precision $tw::d_floor rest_move $tw::d_move rest_worst_image $tw::d_worst residual_force $tw::f_res force_noise $tw::f_noise residual_less_noise $tw::f_clean profile_change $tw::p_change long_residual $tw::fl_res long_noise $tw::fl_noise long_residual_less_noise $tw::fl_clean long_residual_worst_image $tw::fl_image"
             if {[tw::converged] && $next_run >= $TW(min_runs)} {
                 set stop 1
-                puts "TW) the string has stopped: movement over the last half of the run beyond its own wander $tw::d_sys (wander $tw::d_floor), force across it over that span $tw::fl_res kcal/mol per scaled unit (noise $tw::fl_noise; $tw::fl_clean with the noise taken out; largest image $tw::fl_image), profile change $tw::p_change kcal/mol; ending at update $next_run"
-                puts $history_file "TW iter $next_run : converged, systematic_drift $tw::d_sys wander $tw::d_floor long_residual_less_noise $tw::fl_clean long_residual_worst_image $tw::fl_image profile_change $tw::p_change"
+                puts "TW) the string has stopped: over the last half of the run its movement is worth at most $tw::d_sys kcal/mol and its position $tw::d_floor kcal/mol (movement bound $tw::d_move scaled units, worst image $tw::d_worst), force across it over that span $tw::fl_res kcal/mol per scaled unit (noise $tw::fl_noise; $tw::fl_clean with the noise taken out; largest image $tw::fl_image), profile change $tw::p_change kcal/mol; ending at update $next_run"
+                puts $history_file "TW iter $next_run : converged, rest_cost $tw::d_sys rest_precision $tw::d_floor rest_move $tw::d_move rest_worst_image $tw::d_worst long_residual_less_noise $tw::fl_clean long_residual_worst_image $tw::fl_image profile_change $tw::p_change"
             }
         }
         set tg [tw::targets]
@@ -375,16 +383,16 @@ if {$tw_me == 0} {
     set fi {}; set over {}
     foreach e $tw::f_image { lassign $e img v; lappend fi "$img:[format %.2f $v]"; if {$tw::P(force_tol) > 0 && $v > $tw::P(force_tol)} { lappend over $img } }
     puts $history_file "TW iter $i_run : residual_by_image [join $fi { }]"
-    puts $history_file "TW iter $i_run : at the end, systematic_drift $tw::d_sys (tolerance $tw::P(plateau_tol)) wander $tw::d_floor long_residual_less_noise $tw::fl_clean (tolerance $tw::P(force_tol))"
-    if {!$stop && $tw::P(plateau) && $tw::d_sys >= 0 && $tw::d_sys < $tw::P(plateau_tol) && $tw::fl_clean > $tw::P(force_tol)} {
-        puts "TW) the string has come to rest (it moved $tw::d_sys over the last half of the run beyond its wander of $tw::d_floor) but a force of $tw::fl_clean kcal/mol per scaled unit is left across it.  Whether running longer would remove it is not established."
+    puts $history_file "TW iter $i_run : at the end, rest_cost $tw::d_sys rest_precision $tw::d_floor (tolerance $tw::P(rest_tol)) rest_move $tw::d_move (limit $tw::P(rest_move_max)) profile_change $tw::p_change (limit $tw::P(profile_tol)) long_residual_less_noise $tw::fl_clean (tolerance $tw::P(force_tol))"
+    if {!$stop && $tw::P(plateau) && $tw::d_sys >= 0 && $tw::d_sys <= $tw::P(rest_tol) && $tw::d_floor <= $tw::P(rest_tol) && $tw::fl_clean > $tw::P(force_tol)} {
+        puts "TW) the string has come to rest (its movement over the last half of the run is worth at most $tw::d_sys kcal/mol) but a force of $tw::fl_clean kcal/mol per scaled unit is left across it.  Whether running longer would remove it is not established."
         puts $history_file "TW iter $i_run : at rest with a force left across the string"
     }
     if {[llength $over]} {
         puts "TW) images with a force across the string above $tw::P(force_tol) at the end: [join $over {, }].  On alanine dipeptide such places were bends of the path, the force there stayed the same over both halves of long runs, and more images removed only part of it; whether a longer run would remove it is not established. Check the profile's gates before deciding whether it matters."
         puts $history_file "TW iter $i_run : above_force_tol [join $over { }]"
     }
-    puts $history_file "TW iter $i_run : finished, [expr {$stop ? {stopped by its plateau and force tests} : {reached the update cap}}]"
+    puts $history_file "TW iter $i_run : finished, [expr {$stop ? {stopped by its rest, force and profile tests} : {reached the update cap}}]"
     close $history_file
     close $force_file
     puts "TW) finished at update $i_run: [expr {$stop ? {stopped by its plateau and force tests} : {reached the update cap without passing its stopping tests}}]"

@@ -77,6 +77,8 @@ namespace eval tw {
         nblocks     10
         plateau_span 10000
         force_image_tol -1
+        rest_tol    0.05
+        rest_move_max 1.0
     }
     # what the restart file says the step was calibrated under (tw::dump_state,
     # tw::restart_check); empty in a state file older than this record
@@ -137,8 +139,15 @@ namespace eval tw {
     variable fl_image -1.0
     variable fl_noise -1.0
     variable fl_clean -1.0
+    # the rest test (tw::rest): cost of the string's movement and of its
+    # position's uncertainty (kcal/mol, worst image), the movement bound
+    # (scaled units) and the worst image
     variable d_sys -1.0
     variable d_floor -1.0
+    variable d_move -1.0
+    variable d_worst -1
+    # the long-span profile test (tw::long_profile): lower bound on the change, kcal/mol
+    variable p_long -1.0
     # residual force at each image that follows the force, over the last
     # window and with its noise taken out: a list of {image value}
     variable f_image {}
@@ -175,6 +184,9 @@ proc tw::set_param {name value} {
     } elseif {$name ni {pin_first pin_last}} {
         if {![string is double -strict $value]} { error "thalweg: TW($name) must be a number, got '$value'" }
     }
+    if {$name eq "plateau_tol"} {
+        puts "thalweg: TW(plateau_tol) is no longer used (the plateau test was replaced on 2026-11-16 by the rest test, TW(rest_tol) in kcal/mol); ignored"
+    }
     set P($name) $value
 }
 
@@ -204,7 +216,7 @@ proc tw::init {z0 scale periodic} {
     variable G_now {}; variable Z_sum {}; variable Z_n 0; variable prof {}
     variable f_res -1.0; variable f_noise -1.0; variable p_change -1.0; variable force_ratio -1.0
     variable gframes {}; variable f_clean -1.0; variable saved_P {}; variable fl_image -1.0
-    variable zhist {}; variable d_sys -1.0; variable d_floor -1.0; variable f_image {}
+    variable zhist {}; variable d_sys -1.0; variable d_floor -1.0; variable d_move -1.0; variable d_worst -1; variable p_long -1.0; variable f_image {}
     variable ghist {}; variable nplat 0; variable fl_res -1.0; variable fl_noise -1.0; variable fl_clean -1.0
     variable hist_chunk 1; variable hz_sum {}; variable hg_sum {}; variable hz_n 0; variable h_since 0
     variable h0 0.0; variable n_rest -1; variable noise_ratio -1.0; variable k_pass -1
@@ -857,76 +869,167 @@ proc tw::scale_string {a f} {
     return $out
 }
 
-# THE PLATEAU TEST.  A string that moves on a noisy force with a constant
-# step never stands still: it wanders about its resting place.  The test asks
-# whether, over the last half of the frames recorded since calibration, the
-# string has stayed in one place to within plateau_tol (scaled units), as a
-# curve, image by image.
+# THE REST TEST (replaced the plateau test on 2026-11-16).  Is the string at
+# rest, judged by what its motion is worth in free energy?
 #
-# That half is cut into eight equal blocks.  For every image, P is the
-# LARGEST squared distance (as a curve, tw::image_curve_sq) between the mean
-# strings of any two of the blocks, and e2 the squared distance that the
-# noise alone puts between two block means, measured inside the blocks: half
-# the mean squared distance between the two halves of each block.  The test
-# statistic is the largest sqrt(P - e2) over the images; the wander, also
-# reported, is the largest sqrt(e2).  Both must be below plateau_tol.
+# Over the last half of the history since calibration, cut into B = 8 equal
+# blocks: for every image that moves (not held), d is its displacement from
+# the half's mean string (scaled units), across that string (the part along
+# its tangent, central differences, removed), or all of it at a free end.  A
+# straight line through the eight block means of d gives a slope b per block
+# and, from the scatter of the block means about the line, its standard
+# error s per CV (batch means: correlation shorter than a block cannot make
+# noise look like movement, and a slower one widens the error instead).
+#   U    = (|b| + t sqrt(sum s^2)) x 8      upper (95%, t = 1.943, 6 dof)
+#          bound on how far the image moved across the half, scaled units;
+#   cost = U^2 / (h W)   W the half's updates: with the residual flow a
+#          movement M over W updates is driven by a mean force M / (h W),
+#          which does M^2 / (h W) of work on the way, kcal/mol;
+#   prec = t^2 sigma^2 / (h W)   sigma^2 the image's mean squared d: what
+#          not knowing where the averaged string sits costs, 1/2 kappa MCSE^2
+#          with kappa ~ 2 / (h tau) for a constant step in a well of curvature
+#          kappa, so the correlation time tau cancels and need not be known.
+# The string is at rest when cost and prec are at most rest_tol at every
+# image (0.05 kcal/mol, about kT/12) and no image's U exceeds rest_move_max
+# (1 scaled unit, one basin width).  h is the step in force (the smaller of
+# the current step and the calibrated one, so a decaying step only makes the
+# test stricter).
 #
-# Why this and not what came before (sqrt of first-block-vs-last-block
-# distance squared less the mean neighbour-block distance squared, over four
-# blocks), which the third review broke in every way it tried:
-#   - out-and-back motion: blocks a b b a read zero; any two blocks, not just
-#     the first and last, now count;
-#   - oscillation slower than a block: the neighbour term grew with it and
-#     cancelled it; the noise is now measured inside blocks, where motion
-#     slower than a block barely shows, and if it does show (motion about as
-#     fast as a block) the wander gate fails instead;
-#   - a slow creep, a random walk, a creeping end: the earliest verdict came
-#     after 8 x conv_window frames, so the span was 80 frames and a creep of
-#     0.0015 a frame read as 0.08.  The span must now also cover
-#     plateau_span updates, which fixes the slowest creep the test can see:
-#     about plateau_tol / plateau_span per update (with the defaults 2e-5
-#     scaled units per update; on alanine dipeptide with a step of 3e-4 that
-#     is the drift a force of 0.07 kcal/mol per scaled unit would cause, a
-#     quarter of force_tol).  Slower creep passes, by construction.
-# A string whose wander is itself near plateau_tol cannot be told from one
-# that moves by that much: it stops only once the blocks are long enough to
-# average the wander down (a resting string whose block means scatter by
-# 0.4 never stops in a short run; that is the test working, not failing).
-# Returns {systematic wander}, or {-1 -1} while the history is too short:
-# fewer than 8 x conv_window frames, a half shorter than plateau_span
+# Why not the plateau test (largest distance between any two of the eight
+# block means, less the noise inside the blocks, against 0.2 scaled units):
+#   - on the alanine strings the images stay correlated over 10,000 to
+#     20,000 updates (tau ~ 2 / (h kappa)), longer than half a block, so the
+#     in-block noise was too small and a string AT REST failed: a synthetic
+#     resting string with each image's measured wander and correlation passed
+#     0.2 in 16% (pr0P) and 26% (pr1F) of trials, and no 120,000-update run
+#     ever stopped;
+#   - 0.2 over 60,000 updates is the movement a force of 0.015 kcal/mol per
+#     scaled unit causes, twenty times below force_tol: the two tests did not
+#     agree on what at rest means;
+#   - judged against unbiased dynamics, the barrier along those strings did
+#     not change after 10,000 updates (3.59-3.60, 3.56-3.57, 4.87-4.91
+#     kcal/mol, errors 0.15-0.2): positions in soft directions wandered
+#     where the free energy does not care.
+# What this test lets through by construction: a creep driven by a force
+# below sqrt(rest_tol / (h W)) (0.06-0.08 kcal/mol per scaled unit on the
+# alanine runs), and a mode whose correlation time exceeds the half cannot be
+# shown at rest (the run goes on, which is the safe way to be wrong).
+# Assumes the residual flow; with the metric flow the alanine mobilities are
+# all >= 1 in scaled units, so the cost is overestimated.
+# Returns {cost prec move worst}, or {-1 -1 -1 -1} while the history is too
+# short: fewer than 8 x conv_window frames, a half shorter than plateau_span
 # updates, or fewer than two entries per block.
-proc tw::plateau {} {
-    variable zhist; variable P; variable hist_chunk
-    set k [llength $zhist]; set B 8
+proc tw::rest {} {
+    variable zhist; variable P; variable hist_chunk; variable scale; variable N; variable D
+    variable h; variable h0
+    set k [llength $zhist]; set B 8; set T 1.9431802803927816
     set L [expr {$k / (2 * $B)}]
     set kf [expr {$k * $hist_chunk}]
-    if {$L < 2 || $kf < 8 * $P(conv_window) || 0.5 * $kf * $P(frame_updates) < $P(plateau_span)} { return {-1.0 -1.0} }
-    set k0 [expr {$k - $B * $L}]; set hl [expr {$L / 2}]
-    set Q {}; set FQ {}; set e2 {}
-    for {set j 0} {$j < $B} {incr j} {
-        set f [expr {$k0 + $j * $L}]
-        set q [tw::mean_string $zhist $f [expr {$f + $L - 1}]]
-        lappend Q $q; lappend FQ [tw::fine_curve $q]
-        set a [tw::mean_string $zhist $f [expr {$f + $hl - 1}]]
-        set b [tw::mean_string $zhist [expr {$f + $L - $hl}] [expr {$f + $L - 1}]]
-        set d [tw::image_curve_sq_f $a [tw::fine_curve $a] $b [tw::fine_curve $b]]
-        if {$j == 0} { set e2 $d } else { set t {}; foreach x $e2 y $d { lappend t [expr {$x + $y}] }; set e2 $t }
-    }
-    set t {}; foreach x $e2 { lappend t [expr {$x / (2.0 * $B)}] }; set e2 $t
-    set big [lrepeat [llength $e2] 0.0]
-    for {set j 0} {$j < $B} {incr j} {
-        for {set l [expr {$j + 1}]} {$l < $B} {incr l} {
-            set d [tw::image_curve_sq_f [lindex $Q $j] [lindex $FQ $j] [lindex $Q $l] [lindex $FQ $l]]
-            set t {}; foreach x $big y $d { lappend t [expr {$y > $x ? $y : $x}] }; set big $t
+    if {$L < 2 || $kf < 8 * $P(conv_window) || 0.5 * $kf * $P(frame_updates) < $P(plateau_span)} { return {-1.0 -1.0 -1.0 -1} }
+    set hh [expr {$h > 0 && $h < $h0 ? $h : $h0}]
+    if {$hh <= 0} { return {-1.0 -1.0 -1.0 -1} }
+    set k0 [expr {$k - $B * $L}]
+    set W [expr {double($B * $L * $hist_chunk * $P(frame_updates))}]
+    # mean string of the half and of each block, scaled
+    set zbar [tw::mean_string $zhist $k0 [expr {$k - 1}]]
+    set Q {}
+    for {set j 0} {$j < $B} {incr j} { lappend Q [tw::mean_string $zhist [expr {$k0 + $j * $L}] [expr {$k0 + ($j + 1) * $L - 1}]] }
+    set zs {}; foreach p $zbar { set q {}; foreach v $p s $scale { lappend q [expr {$v / $s}] }; lappend zs $q }
+    set cost_w -1.0; set prec_w -1.0; set move_w 0.0; set worst -1; set bad -1.0
+    for {set i 0} {$i < $N} {incr i} {
+        if {[tw::held $i]} continue
+        set ip [expr {$i > 0 ? $i - 1 : 0}]; set in [expr {$i < $N - 1 ? $i + 1 : $N - 1}]
+        set t {}; set tt 0.0
+        foreach a [lindex $zs $ip] b [lindex $zs $in] { set c [expr {$b - $a}]; lappend t $c; set tt [expr {$tt + $c * $c}] }
+        set tt [expr {$tt > 0 ? sqrt($tt) : 1.0}]
+        set tu {}; foreach c $t { lappend tu [expr {$c / $tt}] }
+        set free [tw::free_end $i]
+        set zi [lindex $zs $i]
+        # block means of the displacement, projected
+        set bm {}
+        foreach q $Q {
+            set x {}; foreach v [lindex $q $i] s $scale m $zi { lappend x [expr {$v / $s - $m}] }
+            lappend bm [tw::rest_project $x $tu $free]
         }
+        # straight line through the eight block means, per CV
+        set b2 0.0; set s2 0.0
+        for {set c 0} {$c < $D} {incr c} {
+            set sl 0.0; set mean 0.0
+            for {set j 0} {$j < $B} {incr j} {
+                set y [lindex $bm $j $c]
+                set sl [expr {$sl + ($j - 3.5) * $y}]; set mean [expr {$mean + $y}]
+            }
+            set sl [expr {$sl / 42.0}]; set mean [expr {$mean / $B}]
+            set rr 0.0
+            for {set j 0} {$j < $B} {incr j} { set r [expr {[lindex $bm $j $c] - $mean - ($j - 3.5) * $sl}]; set rr [expr {$rr + $r * $r}] }
+            set b2 [expr {$b2 + $sl * $sl}]; set s2 [expr {$s2 + $rr / 6.0 / 42.0}]
+        }
+        set U [expr {(sqrt($b2) + $T * sqrt($s2)) * $B}]
+        # mean squared displacement over the half's entries
+        set sq 0.0
+        for {set f $k0} {$f < $k} {incr f} {
+            set x {}; foreach v [lindex $zhist $f $i] s $scale m $zi { lappend x [expr {$v / $s - $m}] }
+            foreach c [tw::rest_project $x $tu $free] { set sq [expr {$sq + $c * $c}] }
+        }
+        set sq [expr {$sq / ($B * $L)}]
+        set cost [expr {$U * $U / ($hh * $W)}]; set prec [expr {$T * $T * $sq / ($hh * $W)}]
+        if {$cost > $cost_w} { set cost_w $cost }
+        if {$prec > $prec_w} { set prec_w $prec }
+        if {$U > $move_w} { set move_w $U }
+        set m [expr {$cost > $prec ? $cost : $prec}]
+        if {$m > $bad} { set bad $m; set worst $i }
     }
-    set worst 0.0; set fl 0.0
-    foreach p $big e $e2 {
-        set m [expr {$p > $e ? sqrt($p - $e) : 0.0}]
-        if {$m > $worst} { set worst $m }
-        if {sqrt($e) > $fl} { set fl [expr {sqrt($e)}] }
+    return [list $cost_w $prec_w $move_w $worst]
+}
+
+# Displacement x (scaled) across the unit tangent tu, or all of it at a free end.
+proc tw::rest_project {x tu free} {
+    if {$free} { return $x }
+    set dot 0.0; foreach a $x b $tu { set dot [expr {$dot + $a * $b}] }
+    set out {}; foreach a $x b $tu { lappend out [expr {$a - $dot * $b}] }
+    return $out
+}
+
+# THE PROFILE TEST over the same half (replaced the two-window test on
+# 2026-11-16).  Each of the eight blocks' mean gradients is integrated along
+# that block's mean string (tw::profile): its barrier (highest image less
+# the lowest before it) and end-to-end difference.  A straight line through
+# the eight values of each; the stop is blocked only when the profile is
+# DEMONSTRABLY changing: the LOWER (95%) bound of the change across the half,
+# (|slope| - t se) x 8, above profile_tol.  The driver's profiles are noisy
+# first looks (the dedicated runs settle the profile); this guards against
+# stopping while one is clearly still moving.  The two-window form it
+# replaces took twenty frames on each side and treated them as independent,
+# so its error was five to ten times too small and it blocked almost every
+# stop on noise.  Returns the larger lower bound (kcal/mol), or -1 without
+# the data.
+proc tw::long_profile {} {
+    variable zhist; variable ghist; variable P
+    set k [llength $zhist]; set B 8; set T 1.9431802803927816
+    set L [expr {$k / (2 * $B)}]
+    if {$L < 2 || [llength $ghist] != $k} { return -1.0 }
+    set k0 [expr {$k - $B * $L}]
+    set bar {}; set dF {}
+    for {set j 0} {$j < $B} {incr j} {
+        set a [expr {$k0 + $j * $L}]; set b [expr {$a + $L - 1}]
+        for {set f $a} {$f <= $b} {incr f} { if {[llength [lindex $ghist $f]] != [llength [lindex $zhist $f]]} { return -1.0 } }
+        set F [tw::profile [tw::mean_string $zhist $a $b] [tw::mean_string $ghist $a $b]]
+        set top 0; set fmax [lindex $F 0]
+        for {set i 1} {$i < [llength $F]} {incr i} { if {[lindex $F $i] > $fmax} { set fmax [lindex $F $i]; set top $i } }
+        set fmin [lindex $F 0]; for {set i 1} {$i <= $top} {incr i} { if {[lindex $F $i] < $fmin} { set fmin [lindex $F $i] } }
+        lappend bar [expr {$fmax - $fmin}]; lappend dF [lindex $F end]
     }
-    return [list $worst $fl]
+    set worst 0.0
+    foreach v [list $bar $dF] {
+        set sl 0.0; set mean 0.0
+        for {set j 0} {$j < $B} {incr j} { set sl [expr {$sl + ($j - 3.5) * [lindex $v $j]}]; set mean [expr {$mean + [lindex $v $j]}] }
+        set sl [expr {$sl / 42.0}]; set mean [expr {$mean / $B}]
+        set rr 0.0
+        for {set j 0} {$j < $B} {incr j} { set r [expr {[lindex $v $j] - $mean - ($j - 3.5) * $sl}]; set rr [expr {$rr + $r * $r}] }
+        set lo [expr {(abs($sl) - $T * sqrt($rr / 6.0 / 42.0)) * $B}]
+        if {$lo > $worst} { set worst $lo }
+    }
+    return $worst
 }
 
 # A string's fine curve (as tw::image_curve_sq builds it), and the per-image
@@ -1087,7 +1190,7 @@ proc tw::record_frame {{zf {}} {gf {}}} {
     }
     set d_curve [tw::curve_distance $A $B]
     set worst [expr {$P(drift_curve) ? $d_curve : $d_image}]
-    variable d_sys; variable d_floor
+    variable d_sys; variable d_floor; variable d_move; variable d_worst; variable p_long
     # (worked out every plateau_every frames: it changes slowly and is the
     # costliest thing here)
     variable fl_res; variable fl_noise; variable fl_clean; variable nplat
@@ -1095,38 +1198,46 @@ proc tw::record_frame {{zf {}} {gf {}}} {
     variable h_since
     if {$chunk_done && ($d_sys < 0 || $h_since >= $P(plateau_every))} {
         set h_since 0
-        lassign [tw::plateau] d_sys d_floor
-        if {$P(plateau)} { lassign [tw::long_force] fl_res fl_noise fl_clean }
+        lassign [tw::rest] d_sys d_floor d_move d_worst
+        if {$P(plateau)} { lassign [tw::long_force] fl_res fl_noise fl_clean; set p_long [tw::long_profile] }
         set evaluated [expr {$d_sys >= 0}]
     }
-    set drift_ok [expr {$P(plateau) ? ($d_sys >= 0 && $d_sys < $P(plateau_tol) && $d_floor < $P(plateau_tol)) : ($worst < $P(conv_tol))}]
-    # the profile of one window against the next
+    set drift_ok [expr {$P(plateau) ? ($d_sys >= 0 && $d_sys <= $P(rest_tol) && $d_floor <= $P(rest_tol) && $d_move <= $P(rest_move_max)) : ($worst < $P(conv_tol))}]
     variable p_change
-    set p_change -1.0; set have 1; set p_sig 0
-    foreach pf $prof { if {[llength $pf] != $n} { set have 0 } }
-    if {$have} {
-        # The stop is blocked when the profile is DEMONSTRABLY still changing:
-        # by more than profile_tol and by more than three standard errors of
-        # the difference (from the frame-to-frame spread in each window).  A
-        # difference inside its own noise is not evidence of change; how well
-        # the profile is resolved is for the dedicated runs to settle.
-        set p_change 0.0; set p_sig 0.0
-        for {set i 0} {$i < $n} {incr i} {
-            set a 0.0; set b 0.0; set a2 0.0; set b2 0.0
-            for {set f 0} {$f < $w} {incr f} {
-                set u [lindex $prof $f $i]; set v [lindex $prof [expr {$f + $w}] $i]
-                set a [expr {$a + $u}]; set b [expr {$b + $v}]
-                set a2 [expr {$a2 + $u * $u}]; set b2 [expr {$b2 + $v * $v}]
+    if {$P(plateau)} {
+        # the long-span profile test (tw::long_profile), worked out with the
+        # rest test: blocks the stop only on a change demonstrated beyond
+        # profile_tol
+        set p_change $p_long
+        set prof_ok [expr {$P(profile_tol) <= 0 || $p_change < 0 || $p_change <= $P(profile_tol)}]
+    } else {
+        # the profile of one window against the next (TW(plateau) 0 only)
+        set p_change -1.0; set have 1; set p_sig 0
+        foreach pf $prof { if {[llength $pf] != $n} { set have 0 } }
+        if {$have} {
+            # The stop is blocked when the profile is DEMONSTRABLY still changing:
+            # by more than profile_tol and by more than three standard errors of
+            # the difference (from the frame-to-frame spread in each window).  A
+            # difference inside its own noise is not evidence of change; how well
+            # the profile is resolved is for the dedicated runs to settle.
+            set p_change 0.0; set p_sig 0.0
+            for {set i 0} {$i < $n} {incr i} {
+                set a 0.0; set b 0.0; set a2 0.0; set b2 0.0
+                for {set f 0} {$f < $w} {incr f} {
+                    set u [lindex $prof $f $i]; set v [lindex $prof [expr {$f + $w}] $i]
+                    set a [expr {$a + $u}]; set b [expr {$b + $v}]
+                    set a2 [expr {$a2 + $u * $u}]; set b2 [expr {$b2 + $v * $v}]
+                }
+                set a [expr {$a / $w}]; set b [expr {$b / $w}]
+                set c [expr {abs($b - $a)}]
+                set var [expr {$w > 1 ? (($a2 / $w - $a * $a) + ($b2 / $w - $b * $b)) / ($w - 1) : 0.0}]
+                set se [expr {$var > 0 ? sqrt($var) : 0.0}]
+                if {$c > $p_change} { set p_change $c }
+                if {$c > $P(profile_tol) && $c > 3.0 * $se} { set p_sig 1 }
             }
-            set a [expr {$a / $w}]; set b [expr {$b / $w}]
-            set c [expr {abs($b - $a)}]
-            set var [expr {$w > 1 ? (($a2 / $w - $a * $a) + ($b2 / $w - $b * $b)) / ($w - 1) : 0.0}]
-            set se [expr {$var > 0 ? sqrt($var) : 0.0}]
-            if {$c > $p_change} { set p_change $c }
-            if {$c > $P(profile_tol) && $c > 3.0 * $se} { set p_sig 1 }
         }
+        set prof_ok [expr {$P(profile_tol) <= 0 || $p_change < 0 || !$p_sig}]
     }
-    set prof_ok [expr {$P(profile_tol) <= 0 || $p_change < 0 || !$p_sig}]
     # The force left across the string over the last window, with the noise
     # in that number measured from the window itself and taken out.  The run
     # is not held until the force is RESOLVED below the tolerance: for a
@@ -1467,7 +1578,7 @@ proc tw::dump_state {} {
     set out ""
     foreach v {N D scale periodic z S_g S_M W h nacc frames nconv blk h_signal h_noise noise1 force_ratio F_sum F_n
                G_now Z_sum Z_n prof f_res f_noise p_change gframes f_clean d_image d_curve
-               zhist d_sys d_floor f_image ghist nplat fl_res fl_noise fl_clean fl_image
+               zhist d_sys d_floor d_move d_worst p_long f_image ghist nplat fl_res fl_noise fl_clean fl_image
                hist_chunk hz_sum hg_sum hz_n h_since h0 n_rest noise_ratio k_pass} {
         append out [list set tw::$v [set tw::$v]] "\n"
     }

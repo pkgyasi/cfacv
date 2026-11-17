@@ -26,9 +26,9 @@ check "noise per update measured ($tw::noise1)" [expr {$tw::noise1 > 0}]
 try curve {set dcurve [tw::curve_distance {{0 0 0 0} {1 0 0 0} {2 0 0 0} {3 0 0 0}} {{0 0.35 0 0} {1.5 0.35 0 0} {2.5 0.35 0 0} {3 0.35 0 0}}]}
 check "curve distance of a slid and shifted string is the shift ($dcurve)" [expr {abs($dcurve - 1.0) < 1e-6}]
 check "both drifts recorded ($tw::d_curve, $tw::d_image)" [expr {$tw::d_curve >= 0 && $tw::d_image >= $tw::d_curve - 1e-9}]
-try plateau {set pl [tw::plateau]}
+try rest {set pl [tw::rest]}
 try long_force {set lf [tw::long_force]}
-check "plateau and long force answer inside NAMD ($pl; $lf)" [expr {[llength $pl] == 2 && [llength $lf] == 3}]
+check "rest and long force answer inside NAMD ($pl; $lf)" [expr {[llength $pl] == 4 && [llength $lf] == 3}]
 foreach {k v} {conv_window 1 plateau_every 1 plateau_span 10} { try "set_param $k" [list tw::set_param $k $v] }
 for {set n 0} {$n < 40} {incr n} { try "record long $n" {tw::record_frame $tw::z [lrepeat 5 {0.1 0.2 0.0 0.0}]} }
 check "long-span tests give numbers inside NAMD ($tw::d_sys, $tw::fl_clean)" [expr {$tw::d_sys >= 0 && $tw::fl_res >= 0}]

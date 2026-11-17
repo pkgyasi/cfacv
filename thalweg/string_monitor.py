@@ -248,13 +248,13 @@ def main(argv=None):
     two = res["pass"]
     if read_history.thalweg:
         v = read_history.verdict
-        stopped = bool(v and v[1] in ("converged", "stopped by its plateau and force tests"))
+        stopped = bool(v and v[1] in ("converged", "stopped by its plateau and force tests", "stopped by its rest, force and profile tests"))
         if v is None:
             print("the thalweg driver has not given its verdict yet (no 'finished' line): the run is not over")
         else:
             print(f"the thalweg driver's own verdict at update {v[0]}: {v[1]}")
         if not stopped:
-            print("  the driver's stopping tests (drift over half the run, and the force across the string) did not pass; "
+            print("  the driver's stopping tests (rest over half the run, the force across the string, the profile) did not pass; "
                   "two windows that agree do not make a string that has stopped creeping")
         res["driver_verdict"] = v[1] if v else None
         res["pass"] = bool(two and stopped)

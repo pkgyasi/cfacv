@@ -342,41 +342,81 @@ feed $A $Bgrow
 check "a growing end blocks the stop ($tw::d_curve)" [expr {![tw::converged]}]
 foreach {k v} {calibrate 200 memory 200 stepsize 0 conv_window 20 conv_count 3 frame_updates 100 profile_tol 0.5 force_tol 0.3 plateau 1} { tw::set_param $k $v }
 
-# ---- 5f. the plateau test: a resting string that wanders passes; one that creeps under the same wander does not
-# 12 images on a line in x; every frame each image is displaced across the line by slow noise
-# (an AR(1) wander) and, in the second case, also by a steady creep of the far half of the string
-proc wander_run {creep nfr} {
-    tw::init {{0 0} {1 0} {2 0} {3 0} {4 0} {5 0} {6 0} {7 0} {8 0} {9 0} {10 0} {11 0}} {1.0 1.0} {0 0}
-    foreach {k v} {calibrate 0 conv_window 20 conv_count 1 force_tol 0 profile_tol 0 frame_updates 1 plateau 1 plateau_tol 0.2 plateau_span 200} { tw::set_param $k $v }
-    set tw::nacc 1000
-    set w [lrepeat 12 0.0]; set short {}; set sys {}; set stopped 0
-    for {set f 0} {$f < $nfr} {incr f} {
-        set nw {}; set fr {}; set i 0
-        foreach y $w {
-            set y [expr {0.8 * $y + 0.04 * [gauss]}]; lappend nw $y
-            lappend fr [list $i.0 [expr {$y + ($i >= 6 ? $creep * $f : 0.0)}]]; incr i
-        }
-        set w $nw
-        set d [tw::record_frame $fr {}]
-        # (counts evaluations whose plateau statistic and wander both pass; the stop also needs the hold)
-        if {$tw::d_sys >= 0} { lappend short $d; lappend sys $tw::d_sys; if {$tw::d_sys < 0.2 && $tw::d_floor < 0.2} { incr stopped } }
+# ---- 5f. the rest test, on a model string whose free energy is known
+# 12 images on the x axis (scaled units; D = 3: x along the string, y1 and y2
+# across it).  Each image's (y1, y2) follows the residual flow with a constant
+# step h in F = 1/2 k1 (y1 - y*)^2 + 1/2 k2 y2^2 - f0 y1, with per-update noise
+# of variance q, advanced EXACTLY over each frame of 100 updates (an
+# Ornstein-Uhlenbeck process; with k1 = 0 a drift h f0 per update plus a random
+# walk).  who: images the force f0 acts on (all, or one); target: a command
+# giving y* at frame f (a moving minimum).  Alanine-like h and q.  Returns
+# {stop_frame remaining}: remaining is the free energy the half-run averaged
+# string still had to gain at the stop, from the model, worst image (-1 when
+# unbounded: a constant force in a flat direction); stop_frame -1 = no stop.
+proc ourun {k1 k2 y0 f0 nfr {who all} {target {}} {extra {}} {h 1.5e-4} {q 100.0}} {
+    set z0 {}; for {set i 0} {$i < 12} {incr i} { lappend z0 [list $i.0 0.0 0.0] }
+    tw::init $z0 {1.0 1.0 1.0} {0 0 0}
+    reset_defaults
+    foreach {k v} [concat {calibrate 0 conv_window 20 conv_count 1 force_tol 0 profile_tol 0 frame_updates 100} $extra] { tw::set_param $k $v }
+    set tw::h $h; set tw::h0 $h; set tw::nacc 1000
+    set n 100
+    foreach k [list $k1 $k2] c {1 2} {
+        if {$k > 0} {
+            set a$c [expr {pow(1.0 - $h * $k, $n)}]
+            set s$c [expr {$h * sqrt($q * (1.0 - pow(1.0 - $h * $k, 2 * $n)) / (1.0 - pow(1.0 - $h * $k, 2)))}]
+        } else { set a$c 1.0; set s$c [expr {$h * sqrt($q * $n)}] }
     }
-    set ms 0.0; foreach v $short { set ms [expr {$ms + $v}] }
-    set tail [lrange $sys end-49 end]; set my 0.0; foreach v $tail { set my [expr {$my + $v}] }
-    return [list [expr {$ms / [llength $short]}] [expr {$my / [llength $tail]}] [expr {double($stopped) / [llength $sys]}]]
+    set Y {}; for {set i 0} {$i < 12} {incr i} { lappend Y [list $y0 0.0] }
+    set hist {}
+    for {set f 0} {$f < $nfr} {incr f} {
+        set ys [expr {$target eq {} ? 0.0 : [{*}$target $f]}]
+        set nY {}; set fr {}
+        for {set i 0} {$i < 12} {incr i} {
+            lassign [lindex $Y $i] y1 y2
+            set fi [expr {$who eq "all" || $who == $i ? $f0 : 0.0}]
+            if {$k1 > 0} { set eq1 [expr {$ys + $fi / $k1}]; set y1 [expr {$eq1 + $a1 * ($y1 - $eq1) + $s1 * [gauss]}] } \
+            else { set y1 [expr {$y1 + $n * $h * $fi + $s1 * [gauss]}] }
+            set y2 [expr {$a2 * $y2 + $s2 * [gauss]}]
+            lappend nY [list $y1 $y2]; lappend fr [list $i.0 $y1 $y2]
+        }
+        set Y $nY; lappend hist $Y
+        incr tw::nacc $n
+        tw::record_frame $fr {}
+        if {[tw::converged]} {
+            if {$k1 == 0 && $f0 != 0} { return [list $f -1] }
+            set worst 0.0; set m [expr {$f / 2}]
+            for {set i 0} {$i < 12} {incr i} {
+                set fi [expr {$who eq "all" || $who == $i ? $f0 : 0.0}]
+                set b1 0.0; set b2 0.0
+                for {set g $m} {$g <= $f} {incr g} { set b1 [expr {$b1 + [lindex $hist $g $i 0]}]; set b2 [expr {$b2 + [lindex $hist $g $i 1]}] }
+                set b1 [expr {$b1 / ($f - $m + 1)}]; set b2 [expr {$b2 / ($f - $m + 1)}]
+                set eq1 [expr {$ys + $fi / $k1}]
+                set r [expr {0.5 * $k1 * pow($b1 - $eq1, 2) + 0.5 * $k2 * $b2 * $b2}]
+                if {$r > $worst} { set worst $r }
+            }
+            return [list $f $worst]
+        }
+    }
+    return [list -1 -1]
 }
+proc reset_defaults {} {
+    foreach {k v} {memory 200 calibrate 200 max_move 0.002 stepsize 0 spline 1 evolve_ends 1 conv_window 20 conv_tol 0.1
+                   conv_count 3 polyak 1 force_tol 0.3 profile_tol 0.5 pin_first {} pin_last {} noise_frac 0.5 drift_curve 1
+                   plateau 1 plateau_every 5 hist_max 512 curve_reach 4 flow residual plateau_hold 0.25
+                   step_decay 0.0 frame_updates 100 nblocks 10 plateau_span 10000 force_image_tol -1 rest_tol 0.05 rest_move_max 1.0} { tw::set_param $k $v }
+}
+set KT 0.596
 expr {srand(11)}
-lassign [wander_run 0.0 600] rest_short rest_sys rest_frac
-lassign [wander_run 0.004 600] creep_short creep_sys creep_frac
-check "resting but wandering: the plateau test passes most of the time (systematic $rest_sys, passes [format %.2f $rest_frac])" [expr {$rest_sys < 0.2 && $rest_frac > 0.8}]
-check "creeping 0.4 per 100 frames: the plateau test never passes (systematic $creep_sys, passes $creep_frac)" [expr {$creep_sys > 0.2 && $creep_frac == 0.0}]
-check "the neighbouring-window drift cannot tell them apart (resting $rest_short, creeping $creep_short)" [expr {abs($creep_short - $rest_short) < 0.5 * $rest_short}]
+lassign [ourun [expr {2 * $KT}] $KT 0.0 0.0 1200] st_rest left_rest
+lassign [ourun 0.0 $KT 0.0 0.3 1200] st_creep left_creep
+check "5f a resting model string stops by the rest test (frame $st_rest, free energy left $left_rest)" [expr {$st_rest > 0 && $left_rest <= 0.05}]
+check "5f the same string pushed by 0.3 kcal/mol per scaled unit along a flat direction does not ($st_creep)" [expr {$st_creep < 0}]
 tw::init {{0 0} {1 0} {2 0} {3 0}} {1.0 1.0} {0 0}
 foreach {k v} {conv_window 5 frame_updates 1 calibrate 0} { tw::set_param $k $v }
 set tw::nacc 1000
 for {set f 0} {$f < 39} {incr f} { tw::record_frame {{0 0} {1 0} {2 0} {3 0}} {} }
 check "too little history: no verdict and no stop (39 of 40 frames)" [expr {$tw::d_sys < 0 && ![tw::converged]}]
-foreach {k v} {calibrate 200 memory 200 stepsize 0 conv_window 20 conv_count 3 frame_updates 100 profile_tol 0.5 force_tol 0.3 plateau 1 plateau_tol 0.2} { tw::set_param $k $v }
+reset_defaults
 
 # ---- 5g. the two flows stop at the same string when the metric tensor is far from the identity
 proc run_flow {flow maxit} {
@@ -405,30 +445,18 @@ check "both came to rest by the plateau test" [expr {$stop_m && $stop_r}]
 check "the residual flow's step is not held down by the fast direction (step $h_r against $h_m)" [expr {$h_r > 3.0 * $h_m}]
 foreach {k v} {flow metric pin_first {} pin_last {} force_tol 0.3 profile_tol 0.5 frame_updates 100 conv_window 20 max_move 0.002 memory 200} { tw::set_param $k $v }
 
-# ---- 5h. the history stays bounded, and the plateau test reads the same from it
-proc wander_bounded {creep nfr cap} {
-    tw::init {{0 0} {1 0} {2 0} {3 0} {4 0} {5 0} {6 0} {7 0} {8 0} {9 0} {10 0} {11 0}} {1.0 1.0} {0 0}
-    foreach {k v} [list calibrate 0 conv_window 20 conv_count 1 force_tol 0 profile_tol 0 frame_updates 1 plateau 1 plateau_tol 0.2 hist_max $cap] { tw::set_param $k $v }
-    set tw::nacc 1000
-    set w [lrepeat 12 0.0]; set big 0
-    for {set f 0} {$f < $nfr} {incr f} {
-        set nw {}; set fr {}; set i 0
-        foreach y $w { set y [expr {0.8 * $y + 0.04 * [gauss]}]; lappend nw $y; lappend fr [list $i.0 [expr {$y + ($i >= 6 ? $creep * $f : 0.0)}]]; incr i }
-        set w $nw; tw::record_frame $fr {}
-        if {[llength $tw::zhist] > $big} { set big [llength $tw::zhist] }
-    }
-    return [list $tw::d_sys $big $tw::hist_chunk]
-}
+# ---- 5h. the history stays bounded, and the rest test reads the same from it
 expr {srand(11)}
-# (the cap is at least 64 entries now: the plateau test's sixteen half-blocks need two each)
-lassign [wander_bounded 0.0 1500 64] rest_b big_b chunk_b
-lassign [wander_bounded 0.002 1500 64] creep_b big_c chunk_c
-check "1500 frames kept in at most 64 entries (most $big_b, $chunk_b frames each)" [expr {$big_b <= 64 && $chunk_b >= 32}]
-check "bounded history: at rest reads $rest_b, creeping reads $creep_b" [expr {$rest_b < 0.2 && $creep_b > 0.2}]
-foreach {k v} {calibrate 200 conv_window 20 conv_count 3 frame_updates 100 profile_tol 0.5 force_tol 0.3 hist_max 512} { tw::set_param $k $v }
+lassign [ourun [expr {2 * $KT}] $KT 0.0 0.0 1500 all {} {hist_max 64 conv_count 1000000}] - -
+set big_b [llength $tw::zhist]; set chunk_b $tw::hist_chunk; set rest_b $tw::d_sys
+lassign [ourun 0.0 $KT 0.0 0.3 1500 all {} {hist_max 64 conv_count 1000000}] - -
+set creep_b $tw::d_sys
+check "1500 frames kept in at most 64 entries (most $big_b, $chunk_b frames each)" [expr {$big_b <= 64 && $chunk_b >= 16}]
+check "bounded history: at rest the rest test reads $rest_b kcal/mol, pushed by 0.3 it reads $creep_b" [expr {$rest_b >= 0 && $rest_b <= 0.05 && $creep_b > 0.05}]
+reset_defaults
 
 # ---- 5i. the step shrinks only after the string is at rest
-foreach {k v} {memory 100 calibrate 200 max_move 0.004 conv_window 8 conv_tol 0.06 conv_count 1000000 step_decay 0.6 force_tol 0 profile_tol 0 frame_updates 25} { tw::set_param $k $v }
+foreach {k v} {memory 100 calibrate 200 max_move 0.004 conv_window 8 conv_tol 0.06 conv_count 1000000 step_decay 0.6 force_tol 0 profile_tol 0 frame_updates 25 plateau_span 2000} { tw::set_param $k $v }
 expr {srand(3)}
 tw::init $z0 {1.0 1.0} {0 0}
 set h_before -1; set h_first -1
@@ -466,12 +494,6 @@ check "samples correlated over 30 updates, blocks of 20: longer blocks give more
 
 # ==== 7. review round 3: each test below failed on 2891a69 for the reason named
 set TDIR [file join [file dirname [info script]] .. driver]
-proc reset_defaults {} {
-    foreach {k v} {memory 200 calibrate 200 max_move 0.002 stepsize 0 spline 1 evolve_ends 1 conv_window 20 conv_tol 0.1
-                   conv_count 3 polyak 1 force_tol 0.3 profile_tol 0.5 pin_first {} pin_last {} noise_frac 0.5 drift_curve 1
-                   plateau 1 plateau_tol 0.2 plateau_every 5 hist_max 512 curve_reach 4 flow residual plateau_hold 0.25
-                   step_decay 0.0 frame_updates 100 nblocks 10 plateau_span 10000 force_image_tol -1} { tw::set_param $k $v }
-}
 # a string of 12 images on the x axis, fed frames directly (no forces unless given);
 # mode: all = every image creeps across; end = the last image creeps across;
 # endalong = the last image creeps along; osc = all oscillate; hosc = the far half
@@ -562,30 +584,44 @@ tw::set_param calibrate 2; tw::set_param max_move 0.004
 set err [catch {tw::restart_check} msg]
 check "7.3 a different max_move is reported, not refused ($msg)" [expr {!$err && [string match "*max_move*" $msg]}]
 
-# ---- 7.4 the plateau test (finding 3).  Frames of 20 updates and the default
-# plateau_span, so the test reads at least 10,000 updates (500 frames).
-set f3 {}
-foreach {lab mode rate noise T} {
-    "every image creeping 0.001 per frame"            all 0.001 0.04 100
-    "far half oscillating, amplitude 0.3, period 120" hosc 0.3 0.04 120
-    "all oscillating, amplitude 0.5, period 107"      osc 0.5 0.04 107
-    "far half random-walking, 0.012 per frame"        rw 0.012 0.04 100
-    "end image creeping across, 0.002 per frame"      end 0.002 0.04 100
-    "end image creeping along, 0.003 per frame"       endalong 0.003 0.04 100
-} {
+# ---- 7.4 the rest test (replaced the plateau test of finding 3 on 2026-11-16).
+# Model strings as in 5f (alanine-like h 1.5e-4, q 100; 120,000 updates).
+# Each case that must not stop is a string whose free energy is still changing
+# or unbounded; each that must stop is checked on the claim the test rests on:
+# what the averaged string still had to gain at the stop is at most rest_tol.
+proc target_osc {f} { return [expr {0.6 * sin(3.141592653589793 * $f / 1200.0)}] }
+foreach {lab k1 k2 y0 f0 who tgt} [list \
+    "pushed by 0.3 along a flat direction"           0.0 $KT 0.0 0.3 all {} \
+    "pushed by 0.1 along a flat direction"           0.0 $KT 0.0 0.1 all {} \
+    "one end pushed by 0.3 along a flat direction"   0.0 $KT 0.0 0.3 11 {} \
+    "following a minimum that goes 0.6 out and back" $KT $KT 0.0 0.0 all target_osc] {
     set stops {}
-    foreach seed {1 2} { expr {srand($seed)}; lappend stops [hrun $mode $rate $noise 1500 {} $T] }
-    check "7.4 $lab: never stops in 1500 frames (stop frames $stops)" [expr {[lindex $stops 0] < 0 && [lindex $stops 1] < 0}]
+    foreach seed {1 2} { expr {srand($seed)}; lappend stops [lindex [ourun $k1 $k2 $y0 $f0 1200 $who $tgt] 0] }
+    check "7.4 $lab: never stops in 120,000 updates (stop frames $stops)" [expr {[lindex $stops 0] < 0 && [lindex $stops 1] < 0}]
 }
-set stops {}
-foreach seed {1 2} { expr {srand($seed)}; lappend stops [hrun all 0.0 0.04 2000] }
-check "7.4 a resting string with wander 0.067 rms still stops (stop frames $stops)" [expr {[lindex $stops 0] > 0 && [lindex $stops 1] > 0}]
+foreach {lab k1 k2 y0} [list \
+    "resting, curvatures 2kT and kT"           [expr {2 * $KT}] $KT 0.0 \
+    "relaxing from 3 scaled units, 2kT and 2kT" [expr {2 * $KT}] [expr {2 * $KT}] 3.0 \
+    "relaxing from 1.5, kT and 2kT"            $KT [expr {2 * $KT}] 1.5] {
+    set out {}
+    foreach seed {1 2} { expr {srand($seed)}; lappend out [ourun $k1 $k2 $y0 0.0 2000] }
+    set ok 1; foreach r $out { lassign $r st left; if {$st < 0 || $left > 0.05} { set ok 0 } }
+    check "7.4 $lab: stops within 200,000 updates, with at most rest_tol of free energy left at the stop ({frame left}: $out)" $ok
+}
+# a mode slower than the half cannot be shown at rest: it may not stop, but
+# if it does, the promise must still hold
+set out {}
+foreach seed {1 2} { expr {srand($seed)}; lappend out [ourun [expr {$KT / 10}] $KT 1.5 0.0 1200] }
+set ok 1; foreach r $out { lassign $r st left; if {$st >= 0 && $left > 0.05} { set ok 0 } }
+check "7.4 relaxing from 1.5 in a mode of curvature kT/10: no stop with more than rest_tol left ($out)" $ok
+reset_defaults
 
 # ---- 7.5 the step decays only after the full stop criteria held, and is restored if the string moves on (finding 4)
 proc strline {y} { set fr {}; for {set i 0} {$i < 12} {incr i} { lappend fr [list $i.0 [expr {$i >= 6 ? $y : 0.0}]] }; return $fr }
 reset_defaults
 tw::init [strline 0] {1.0 1.0} {0 0}
 foreach {k v} {calibrate 0 conv_window 20 conv_count 1000 force_tol 0 profile_tol 0 frame_updates 20 step_decay 0.6} { tw::set_param $k $v }
+set tw::h 1e-3; set tw::h0 1e-3
 set tw::nacc 1000; set first_pass -1; set rest_at_first -2
 for {set f 0} {$f < 1600} {incr f} {
     incr tw::nacc 20; tw::record_frame [strline 0.0] {}
@@ -594,7 +630,7 @@ for {set f 0} {$f < 1600} {incr f} {
 check "7.5 a single plateau pass does not start the decay (n_rest $rest_at_first at the first pass, frame $first_pass)" [expr {$first_pass > 0 && $rest_at_first < 0}]
 check "7.5 the decay starts once the pass has held (n_rest $tw::n_rest)" [expr {$tw::n_rest > 0}]
 for {set f 0} {$f < 800} {incr f} { incr tw::nacc 20; tw::record_frame [strline [expr {0.01 * $f}]] {} }
-check "7.5 a string that moves again resets it (systematic $tw::d_sys, n_rest $tw::n_rest)" [expr {$tw::d_sys > 0.2 && $tw::n_rest < 0}]
+check "7.5 a string that moves again resets it (rest cost $tw::d_sys kcal/mol, n_rest $tw::n_rest)" [expr {$tw::d_sys > 0.05 && $tw::n_rest < 0}]
 reset_defaults
 tw::init {{0.0 0.0} {1.0 0.0} {2.0 0.0} {3.0 0.0}} {1.0 1.0} {0 0}
 foreach {k v} {calibrate 2 memory 2 stepsize 0.001 step_decay 0.6} { tw::set_param $k $v }
@@ -617,7 +653,7 @@ proc frun {G nfr} {
     tw::init $z0 {1.0 1.0} {0 0}
     foreach {k v} {calibrate 0 conv_window 20 force_tol 0.3 profile_tol 0 frame_updates 20} { tw::set_param $k $v }
     tw::accumulate [lrepeat 12 {0.0 0.0}] [lrepeat 12 {1.0 0.0 0.0 1.0}]
-    set tw::nacc 1000
+    set tw::h 1e-3; set tw::h0 1e-3; set tw::nacc 1000
     for {set f 0} {$f < $nfr} {incr f} {
         set fr {}; set gf {}
         for {set i 0} {$i < 12} {incr i} { lappend fr [list $i.0 [expr {0.01 * [gauss]}]]; lappend gf [list 0.0 [expr {($i == 5 ? $G : 0.0) + 0.05 * [gauss]}]] }
@@ -639,7 +675,7 @@ check "7.7 no forces recorded: the force test cannot pass (stop $sn, long residu
 reset_defaults
 tw::init [strline 0] {1.0 1.0} {0 0}
 foreach {k v} {calibrate 0 conv_window 21 conv_count 1 force_tol 0 profile_tol 0 frame_updates 20} { tw::set_param $k $v }
-set tw::nacc 1000; set ok8 -1
+set tw::h 1e-3; set tw::h0 1e-3; set tw::nacc 1000; set ok8 -1
 for {set f 0} {$f < 2000} {incr f} {
     incr tw::nacc 20; tw::record_frame [strline 0.0] {}
     if {[tw::converged]} { set ok8 [expr {$tw::h_since == 0}]; break }

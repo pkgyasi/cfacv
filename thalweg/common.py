@@ -15,6 +15,16 @@ A CV definition file is JSON:
 Each entry of "atoms" is an MDAnalysis selection; a selection of several atoms
 means their centre of mass, which is what a cfacv "center" is.  "string" names
 the CVs that span the string, in cv.inp order; the others are measured only.
+
+COORD (analysis only, 2026-11-17) is a smooth coordination number: the sum over
+the atoms of the second selection (e.g. "name OH2") of s(r) = (1 - (r/r0)^n) /
+(1 - (r/r0)^m), r the minimum-image distance to the centre of mass of the first
+selection.  Optional keys "r0" (A, default 3.2), "n" (6), "m" (12).  It is a
+solvent coordinate for CV selection, basin classification and the committor
+test; cfacv cannot restrain it, so it cannot span a string and
+make_cfacv_inputs.py refuses it:
+
+        {"name": "n_Na", "type": "COORD", "atoms": ["name SOD", "name OH2"], "r0": 3.2}
 """
 import json
 import re
@@ -23,6 +33,7 @@ import numpy as np
 
 TWO_PI = 2.0 * np.pi
 PERIODIC_TYPES = {"DIHED"}
+ANALYSIS_ONLY_TYPES = {"COORD"}          # measured, never restrained
 
 
 # --------------------------------------------------------------------------
@@ -35,15 +46,24 @@ class CVSet:
         if len(set(self.names)) != len(self.names):
             raise ValueError("duplicate CV names")
         for c in cvs:
-            n = {"BOND": 2, "ANGLE": 3, "DIHED": 4}.get(c["type"])
+            n = {"BOND": 2, "ANGLE": 3, "DIHED": 4, "COORD": 2}.get(c["type"])
             if n is None:
                 raise ValueError(f"CV {c['name']}: unsupported type {c['type']}")
             if len(c["atoms"]) != n:
                 raise ValueError(f"CV {c['name']}: {c['type']} needs {n} atom selections")
-        self.string = list(string) if string else list(self.names)
+            if c["type"] == "COORD":
+                for k in ("r0", "n", "m"):
+                    if k in c and not float(c[k]) > 0:
+                        raise ValueError(f"CV {c['name']}: {k} must be positive")
+                if int(c.get("m", 12)) <= int(c.get("n", 6)):
+                    raise ValueError(f"CV {c['name']}: COORD needs m > n")
+        self.string = list(string) if string else [c["name"] for c in cvs if c["type"] not in ANALYSIS_ONLY_TYPES]
         for s in self.string:
             if s not in self.names:
                 raise ValueError(f"string CV {s} is not defined")
+            if next(c for c in cvs if c["name"] == s)["type"] in ANALYSIS_ONLY_TYPES:
+                raise ValueError(f"string CV {s}: a {next(c for c in cvs if c['name'] == s)['type']} CV is analysis only "
+                                 "(cfacv cannot restrain it), so it cannot span a string")
 
     @classmethod
     def load(cls, path):
@@ -232,9 +252,26 @@ class CVCalculator:
                            for p in pts[1:]]
         return [np.asarray(p, dtype=float) for p in pts]
 
+    def _coord(self, c, gs):
+        from MDAnalysis.lib.distances import distance_array
+        box = self.u.dimensions
+        have_box = box is not None and np.all(box[:3] > 0)
+        ctr = self._centers(gs[:1])[0]
+        others = gs[1].positions.astype(float)
+        if gs[0].n_atoms == 1:                       # the centre itself is not its own neighbour
+            others = others[gs[1].indices != gs[0].indices[0]]
+        r = distance_array(ctr[None, :].astype(np.float32), others.astype(np.float32),
+                           box=box if have_box else None)[0].astype(float)
+        r0 = float(c.get("r0", 3.2)); n = int(c.get("n", 6)); m = int(c.get("m", 12))
+        x = r / r0
+        near = np.abs(x - 1.0) < 1e-6                # the limit at r = r0 is n/m
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sw = np.where(near, n / m, (1.0 - x ** n) / (1.0 - x ** m))
+        return float(sw.sum())
+
     def frame(self):
         """CV values for the current frame, in CVSet order."""
-        return np.array([cv_values_from_points(c["type"], self._centers(gs))
+        return np.array([self._coord(c, gs) if c["type"] == "COORD" else cv_values_from_points(c["type"], self._centers(gs))
                          for c, gs in zip(self.cvset.cvs, self.groups)])
 
     def trajectory(self, start=None, stop=None, step=None):
@@ -250,6 +287,8 @@ class CVCalculator:
         a function of the centers of mass of its atom groups, so its gradient
         on atom a of group g is (m_a / M_g) dtheta/dR_g; dtheta/dR_g is taken
         by central differences."""
+        if any(c["type"] in ANALYSIS_ONLY_TYPES for c in self.cvset.cvs):
+            raise ValueError("the metric tensor is defined here for restrainable CVs only; drop the COORD CVs first")
         grads = []                                            # per CV: {atom index: 3-vector}
         for c, gs in zip(self.cvset.cvs, self.groups):
             pts = self._centers(gs); per = c["type"] in PERIODIC_TYPES

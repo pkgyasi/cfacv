@@ -47,6 +47,9 @@ def build_groups(cvset, universe):
     in order of first use.  cv_lines: (type, [group indices]) per CV."""
     groups, cv_lines, owner = [], [], {}
     for c in cvset.cvs:
+        if c["type"] == "COORD":
+            raise ValueError(f"CV {c['name']}: COORD is analysis only; cfacv has no coordination-number CV to restrain. "
+                             "Leave it out of the CV file given here (it can stay in the file cv_select.py reads).")
         idx = []
         for sel in c["atoms"]:
             g = universe.select_atoms(sel)

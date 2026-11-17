@@ -65,7 +65,7 @@
 #     TW(step_decay)   0 = constant step [0]; a > 0 = once the string has
 #                      passed the plateau test the step shrinks as
 #                      (update at rest / update)^a.  Use 0.5 < a <= 1.
-#     TW(hist_max)     most entries kept of the history the plateau and force
+#     TW(hist_max)     most entries kept of the history the rest and force
 #                      tests read [512]; beyond it neighbours are merged
 #     TW(curve_reach)  images either side within which a curve distance looks
 #                      for the nearest point [4]
@@ -395,6 +395,6 @@ if {$tw_me == 0} {
     puts $history_file "TW iter $i_run : finished, [expr {$stop ? {stopped by its rest, force and profile tests} : {reached the update cap}}]"
     close $history_file
     close $force_file
-    puts "TW) finished at update $i_run: [expr {$stop ? {stopped by its plateau and force tests} : {reached the update cap without passing its stopping tests}}]"
+    puts "TW) finished at update $i_run: [expr {$stop ? {stopped by its rest, force and profile tests} : {reached the update cap without passing its stopping tests}}]"
 }
 replicaBarrier

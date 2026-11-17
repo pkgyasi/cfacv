@@ -686,7 +686,7 @@ proc tw::advance {} {
         # stopping test now measures the force over the last window of
         # frames and allows for its own noise; see tw::record_frame.)
     }
-    # Once the string is at rest (the plateau and force tests have passed and
+    # Once the string is at rest (the rest and force tests have passed and
     # held, tw::record_frame sets n_rest), the step may shrink:
     # h = h0 (n_rest / n)^step_decay.  A constant step leaves the string
     # wandering by an amount set by the step, and its average biased by as
@@ -806,7 +806,7 @@ proc tw::mean_string {fr first last} {
     return $out
 }
 
-# Add one frame to the history the plateau and force tests read.  Frames are
+# Add one frame to the history the rest and force tests read.  Frames are
 # kept as means over chunks of hist_chunk frames; when there are hist_max
 # chunks (at least 64, so that the plateau test's sixteen half-blocks have
 # two entries each), neighbours are merged and the chunk length doubles, so

@@ -193,7 +193,7 @@ refinement, so it is a first look, not the profile of record.
   updates later.
 
   **A shrinking step.** `TW(step_decay) a` (0 = off) makes the step fall as
-  (update at rest / update)^a once the plateau and force tests have passed
+  (update at rest / update)^a once the rest and force tests have passed
   AND held, never before: a string with a vanishing step looks at rest
   wherever it is. If the rest test fails later, the rest point is cleared
   and the step goes back to its calibrated value. Since a run normally stops
@@ -210,7 +210,7 @@ refinement, so it is a first look, not the profile of record.
   directions count. Above about 1.3 the blocks
   are shorter than the force stays correlated: lengthen `TW(calibrate)`.
 
-  **History.** The plateau and force tests read frames since calibration,
+  **History.** The rest and force tests read frames since calibration,
   kept as means over chunks so that there are never more than
   `TW(hist_max)` of them (at least 64); restart files stay small however
   long the run. Merging keeps the newest frames.

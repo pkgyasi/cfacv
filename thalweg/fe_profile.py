@@ -442,11 +442,12 @@ def from_force_samples(z, samples, scale, nblocks=10, resolution_tol=0.5, drift_
     # limit on it is close to a sufficient condition there (not always: on a
     # pinned-end 16-image string it read 0.39 where the first segment was
     # 0.44 off).  On real profiles the change beyond its noise allowance is
-    # <= 0.24 for every profile known to match unbiased dynamics (31-, 49-,
+    # <= 0.25 for every profile known to match unbiased dynamics (31-, 49-,
     # 61-image dedicated runs, mixed units, a 31-image first look) and >= 0.31
-    # for every one known to be under-resolved (four 16- and 24-image first
-    # looks, two 16- and 24-image dedicated sets).  local_tol 0.3 (half of kT
-    # at 300 K, the reference gate's tolerance) separates them; the gap is
+    # for the three 16- and 24-image first looks that fail against it.  It
+    # also refuses 16- and 24-image dedicated sets (0.61, 1.24) that agree with
+    # a 960 ns reference to 0.11 and 0.30: conservative there.  local_tol 0.3
+    # (half of kT at 300 K, the reference gate's tolerance) separates them; the gap is
     # narrow.  The change is judged against its own block error, as above.
     loo_d, loo_se = np.zeros(n), np.zeros(n)
     for i in range(1, n - 1):
